@@ -384,6 +384,11 @@ const AGENT_MODELS = {
   fable: `claude-fable-5${CTX}`,
   opus: `claude-opus-5${CTX}`,
   sonnet: `claude-sonnet-5${CTX}`,
+  // No ${CTX}: the CLI rejects the long-context beta header for Haiku under
+  // subscription auth ("This authentication style is incompatible with the
+  // long context beta header") — verified against the installed CLI (2.1.233),
+  // unlike the other three models above. Bare model id only.
+  haiku: 'claude-haiku-4-5',
 }
 const AGENT_EFFORTS = new Set(['high', 'xhigh', 'max'])
 

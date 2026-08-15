@@ -813,7 +813,7 @@ function registerAgentControl(server) {
         repo: z.string().optional().describe('repo key for a DEV agent (a localRepos key or a bridges[].repos entry from list_agents); omit for a knowledge agent'),
         kind: z.enum(['dev', 'knowledge']).optional().describe('default "dev"'),
         vault: z.string().optional().describe('for a knowledge agent: which vault (e.g. "atlas")'),
-        model: z.enum(['opus', 'fable', 'sonnet']).optional().describe('default sonnet for a dev agent you spawn; opus for a knowledge agent'),
+        model: z.enum(['opus', 'fable', 'sonnet', 'haiku']).optional().describe('default sonnet for a dev agent you spawn; opus for a knowledge agent'),
         effort: z.enum(['high', 'xhigh', 'max']).optional().describe('default high (dev) / xhigh (knowledge)'),
       },
     },

@@ -785,11 +785,12 @@ export function AgentList({
           className="capture__input capture__input--sm agents__select"
           value={model}
           onChange={(e) => setModel(e.currentTarget.value)}
-          title="Model for this agent (always the 1M-context variant)"
+          title="Model for this agent (1M-context variant, except Haiku)"
         >
           <option value="fable">Fable</option>
           <option value="opus">Opus</option>
           <option value="sonnet">Sonnet</option>
+          <option value="haiku">Haiku</option>
         </select>
         <select
           className="capture__input capture__input--sm agents__select"
