@@ -134,12 +134,31 @@ so a downed dashboard self-heals within ~2 minutes.
 ```bash
 npm i -g @anthropic-ai/claude-code
 claude            # then /login — sign in on your subscription (NOT an API key)
+
+# As root: pin the binary at a standard location too (idempotent — re-runnable).
+# `npm i -g` follows npm's prefix, which is often ~/.local/bin; cron (/etc/cron.d)
+# and systemd hand a service a bare PATH that does NOT include it, so a dashboard
+# restarted by the watchdog would spawn every agent with ENOENT while an
+# interactive `serve.sh restart` worked.
+[ "$(command -v claude)" = /usr/local/bin/claude ] || ln -sfn "$(command -v claude)" /usr/local/bin/claude
 ```
+
+The API also resolves an **absolute** `claude` once at boot (`CLAUDE_BIN` if set, else
+PATH, then `~/.local/bin`, then `/usr/local/bin`) and uses that path at every spawn —
+`curl -s .../api/health | jq .claude` shows which binary it settled on, or why it
+couldn't. Set `CLAUDE_BIN` in `.env` if yours lives anywhere else.
 
 Leave `ANTHROPIC_API_KEY` **blank** everywhere. `serve.sh` strips it from the service
 env and each agent launches with `env -u ANTHROPIC_API_KEY`, so nothing can fall back
 to API-key billing. Agents run `claude --dangerously-skip-permissions` (headless) with
 `IS_SANDBOX=1`.
+
+The one exception is a spawn you deliberately put on a **[provider
+profile](PROVIDERS.md)** — the same harness against an Anthropic-compatible
+backend (DeepSeek via OpenRouter, …). That profile then owns the Anthropic
+variables for that agent alone, and sets `ANTHROPIC_API_KEY` explicitly empty
+rather than leaving it unset. Optional, off by default, and no profiles
+configured means nothing about the above changes.
 
 Each launched agent also loads one of the MCP configs in `api/src/mcp/` with
 `--strict-mcp-config`: `dev.mcp.json` (box-local dev agents — the seven read-only vault
@@ -262,6 +281,11 @@ it costs and the config only you can supply — a cookie file, a feed list:
   RSS/Atom feeds → `Wiki/Sources/` pages plus a rolling digest.
 
 [docs/ADDONS.md](ADDONS.md) is the model, the hook API and the shipped catalog.
+
+Separately optional, and not an addon: **[model-provider profiles](PROVIDERS.md)** let a
+dev agent spawn against an Anthropic-compatible backend (DeepSeek via OpenRouter, …) in
+the unchanged harness. Copy `api/src/providers.example.json` to `providers.json`
+(gitignored — it holds your keys) and a picker appears on the spawn form.
 
 ---
 

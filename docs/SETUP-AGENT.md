@@ -96,8 +96,15 @@ The checks below are SETUP.md's "Verifying it works" list, distributed per step.
   `ATLAS_PORT`) → `{"ok":true,...}`, and `systemctl is-enabled atlas-kit.service` →
   `enabled`.
 - **Step 7 — Claude Code CLI (subscription auth).** Already logged in from the bootstrap.
-  **Verify:** `claude --version` works and `grep -c '^ANTHROPIC_API_KEY=$' .env` confirms
-  the key is left blank (subscription-only — never set it).
+  **As root, also pin the binary at a standard path** (idempotent, so safe on a re-run):
+  `[ "$(command -v claude)" = /usr/local/bin/claude ] || ln -sfn "$(command -v claude)" /usr/local/bin/claude`.
+  ⚠️ Do not skip this: `npm i -g` follows npm's prefix (often `~/.local/bin`), and cron
+  and systemd give a service a bare PATH without it — the dashboard then works when YOU
+  restart it and spawns ENOENT agents when the watchdog does.
+  **Verify:** `claude --version` works, `curl -s http://127.0.0.1:8080/api/health` shows
+  `"claude":{"ok":true,…}` with the resolved path, and `grep -c '^ANTHROPIC_API_KEY=$' .env`
+  confirms the key is left blank (subscription-only — never set it). If the CLI lives
+  somewhere else entirely, set `CLAUDE_BIN=/abs/path/to/claude` in `.env` instead.
 - **Step 8 — vault + `VAULT_PATH`.** Create-from-template or clone the existing vault to
   the chosen path; confirm it has `Wiki/` + `Tasks/`. **Verify:** `curl -s
   http://127.0.0.1:8088/api/wiki/pages` (or your `ATLAS_PORT`) returns the vault's pages
@@ -154,8 +161,8 @@ none enabled the kit is byte-identical to one that never had the framework
 them **after** step 6's health check and step 8's vault check have passed, never during
 Phase 1, and take a no for an answer.
 
-Read [docs/ADDONS.md](ADDONS.md) and the three `addons/*/README.md` files before you
-offer anything. Then present all three in **one** message — what each does **and** what
+Read [docs/ADDONS.md](ADDONS.md) and the four `addons/*/README.md` files before you
+offer anything. Then present all four in **one** message — what each does **and** what
 it costs, taken from that README's **"What it costs"** table:
 
 - **[`semantic-search`](../addons/semantic-search/README.md)** — a second, dense retrieval
@@ -172,6 +179,16 @@ it costs, taken from that README's **"What it costs"** table:
   that spends on a timer — one `claude -p` call per NEW item on their subscription, capped
   at 12 per sweep, so ≤ 288 short calls/day at the defaults, plus one permanent markdown
   page per item.
+- **[`voice`](../addons/voice/README.md)** — spoken recaps of fleet events (a Voice card)
+  and dictation into the dashboard's text fields. **Costs:** the default path is **free**
+  — no download, no key, no server call; the browser's own voice reads a line the
+  dashboard already had, and its Web Speech API does the listening. Two things are not
+  free and both are opt-in: a **Recap** button spends one `claude -p` call (guarded to
+  1/agent/60 s and 100/day fleet-wide), and an on-box engine instead of the browser's is
+  ~5 MB (`espeak-ng`) to ~310 MB (`piper` + a voice) out of tree, ~150 MB for a
+  whisper.cpp model. ⚠️ Browser **dictation is a cloud service in Chrome and Safari** —
+  their audio goes to Google/Apple; the README's privacy table says which path goes where,
+  and an on-box engine is the answer if that is not acceptable.
 
 ⚠️ **State the cost before enabling, every time, and do not round it down.** The operator
 is deciding whether to spend their disk, RAM and subscription calls; the honest table is
@@ -227,6 +244,40 @@ For each addon they say yes to, five moves in this order:
   sweep line (that file is regenerated from the enabled addons, never hand-edited), and
   `GET /api/addons` reports the feed list and the last run; the manual-sweep and CLI forms
   are in §4 of the README.
+- **`voice` — enabling it is the whole install; the rest is opt-in.** Step 1 downloads
+  nothing: `bash addons/voice/install.sh` only *detects* what is already here (`--check`
+  reports it), and installs an engine only when they name one (`--engine espeak-ng` |
+  `piper` | `whisper`) — a download, so Safety §2 applies (`--engine whisper` only wires a
+  wrapper around a whisper.cpp + ffmpeg this box already has; it installs neither). Leave it out and the browser
+  path is the whole feature. Two `.env` lines exist and both are optional:
+  `ATLAS_VOICE_TTS_CMD` / `ATLAS_VOICE_STT_CMD` (an on-box engine takes over from the
+  browser). ⚠️ **Its three routes need a Caddyfile handler** — `infra/Caddyfile.example`
+  ships `handle /api/voice/*` with the bearer injected, so a Caddyfile copied from the
+  current example already has it; a box whose `infra/Caddyfile` predates the addon needs
+  the block added by hand plus a `scripts/serve.sh restart`. Without it the card degrades
+  rather than breaking: it speaks the free event line and dictation stays in the browser.
+  **Verify:** `GET /api/addons` reports which speech/dictation path is live and whether
+  the bearer is configured, and the dashboard grows a **Voice** card.
+
+## Phase 1c — Mention model-provider profiles (one line, only if it fits)
+
+Separately optional, and **not** an addon: a dev agent can spawn against an
+Anthropic-compatible backend — DeepSeek via OpenRouter, DeepSeek direct — running the
+**unchanged** harness ([docs/PROVIDERS.md](PROVIDERS.md)). With no profiles configured
+nothing changes anywhere, so this is a mention, not an offer: name it once, in a line,
+and only if they asked about model cost or a non-Anthropic backend. Read PROVIDERS.md
+before saying anything about it — the caveats (no prompt caching or extended thinking on
+DeepSeek; OpenRouter's Anthropic skin is officially guaranteed only for Anthropic's own
+models) are the part that decides whether it is worth it, and rounding them down is how
+they end up surprised by a bill.
+
+⚠️ **You never handle their API key.** Your part is naming the file it goes in —
+`cp api/src/providers.example.json api/src/providers.json` (gitignored) — and pointing at
+the two placeholder profiles inside it. Do not ask them to paste a key into the chat, do
+not read one back, do not put one in `.env`, a prompt, or any file you write. Same rule as
+the `instagram-ingest` cookie jar, for the same reason. **Verify** without touching a
+secret: `curl -s http://127.0.0.1:8080/api/providers` lists the profile names and labels —
+by design that route serves nothing else — and a picker appears on the spawn form.
 
 ## Phase 2 — Safety rules (apply throughout)
 
