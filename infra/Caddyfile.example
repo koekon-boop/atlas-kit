@@ -1,13 +1,15 @@
 # Atlas Kit reverse proxy. Copy to infra/Caddyfile and adjust <REPO_ROOT>.
 # serve.sh runs `caddy run --config infra/Caddyfile` (with .env sourced, so
-# {env.DASHBOARD_BEARER_TOKEN} is available). Binds :8080 on localhost; a
-# Cloudflare Tunnel + Access front it at the edge (see docs/SETUP.md).
+# {env.DASHBOARD_BEARER_TOKEN} and {$ATLAS_PORT} are available). Binds ATLAS_PORT
+# (default 8088 — see .env.example) on localhost; a Cloudflare Tunnel + Access
+# front it at the edge (see docs/SETUP.md). Pick a different ATLAS_PORT in .env
+# if something else on the box already owns the default.
 #
 # The pattern: WRITE/EXEC routes get the bearer injected here server-side, so the
 # browser never holds the token. READ routes and the live-app proxy pass through
 # untouched (Cloudflare Access gates identity at the edge).
 
-:8080 {
+:{$ATLAS_PORT} {
 	encode gzip
 
 	# --- Write/exec routes: inject the dashboard bearer, then proxy to Express ---

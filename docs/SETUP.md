@@ -12,10 +12,12 @@ spawn Claude Code agents. Most of steps 1–9 are automated by
 > up."* This file is the manual version.
 
 Architecture recap: a **Cloudflare Tunnel** (outbound-only) fronts **Caddy** on
-`:8080`; Caddy serves the built app and proxies `/api` to the **Express** API on
-`127.0.0.1:3001` (injecting the bearer token on write routes); an **MCP** server runs
-on `:3002` for the Claude.ai connector. **Cloudflare Access** gates identity at the
-edge. LLM work runs on your **Claude subscription** via the `claude` CLI — no API keys.
+`ATLAS_PORT` (default `:8088` — pick your own in `.env` if something else on the box
+already owns it, e.g. an existing nginx/other app on 8080); Caddy serves the built app
+and proxies `/api` to the **Express** API on `127.0.0.1:3001` (injecting the bearer
+token on write routes); an **MCP** server runs on `:3002` for the Claude.ai connector.
+**Cloudflare Access** gates identity at the edge. LLM work runs on your **Claude
+subscription** via the `claude` CLI — no API keys.
 
 ---
 
@@ -105,9 +107,12 @@ cp infra/Caddyfile.example infra/Caddyfile
 # edit <REPO_ROOT> to the repo path (e.g. /workspace)
 ```
 
-Caddy binds `:8080`, serves `web/dist`, proxies `/api` + `/agent-app`, and injects
-`DASHBOARD_BEARER_TOKEN` on the write routes. `X-Frame-Options: SAMEORIGIN` lets the
-dashboard iframe its own live-app preview.
+Caddy binds `ATLAS_PORT` (`.env`, default `8088`), serves `web/dist`, proxies `/api` +
+`/agent-app`, and injects `DASHBOARD_BEARER_TOKEN` on the write routes.
+`X-Frame-Options: SAMEORIGIN` lets the dashboard iframe its own live-app preview. If
+you change `ATLAS_PORT` from the default, update the `service:` line in
+`/root/.cloudflared/config.yml` to match (see step 4 — cloudflared's config has no
+env-var substitution).
 
 ## 6. Node + the systemd services
 
@@ -241,7 +246,7 @@ framework, so the install above is complete on its own.
 bash addons/<name>/install.sh            # idempotent; --check reports state
 echo 'ATLAS_ADDONS=semantic-search' >> .env   # …or: cp addons.example.json addons.json
 scripts/serve.sh restart                 # enabling is a restart, not a reload
-curl -s http://127.0.0.1:8080/api/addons # what is actually enabled on this box
+curl -s http://127.0.0.1:$ATLAS_PORT/api/addons # what is actually enabled on this box
 ```
 
 `ATLAS_ADDONS` wins whenever it is **defined** (empty means *no addons*); `addons.json`
@@ -262,7 +267,8 @@ it costs and the config only you can supply — a cookie file, a feed list:
 
 ### Verifying it works
 
-- `curl http://127.0.0.1:8080/api/health` → `{"ok":true,...}`.
+- `curl http://127.0.0.1:$ATLAS_PORT/api/health` → `{"ok":true,...}` (`$ATLAS_PORT`
+  from `.env`, default `8088`).
 - Open `dashboard.<your-domain>` on your phone → you should hit the Access login, then
   the dashboard.
 - The home tab shows the **Atlas Kit** card seeded in step 8, with a **Redeploy** button.

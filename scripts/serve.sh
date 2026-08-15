@@ -25,7 +25,15 @@ export HOME="${HOME:-/root}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION=api
 KEEPALIVE=_keepalive          # holder window — keeps the session (and tmux server) alive
-HEALTH=http://127.0.0.1:8080/api/health
+
+# Caddy's public port: an already-set env var wins, else whatever .env says, else
+# 8088 (this fork's default — 8080 is upstream's, but collides with other services
+# on some boxes, e.g. nginx/Dify). infra/Caddyfile reads the same var via `{$ATLAS_PORT}`,
+# so this is the one place a box picks its own port. Exported so every tmux window
+# spawned below (in particular the caddy one) sees it.
+ATLAS_PORT="${ATLAS_PORT:-$(grep -E '^ATLAS_PORT=' "$ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+export ATLAS_PORT="${ATLAS_PORT:-8088}"
+HEALTH="http://127.0.0.1:${ATLAS_PORT}/api/health"
 HOOK=/etc/profile.d/zz-atlas-kit-serve.sh
 
 # All tmux calls go through this wrapper so an optional dedicated socket can be used
@@ -43,8 +51,8 @@ stop() {
   # raced the next start when `api` was the only session (→ Cloudflare 502; see
   # ensure_session). start() respawns the windows in place; the keepalive window
   # holds the server open. These pkills still mop up any orphan OUTSIDE a tmux window
-  # (e.g. a caddy left holding :8080 after a botched run); caddy ignores SIGHUP so it
-  # must be killed by exact cmdline.
+  # (e.g. a caddy left holding its port after a botched run); caddy ignores SIGHUP so
+  # it must be killed by exact cmdline.
   pkill -f "caddy run --config $ROOT/infra/Caddyfile" 2>/dev/null || true
   pkill -f "node --env-file=.env api/src/server.mjs" 2>/dev/null || true
   pkill -f "node --env-file=.env api/src/mcp/http.mjs" 2>/dev/null || true
@@ -127,8 +135,11 @@ start() {
   # comment and ensure_session for the fd-9 / no-teardown rationale.
   svc express \
     "cd '$ROOT' && HOME='$HOME' env -u ANTHROPIC_API_KEY node --env-file=.env api/src/server.mjs 2>&1 | tee /tmp/atlas-kit-express.log"
+  # ATLAS_PORT: same "may predate our env" issue as HOME above — .env is sourced
+  # fresh here (for DASHBOARD_BEARER_TOKEN etc.) but an older .env may not define
+  # ATLAS_PORT yet, so the fallback resolved above is inlined as its default.
   svc caddy \
-    "set -a; . '$ROOT/.env'; set +a; caddy run --config '$ROOT/infra/Caddyfile' 2>&1 | tee /tmp/atlas-kit-caddy.log"
+    "set -a; . '$ROOT/.env'; export ATLAS_PORT=\"\${ATLAS_PORT:-$ATLAS_PORT}\"; set +a; caddy run --config '$ROOT/infra/Caddyfile' 2>&1 | tee /tmp/atlas-kit-caddy.log"
   # MCP server (streamable-HTTP, 127.0.0.1:3002). Localhost-only; the remote
   # connector exposure (Cloudflare Tunnel → mcp.<domain>, behind Access) is wired
   # separately once the Access app exists. Cf-Access JWT check is a no-op until
@@ -137,7 +148,7 @@ start() {
     "cd '$ROOT' && HOME='$HOME' env -u ANTHROPIC_API_KEY node --env-file=.env api/src/mcp/http.mjs 2>&1 | tee /tmp/atlas-kit-mcp.log"
 
   for _ in $(seq 1 30); do
-    is_up && { log "up: Express :3001 + Caddy :8080 (tmux '$SESSION')"; return 0; }
+    is_up && { log "up: Express :3001 + Caddy :$ATLAS_PORT (tmux '$SESSION')"; return 0; }
     sleep 0.5
   done
   log "WARNING: health check failed — see /tmp/atlas-kit-express.log and /tmp/atlas-kit-caddy.log"

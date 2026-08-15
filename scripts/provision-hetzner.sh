@@ -35,7 +35,7 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt -y install nodejs
 node -v
 
-echo "== 3. caddy (binary only — serve.sh runs its OWN caddy on :8080) =="
+echo "== 3. caddy (binary only — serve.sh runs its OWN caddy on ATLAS_PORT, default :8088) =="
 apt -y install debian-keyring debian-archive-keyring apt-transport-https
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
   | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -67,7 +67,9 @@ echo "== 7. config: .env + Caddyfile =="
 [ -f /workspace/.env ] || cp /workspace/.env.example /workspace/.env
 [ -f /workspace/infra/Caddyfile ] || cp /workspace/infra/Caddyfile.example /workspace/infra/Caddyfile
 pause "edit /workspace/.env — set DASHBOARD_BEARER_TOKEN (required; openssl rand -hex 32).
-       VAULT_PATH defaults to /vault. CF_ACCESS_* stay blank until the Access app exists."
+       VAULT_PATH defaults to /vault. ATLAS_PORT defaults to 8088 — change it if
+       something else on this box already owns that port. CF_ACCESS_* stay blank
+       until the Access app exists."
 
 echo "== 8. build + deps =="
 ( cd /workspace/web && npm ci && npm run build )
@@ -99,14 +101,17 @@ systemctl enable --now atlas-kit.service
 install -m 644 /workspace/infra/atlas-kit.cron /etc/cron.d/atlas-kit
 
 echo "== 10. local health =="
-curl -fsS http://127.0.0.1:8080/api/health && echo "  <- local OK"
+ATLAS_PORT="$(grep -E '^ATLAS_PORT=' /workspace/.env 2>/dev/null | tail -1 | cut -d= -f2-)"
+ATLAS_PORT="${ATLAS_PORT:-8088}"
+curl -fsS "http://127.0.0.1:$ATLAS_PORT/api/health" && echo "  <- local OK"
 
-cat <<'EOF'
+cat <<EOF
 
 Done. Next (manual, reversible) — see docs/SETUP.md:
-  cloudflared tunnel --url http://localhost:8080
+  cloudflared tunnel --url http://localhost:$ATLAS_PORT
     -> opens a random https://<id>.trycloudflare.com — open it on your phone to
        prove the box serves end-to-end. No DNS change, no Cloudflare account.
     Then: DNS cutover on Cloudflare -> Access apps (dashboard + mcp) -> a named
-    tunnel from infra/cloudflared-config.example.yml.
+    tunnel from infra/cloudflared-config.example.yml (match its service: port to
+    ATLAS_PORT — cloudflared's config has no env-var substitution).
 EOF
