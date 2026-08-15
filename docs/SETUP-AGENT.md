@@ -78,34 +78,40 @@ The checks below are SETUP.md's "Verifying it works" list, distributed per step.
   routes `mcp.<domain>`, the MCP server refuses to start with either blank — check its
   log for `Access JWT check: ENFORCED` rather than `REFUSING TO START`.
   **Verify:** `cloudflared tunnel list` shows the tunnel; `dashboard.<domain>` resolves and hits the Access login. (No domain ⇒ skip;
-  note that the dashboard is reached via the tailnet IP or `ssh -L 8080:127.0.0.1:8080`.)
+  note that the dashboard is reached via the tailnet IP or `ssh -L 8088:127.0.0.1:8088`
+  — or whatever `ATLAS_PORT` ends up being, see step 5.)
 - **Step 5 — Caddy.** `cp infra/Caddyfile.example infra/Caddyfile` and replace
-  `<REPO_ROOT>` with the repo path. **Verify:** `caddy validate --config infra/Caddyfile`
+  `<REPO_ROOT>` with the repo path. It binds `ATLAS_PORT` (`.env`, default `8088`) —
+  pick a different one now if something else on the box already owns the default (e.g.
+  an nginx/other app on 8080). **Verify:** `caddy validate --config infra/Caddyfile`
   passes.
 - **Step 6 — Node + the services.** Write `.env` first (see Safety §3):
   `cp .env.example .env`; set `DASHBOARD_BEARER_TOKEN=$(openssl rand -hex 32)`,
-  `VAULT_PATH`, `ATLAS_AUTHOR_NAME`/`ATLAS_AUTHOR_EMAIL`, `VITE_OPERATOR_NAME`, and
-  `CF_ACCESS_*` if step 4 ran. Then `cd web && npm ci && npm run build` (build **after**
-  `VITE_OPERATOR_NAME` is set — it's baked in), `cd ../api && npm ci`, install the systemd
-  unit (see SETUP.md step 6 / `scripts/provision-hetzner.sh`), and `scripts/serve.sh
-  ensure`. **Verify (the core check):** `curl -fsS http://127.0.0.1:8080/api/health` →
-  `{"ok":true,...}`, and `systemctl is-enabled atlas-kit.service` → `enabled`.
+  `VAULT_PATH`, `ATLAS_AUTHOR_NAME`/`ATLAS_AUTHOR_EMAIL`, `VITE_OPERATOR_NAME`,
+  `ATLAS_PORT` if step 5 picked a non-default port, and `CF_ACCESS_*` if step 4 ran.
+  Then `cd web && npm ci && npm run build` (build **after** `VITE_OPERATOR_NAME` is
+  set — it's baked in), `cd ../api && npm ci`, install the systemd unit (see SETUP.md
+  step 6 / `scripts/provision-hetzner.sh`), and `scripts/serve.sh ensure`. **Verify
+  (the core check):** `curl -fsS http://127.0.0.1:8088/api/health` (or your
+  `ATLAS_PORT`) → `{"ok":true,...}`, and `systemctl is-enabled atlas-kit.service` →
+  `enabled`.
 - **Step 7 — Claude Code CLI (subscription auth).** Already logged in from the bootstrap.
   **Verify:** `claude --version` works and `grep -c '^ANTHROPIC_API_KEY=$' .env` confirms
   the key is left blank (subscription-only — never set it).
 - **Step 8 — vault + `VAULT_PATH`.** Create-from-template or clone the existing vault to
   the chosen path; confirm it has `Wiki/` + `Tasks/`. **Verify:** `curl -s
-  http://127.0.0.1:8080/api/wiki/pages` returns the vault's pages (not an empty list on a
-  populated vault) and `curl -s http://127.0.0.1:8080/api/tasks` returns its tasks.
+  http://127.0.0.1:8088/api/wiki/pages` (or your `ATLAS_PORT`) returns the vault's pages
+  (not an empty list on a populated vault) and `curl -s
+  http://127.0.0.1:8088/api/tasks` returns its tasks.
   **Then, once that check passes, seed the kit's own project card:** `node --env-file=.env
   scripts/seed-self-card.mjs`. It writes `Wiki/Projects/Atlas-Kit.md` through the commit
   queue, filling in the repo path, the `origin` URL and the spawn key if one is registered
   — and it **never overwrites an existing page**, so it is safe on a re-run (Safety §1).
   Say what it wrote. Skip it only if the operator says they don't want the card. **Verify:**
-  `curl -s http://127.0.0.1:8080/api/projects` lists **Atlas Kit** with `selfDeploy: true`
-  and a `repo` path — that pair is what puts the **Redeploy** button on the card
-  ([docs/UPDATING.md](UPDATING.md), which is also the answer to "how do I update this box
-  later?").
+  `curl -s http://127.0.0.1:8088/api/projects` (or your `ATLAS_PORT`) lists **Atlas Kit**
+  with `selfDeploy: true` and a `repo` path — that pair is what puts the **Redeploy**
+  button on the card ([docs/UPDATING.md](UPDATING.md), which is also the answer to "how
+  do I update this box later?").
 - **Step 9 — cron.** `install -m 644 infra/atlas-kit.cron /etc/cron.d/atlas-kit`.
   **Verify:** the file exists and lists the watchdog + `refresh-atlas.mjs` +
   `clear-done.mjs` + `refresh-github.mjs` lines.
@@ -116,14 +122,15 @@ The checks below are SETUP.md's "Verifying it works" list, distributed per step.
   On a yes, set `ATLAS_GITHUB_USER=<login>` in `.env`, `scripts/serve.sh restart`, and run
   `node --env-file=.env scripts/refresh-github.mjs` once for the first fill. Auth is their
   own `gh` login — never ask for or write a token. **Verify:** `curl -s
-  http://127.0.0.1:8080/api/data/scorecard` includes a `GitHub Contributions (1y)` stat,
+  http://127.0.0.1:8088/api/data/scorecard` (or your `ATLAS_PORT`) includes a `GitHub Contributions (1y)` stat,
   and the Scorecard shows a **GitHub** group. ⚠️ Cron runs as **root**: if `gh auth status`
   fails for root, say so — the cron will no-op until they `gh auth login` there.
 - **Step 10 — workstation bridge** (only if chosen). Guide the operator through
   `scripts/install-agent-bridge.sh` on the **workstation** (it's a separate machine —
   you can't run it from here), then set `AGENT_BRIDGE_URL` (the workstation tailnet IP)
   + `AGENT_BRIDGE_TOKEN` in `.env` and `scripts/serve.sh restart`. **Verify:** `curl -s
-  http://127.0.0.1:8080/api/agents` shows the bridge with `reachable: true` **and**
+  http://127.0.0.1:8088/api/agents` (or your `ATLAS_PORT`) shows the bridge with
+  `reachable: true` **and**
   `capacity.known: true` — `known: false` means that bridge predates spawn-capacity
   reporting and nothing is limiting agents on it; have the operator re-run
   `sudo scripts/restart-agent-bridge.sh` there. While you're in `bridge.env`, set
@@ -185,7 +192,7 @@ For each addon they say yes to, five moves in this order:
    used only when `ATLAS_ADDONS` is unset). Pick one mechanism; don't set both.
 3. **The per-addon config you cannot do for them** — see below.
 4. **`scripts/serve.sh restart`.** Enabling is a restart, not a reload.
-5. **Verify:** `curl -s http://127.0.0.1:8080/api/addons` lists the addon with its hooks
+5. **Verify:** `curl -s http://127.0.0.1:8088/api/addons` (or your `ATLAS_PORT`) lists the addon with its hooks
    and its `status`, and `errors` is empty. An addon that failed to load is *recorded
    there and skipped* — the API comes up regardless, so a working dashboard is no
    evidence that the addon loaded.
@@ -246,7 +253,7 @@ When every chosen step's check has passed, report:
 - **What's running** — the systemd units (`atlas-kit.service`, `cloudflared` if used) and
   the cron jobs, plus the health check result.
 - **URLs** — the dashboard URL (`https://dashboard.<domain>` behind Access, or the
-  tailnet/`localhost:8080` path for a domain-less box) and the MCP connector host.
+  tailnet/`localhost:$ATLAS_PORT` path for a domain-less box) and the MCP connector host.
 - **Where the vault lives** — its path + repo, and that the box commits back to it.
 - **How to open the dashboard** and **how to spawn a first agent** (add the repo key to
   `agent-local-repos.json`, give a project page an `agent_repo:`, click Spawn).

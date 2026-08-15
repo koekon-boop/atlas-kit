@@ -88,7 +88,7 @@ git merge --ff-only origin/main    # refuses on divergence — never force
 cd web && npm ci && npm run build && cd ..   # npm ci only if web/package-lock.json moved
 cd api && npm ci && cd ..                    # …likewise for api/
 scripts/serve.sh restart
-curl -fsS http://127.0.0.1:8080/api/health   # {"ok":true,…}
+curl -fsS http://127.0.0.1:${ATLAS_PORT:-8088}/api/health   # {"ok":true,…}
 ```
 
 ### First update from the template repo
@@ -118,7 +118,7 @@ kit and the one-click path works as-is.
   dependency or a cron line: `bash addons/<name>/install.sh` (idempotent; `--check`
   reports state without installing). Then confirm what actually loaded:
   ```bash
-  curl -s http://127.0.0.1:8080/api/addons     # each enabled addon, its hooks, its errors
+  curl -s http://127.0.0.1:${ATLAS_PORT:-8088}/api/addons     # each enabled addon, its hooks, its errors
   ```
   An addon that failed to load is *recorded there and skipped* — the API comes up
   regardless, so a working dashboard is no evidence that an addon loaded.
