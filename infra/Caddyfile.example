@@ -45,6 +45,13 @@
 			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
 		}
 	}
+	# addons/voice: recap, speak (TTS passthrough) and transcribe (STT passthrough)
+	# are all bearer-gated by the addon's own middleware — no core route gates them.
+	handle /api/voice/* {
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+		}
+	}
 	# (The token is harmless on the read routes below; only writes require it.)
 
 	# --- Read routes (open; Cloudflare Access gates them at the edge) ---
