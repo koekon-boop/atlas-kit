@@ -109,6 +109,7 @@ ever meant. Without a profile the kit resolves the tier to Anthropic's model ID
 ```
 dropdown "Opus"  →  --model opus  →  ANTHROPIC_DEFAULT_OPUS_MODEL   →  deepseek/deepseek-v4-pro
 dropdown "Sonnet" → --model sonnet → ANTHROPIC_DEFAULT_SONNET_MODEL →  deepseek/deepseek-v4-flash
+dropdown "Haiku"  →  --model haiku →  ANTHROPIC_DEFAULT_HAIKU_MODEL  →  deepseek/deepseek-v4-flash
 ```
 
 This matters more than it looks: hand Claude Code the resolved
@@ -118,10 +119,12 @@ happily serve and bill. The kit does not let that happen.
 
 Consequences:
 
-- **Opus and Sonnet only.** There is no `fable` tier for Claude Code to resolve,
-  so the picker hides Fable while a profile is selected and the API refuses the
-  pair (`400`). Map `ANTHROPIC_DEFAULT_HAIKU_MODEL` too — Claude Code uses the
-  haiku tier internally — and `CLAUDE_CODE_SUBAGENT_MODEL` for sub-agents.
+- **Opus, Sonnet and Haiku only.** There is no `fable` tier for Claude Code to
+  resolve, so the picker hides Fable while a profile is selected and the API
+  refuses the pair (`400`). Map `ANTHROPIC_DEFAULT_HAIKU_MODEL` too — Claude
+  Code uses the haiku tier internally, and this kit's dropdown also offers it
+  as a selectable dev-agent tier — and `CLAUDE_CODE_SUBAGENT_MODEL` for
+  sub-agents.
 - **Effort is untouched.** `--effort high/xhigh/max` is passed exactly as before;
   what a given backend does with it is that backend's business.
 - Everything else on the launch line — the MCP config, `--strict-mcp-config`,

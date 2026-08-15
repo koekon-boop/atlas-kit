@@ -672,10 +672,10 @@ export function AgentList({
   // renders and no spawn carries a `provider`, i.e. nothing here changes.
   const providers = useProviders()
   const [provider, setProvider] = useState('')
-  // A profile maps the opus/sonnet TIERS only (Claude Code has no `fable` tier to
-  // point at ANTHROPIC_DEFAULT_*_MODEL), so Fable and a profile are mutually
-  // exclusive — the server refuses the pair. Picking a profile moves a Fable
-  // selection to Opus rather than leaving the form on a combination that 400s.
+  // A profile maps the opus/sonnet/haiku TIERS only (Claude Code has no `fable`
+  // tier to point at ANTHROPIC_DEFAULT_*_MODEL), so Fable and a profile are
+  // mutually exclusive — the server refuses the pair. Picking a profile moves a
+  // Fable selection to Opus rather than leaving the form on a combination that 400s.
   const pickProvider = (name: string) => {
     setProvider(name)
     if (name && model === 'fable') setModel('opus')
@@ -801,9 +801,9 @@ export function AgentList({
           onChange={(e) => setModel(e.currentTarget.value)}
           title="Model for this agent (1M-context variant, except Haiku)"
         >
-          {/* Hidden under a provider profile: the tier has to be one the profile
-              maps (opus/sonnet), and offering an option the spawn would refuse
-              is worse than not offering it. */}
+          {/* Fable is hidden under a provider profile: the tier has to be one the
+              profile maps (opus/sonnet/haiku), and offering an option the spawn
+              would refuse is worse than not offering it. */}
           {provider ? null : <option value="fable">Fable</option>}
           <option value="opus">Opus</option>
           <option value="sonnet">Sonnet</option>

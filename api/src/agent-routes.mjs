@@ -420,7 +420,7 @@ export function spawnPicks({ model, effort, kind, provider } = {}) {
  * ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL — there is no `fable` tier, so a
  * `fable` pick would reach the gateway as the literal model name `fable`. The
  * dropdown hides the combination; this is the server-side half. */
-const PROVIDER_TIERS = new Set(['opus', 'sonnet'])
+const PROVIDER_TIERS = new Set(['opus', 'sonnet', 'haiku'])
 
 // Call a bridge; returns { ok, status, body } and never throws — a down bridge /
 // timeout comes back as ok:false so callers can degrade. `bridge` is a resolved

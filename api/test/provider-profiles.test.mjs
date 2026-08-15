@@ -16,8 +16,8 @@
  *      session view the dashboard renders, not the audit journal, not the
  *      command line (where `ps` would show them). Asserted with a canary value
  *      swept across every one of those surfaces.
- *   3. TIER MAPPING. The opus/sonnet picker keeps working: with a profile the
- *      TIER ALIAS is what `--model` gets, so the profile's
+ *   3. TIER MAPPING. The opus/sonnet/haiku picker keeps working: with a profile
+ *      the TIER ALIAS is what `--model` gets, so the profile's
  *      ANTHROPIC_DEFAULT_<TIER>_MODEL is what resolves it. Handing Claude Code
  *      the resolved `claude-sonnet-5[1m]` instead would ask the gateway for
  *      Anthropic's own Sonnet — served, and billed, as if nothing were wrong.
@@ -60,6 +60,7 @@ fs.writeFileSync(
         ANTHROPIC_API_KEY: '',
         ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek/deepseek-v4-pro',
         ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek/deepseek-v4-flash',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek/deepseek-v4-flash',
       },
     },
     'no-key-profile': { label: 'Backend that never mentions the key', env: { ANTHROPIC_BASE_URL: 'https://example.invalid/api' } },
@@ -170,7 +171,8 @@ test('a profile travels BY FILE — its values never reach a command line', () =
       "export ANTHROPIC_BASE_URL='https://openrouter.ai/api'\n" +
       `export ANTHROPIC_AUTH_TOKEN='${CANARY}'\n` +
       "export ANTHROPIC_DEFAULT_OPUS_MODEL='deepseek/deepseek-v4-pro'\n" +
-      "export ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek/deepseek-v4-flash'\n",
+      "export ANTHROPIC_DEFAULT_SONNET_MODEL='deepseek/deepseek-v4-flash'\n" +
+      "export ANTHROPIC_DEFAULT_HAIKU_MODEL='deepseek/deepseek-v4-flash'\n",
   )
   // …and the command line carries none of it. An argv is world-readable in `ps`,
   // which is exactly why `tmux new-session -e NAME=value` is NOT how this works.
@@ -262,25 +264,52 @@ test('the session record + audit line carry the profile NAME only', async () => 
 
 /* --- 3. the model-alias interplay ----------------------------------------- */
 
-test('the opus/sonnet picker is unchanged — with a profile it names the TIER', () => {
+test('the opus/sonnet/haiku picker is unchanged — with a profile it names the TIER', () => {
   // Without a profile: the resolved Anthropic model ID, exactly as before.
   assert.deepEqual(spawnPicks({ model: 'sonnet' }), { modelId: `claude-sonnet-5${CTX}`, effortLevel: 'xhigh' })
   assert.deepEqual(spawnPicks({ model: 'opus', effort: 'high' }), { modelId: `claude-opus-5${CTX}`, effortLevel: 'high' })
-  // With one: the tier alias, which is what ANTHROPIC_DEFAULT_<TIER>_MODEL maps.
+  assert.deepEqual(spawnPicks({ model: 'haiku' }), { modelId: 'claude-haiku-4-5', effortLevel: 'xhigh' })
+  // With one: the tier alias, which is what ANTHROPIC_DEFAULT_<TIER>_MODEL maps —
+  // haiku included, so a resolved Anthropic model id never reaches the backend.
   const p = 'deepseek-openrouter'
   assert.deepEqual(spawnPicks({ model: 'sonnet', provider: p }), { modelId: 'sonnet', effortLevel: 'xhigh' })
   assert.deepEqual(spawnPicks({ model: 'opus', effort: 'max', provider: p }), { modelId: 'opus', effortLevel: 'max' })
+  assert.deepEqual(spawnPicks({ model: 'haiku', provider: p }), { modelId: 'haiku', effortLevel: 'xhigh' })
   // The DEFAULT pick still applies, and still lands on a mappable tier.
   assert.equal(spawnPicks({ provider: p }).modelId, 'sonnet')
   // …and the profile is what turns that tier into a real model.
   const env = resolveProvider(p).env
   assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'deepseek/deepseek-v4-flash')
   assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'deepseek/deepseek-v4-pro')
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'deepseek/deepseek-v4-flash')
   // The alias reaches the command line shell-quoted, like any other model value.
   assert.match(
     launchCommand(LAUNCH_CMD, { model: spawnPicks({ model: 'opus', provider: p }).modelId, effort: 'high', provider: p }),
     /--model 'opus' --effort 'high'/,
   )
+  assert.match(
+    launchCommand(LAUNCH_CMD, { model: spawnPicks({ model: 'haiku', provider: p }).modelId, effort: 'xhigh', provider: p }),
+    /--model 'haiku' --effort 'xhigh'/,
+  )
+})
+
+test('a haiku-tier spawn with a provider profile clears the tier check — same as opus/sonnet', async () => {
+  const { agentRouter } = await import('../src/agent-routes.mjs')
+  const spawnRoute = findRoute(agentRouter((_r, _s, next) => next()), '/api/agents/spawn')
+  const call = (body) =>
+    new Promise((resolve) => {
+      spawnRoute({ body, method: 'POST', headers: {} }, {
+        status(code) { this._code = code; return this },
+        json(payload) { resolve({ status: this._code ?? 200, body: payload }) },
+      }, () => {})
+    })
+  // `demo` is in no agent-local-repos.json here (same fixture as the `remote`
+  // case below), so a mappable tier still 400s — but on the BOX-LOCAL refusal,
+  // never on "mappable tier". That is the proof haiku is now in PROVIDER_TIERS.
+  const r = await call({ task: 't', repo: 'demo', model: 'haiku', provider: 'deepseek-openrouter' })
+  assert.equal(r.status, 400)
+  assert.match(r.body.error, /box-local/)
+  assert.doesNotMatch(r.body.error, /mappable tier/)
 })
 
 test('effort, MCP config and every other launch flag survive a profile untouched', () => {
@@ -294,7 +323,7 @@ test('effort, MCP config and every other launch flag survive a profile untouched
 test('the MCP spawn_agent tool forwards a profile for dev agents only', () => {
   const dev = spawnBody({ task: 't', repo: 'demo', provider: 'deepseek-openrouter' })
   assert.equal(dev.provider, 'deepseek-openrouter')
-  assert.equal(dev.model, 'opus') // the orchestrator's dev default, unchanged
+  assert.equal(dev.model, 'sonnet') // the orchestrator's dev default (this fork: Sonnet, not Opus), unchanged
   assert.equal(spawnBody({ task: 't', repo: 'demo' }).provider, undefined)
   assert.equal(spawnBody({ task: 't', kind: 'knowledge', provider: 'deepseek-openrouter' }).provider, undefined)
 })
