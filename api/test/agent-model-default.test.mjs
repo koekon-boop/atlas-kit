@@ -71,11 +71,19 @@ test('explicit picks still override in every path', () => {
   assert.equal(spawnPicks({ model: 'sonnet', kind: 'knowledge' }).modelId, `claude-sonnet-5${CTX}`)
   assert.equal(spawnPicks({ model: 'fable', kind: 'knowledge' }).modelId, `claude-fable-5${CTX}`)
   assert.equal(spawnPicks({ model: 'fable' }).modelId, `claude-fable-5${CTX}`)
+  assert.equal(spawnPicks({ model: 'haiku', kind: 'knowledge' }).modelId, 'claude-haiku-4-5')
   assert.equal(spawnPicks({ effort: 'max', kind: 'knowledge' }).effortLevel, 'max')
   // …and through the MCP tool, for a dev agent and a knowledge agent alike.
   assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'sonnet', effort: 'max' })).modelId, `claude-sonnet-5${CTX}`)
   assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'sonnet', effort: 'max' })).effortLevel, 'max')
   assert.equal(spawnPicks(spawnBody({ task: 't', kind: 'knowledge', model: 'fable' })).modelId, `claude-fable-5${CTX}`)
+  assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'haiku' })).modelId, 'claude-haiku-4-5')
+})
+
+test('haiku never gets the [1m] suffix — the CLI rejects the long-context beta header for Haiku under subscription auth', () => {
+  // Unlike fable/opus/sonnet, this holds regardless of AGENT_EXTENDED_CONTEXT.
+  assert.equal(spawnPicks({ model: 'haiku' }).modelId, 'claude-haiku-4-5')
+  assert.equal(spawnPicks({ model: 'haiku', kind: 'knowledge' }).modelId, 'claude-haiku-4-5')
 })
 
 test('the spawn lineage parent is stamped only when the orchestrator env is set', () => {
@@ -92,6 +100,7 @@ test('AGENT_EXTENDED_CONTEXT=0 is the [1m] kill-switch — on every model', asyn
   assert.equal(off.spawnPicks({ kind: 'knowledge' }).modelId, 'claude-opus-5')
   assert.equal(off.spawnPicks({}).modelId, 'claude-sonnet-5')
   assert.equal(off.spawnPicks({ model: 'fable' }).modelId, 'claude-fable-5')
+  assert.equal(off.spawnPicks({ model: 'haiku' }).modelId, 'claude-haiku-4-5') // unaffected either way
   if (prev === undefined) delete process.env.AGENT_EXTENDED_CONTEXT
   else process.env.AGENT_EXTENDED_CONTEXT = prev
 })
