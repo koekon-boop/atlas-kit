@@ -4,7 +4,6 @@ import { Hero } from './cards/Hero'
 import { SearchBar } from './SearchBar'
 import { Scorecard } from './cards/Scorecard'
 import { KnowledgeAgents } from './cards/KnowledgeAgents'
-import { News } from './cards/News'
 import { Voice } from './cards/Voice'
 import { Projects } from './cards/Projects'
 import { NoteReader } from './NoteReader'
@@ -54,9 +53,6 @@ function CommandCenterInner() {
             and the dashboard's main control surface. It grounds answers in the
             typed Atlas graph and can spawn/steer the other agents. */}
         <KnowledgeAgents className="col-span-12" vault={VAULT} />
-        {/* Renders only where the optional news-ingest addon is enabled — the
-            card asks GET /api/addons and returns null otherwise. */}
-        <News className="col-span-12" onOpenWiki={openPath} />
         {/* Same runtime gate, for the optional voice addon: spoken recaps of
             fleet events. Null wherever the addon is not enabled. */}
         <Voice className="col-span-12" />
