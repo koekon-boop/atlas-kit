@@ -178,7 +178,7 @@ flowchart TB
 | **Self card + Redeploy** | The kit's own project card, seeded into the vault at setup. `self_deploy: true` + `repo_path:` on any project page adds a bearer-gated, single-flight Redeploy button; the run lives in a transient systemd unit (detached `setsid` fallback) and reports back through a state file, since it restarts the API mid-flight. | `scripts/seed-self-card.mjs`, `api/src/deploy-routes.mjs`, `docs/UPDATING.md` |
 | **Claude Code skills** | Four operator workflows shipped with the repo: `fleet-status`, `ship-protocol`, `deep-research`, `update-config`. | `.claude/skills/` |
 | **Optional addons** | Env-gated directories with an `api/register.mjs` manifest. Four ship today: `semantic-search`, `instagram-ingest`, `news-ingest`, `voice`. Zero enabled = byte-identical to a kit without the framework. | `addons/` |
-| **Model-provider profiles** | Optional named backends a dev agent can spawn against — the **unchanged** Claude-Code harness pointed at an Anthropic-compatible endpoint (DeepSeek via OpenRouter, DeepSeek direct, …). No second agent CLI; no profiles configured = byte-identical to a kit without the feature. | `api/src/providers.mjs`, [docs/PROVIDERS.md](docs/PROVIDERS.md) |
+| **Model-provider profiles** | Optional named backends a dev agent or a knowledge chat can spawn against — the **unchanged** Claude-Code harness pointed at an Anthropic-compatible endpoint (DeepSeek via OpenRouter, DeepSeek direct, …). No second agent CLI; no profiles configured = byte-identical to a kit without the feature. | `api/src/providers.mjs`, [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | **scripts / infra / CI** | `serve.sh` runs three tmux windows (Express, Caddy, the MCP HTTP server) with a `--env-file` and no inherited API key; cron does a 15-min vault refresh, a daily done-clear, a 2-min health watchdog and (once `ATLAS_GITHUB_USER` is set) a half-hourly GitHub-contributions pull for the Scorecard. CI globs every `*.test.mjs` under `api/test` and `addons/*/test` and subtracts an explicit opt-out list, so **adding a test file is enough to gate it**. | `scripts/`, `infra/`, `.github/workflows/ci.yml` |
 
 ### The flows
@@ -293,7 +293,11 @@ This is a headline feature, not an implementation detail:
   non-fast-forward pushes.
 - **`*.md merge=union` for logs.** Add a `.gitattributes` with `*.md merge=union` to
   your vault (the llm-atlas template already does) so append-only files like `log.md`
-  and `index.md` merge cleanly across your phone, agents, and the Kanban.
+  and `index.md` merge cleanly across your phone, agents, and the Kanban. Its one cost —
+  two writers rewriting the *same* frontmatter line leave a duplicate YAML key, which
+  silently untypes the whole page — is **self-healed** after every pull/rebase/merge in
+  the commit queue, and survived by the readers in between
+  ([PROTOCOLS §5a](docs/PROTOCOLS.md#5a-union-merge-doubles-a-frontmatter-key--and-that-silently-deletes-a-card)).
 
 ---
 
