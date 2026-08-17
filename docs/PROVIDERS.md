@@ -119,14 +119,39 @@ This matters more than it looks: hand Claude Code the resolved
 asks your DeepSeek profile for Anthropic's own Sonnet, which OpenRouter will
 happily serve and bill. The kit does not let that happen.
 
+**The picker SHOWS that mapping.** Select a profile and the model dropdown
+relabels itself from the profile's own tier variables — it stops reading
+`Opus / Sonnet` (true of no backend but Anthropic's) and starts reading what will
+actually run:
+
+```
+Provider: [ DeepSeek (OpenRouter) v ]
+Model:    [ Opus   → deepseek/deepseek-v4-pro    v ]
+          [ Sonnet → deepseek/deepseek-v4-flash    ]
+          [ Haiku  → deepseek/deepseek-v4-flash    ]
+```
+
+Three env names, and only these three, are the source of those labels:
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`. They are also the **only** thing about a profile
+the browser ever sees — model slugs, not credentials; every other value in the
+block, your key above all, stays server-side (`GET /api/providers` serves
+`{name, label, tiers}`). A profile that sets none of the three degrades to plain
+tier labels and today's behaviour, unchanged.
+
 Consequences:
 
-- **Opus, Sonnet and Haiku only.** There is no `fable` tier for Claude Code to
-  resolve, so the picker hides Fable while a profile is selected and the API
-  refuses the pair (`400`). Map `ANTHROPIC_DEFAULT_HAIKU_MODEL` too — Claude
-  Code uses the haiku tier internally, and this kit's dropdown also offers it
-  as a selectable dev-agent tier — and `CLAUDE_CODE_SUBAGENT_MODEL` for
-  sub-agents.
+- **A tier the profile does not map is not offered, and is refused.** Map only
+  `ANTHROPIC_DEFAULT_SONNET_MODEL` and both spawn forms offer Sonnet alone; a
+  spawn naming Opus gets a `400` listing that profile's mappable tiers. The check
+  is per profile, so this fork's Haiku spawn tier is offered exactly when the
+  profile maps `ANTHROPIC_DEFAULT_HAIKU_MODEL` (a profile that declares no tier
+  variable at all keeps the fallback set `opus/sonnet/haiku`).
+- **No Fable, ever.** There is no `fable` tier for Claude Code to resolve, so the
+  picker hides Fable while a profile is selected and the API refuses the pair
+  (`400`). Map `ANTHROPIC_DEFAULT_HAIKU_MODEL` regardless — Claude Code uses the
+  haiku tier internally, and this fork also offers it as a selectable spawn tier
+  in both forms — and `CLAUDE_CODE_SUBAGENT_MODEL` for sub-agents.
 - **Effort is untouched.** `--effort high/xhigh/max` is passed exactly as before;
   what a given backend does with it is that backend's business.
 - Everything else on the launch line — the MCP config, `--strict-mcp-config`,
@@ -137,7 +162,8 @@ Consequences:
 
 **Dashboard** — a second dropdown appears beside the model picker on every spawn
 form, but only on a box that has profiles configured. `Anthropic` (the default)
-means no profile: exactly today's behaviour. It applies to a scheduled spawn too.
+means no profile: exactly today's behaviour, full model list included. It applies
+to a scheduled spawn too.
 
 **API** —
 
@@ -152,7 +178,9 @@ Atlas orchestrator can put an agent it spawns on another backend. (A tool-schema
 change reaches only sessions started after it — a long-running orchestrator keeps
 the schema it launched with until it is restarted.)
 
-`GET /api/providers` lists what is configured — **names and labels only**.
+`GET /api/providers` lists what is configured — **names, labels and the tier map
+only** (`{name, label, tiers}`; see the tier mapping above for why those three
+values, and no others, are served).
 
 Every way a profile cannot be honoured is a **`400` with the reason**, never a
 silent fallback: an unknown profile name, an unmappable tier, or a repo that
@@ -202,7 +230,7 @@ and the tmux *server* that a first spawn starts keeps that argv for its whole
 life. `api/test/provider-profiles.test.mjs` drives a real tmux with a stub
 `claude` and greps `ps` to keep that honest.)
 
-It is also never in: `GET /api/providers` (names and labels only), the session
+It is also never in: `GET /api/providers` (names, labels, tier map), the session
 view the dashboard renders, `state.json` (the profile **name** is persisted, the
 env is resolved per launch), or the audit journal. `api/test/provider-profiles.test.mjs`
 sweeps a canary value across all of those.
