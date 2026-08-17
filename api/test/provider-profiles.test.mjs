@@ -69,6 +69,25 @@ fs.writeFileSync(
       },
     },
     'no-key-profile': { label: 'Backend that never mentions the key', env: { ANTHROPIC_BASE_URL: 'https://example.invalid/api' } },
+    // Maps ONE tier. The picker must offer only that one, and the spawn route
+    // must refuse the other — the mappable set is per profile, not per kit.
+    'sonnet-only': { label: 'One tier only', env: { ANTHROPIC_BASE_URL: 'https://example.invalid/api', ANTHROPIC_DEFAULT_SONNET_MODEL: 'some/cheap-model' } },
+    // Every trap for a `tiers` map derived by PATTERN instead of by the
+    // three-name allowlist: a tier that does not exist, a sub-agent override, a
+    // near-miss suffix — and a second copy of the canary, since a profile the
+    // browser now reads a little of must still leak none of its credentials.
+    'pattern-bait': {
+      label: 'Looks like tiers, is not',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://example.invalid/api',
+        ANTHROPIC_AUTH_TOKEN: CANARY,
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'no/such-tier',
+        CLAUDE_CODE_SUBAGENT_MODEL: 'sub/model',
+        ANTHROPIC_DEFAULT_SONNET_MODEL_OLD: 'stale/slug',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'ds/haiku',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: '', // present but empty ⇒ not a mapping
+      },
+    },
     'quoting-torture': { label: 'Everything the shell would otherwise eat', env: { WEIRD: 'it\'s $HOME `and` "more"' } },
     'Bad Name': { label: 'invalid name', env: { A: 'b' } },
     'bad-env-name': { label: 'invalid env key', env: { 'not a var': 'b' } },
@@ -100,7 +119,7 @@ fs.writeFileSync(
 )
 process.env.CLAUDE_BIN = STUB
 
-const { listProviders, resolveProvider } = await import('../src/providers.mjs')
+const { listProviders, resolveProvider, tiersOf } = await import('../src/providers.mjs')
 const {
   LAUNCH_CMD, RESUME_CMD, KNOWLEDGE_LAUNCH_CMD, ATLAS_CONTROL_LAUNCH_CMD, ATLAS_CONTROL_RESUME_CMD,
   ATLAS_WORKER_LAUNCH_CMD, launchCommand, providerLaunch, providerEnvPrefix, knowledgeLaunch, atlasWorkerLaunch,
@@ -125,9 +144,17 @@ const PROFILED_TEMPLATES = [
 
 test('only well-formed profiles load — a malformed one is dropped, never thrown', () => {
   assert.deepEqual(listProviders(), [
-    { name: 'deepseek-openrouter', label: 'DeepSeek (OpenRouter)' },
-    { name: 'no-key-profile', label: 'Backend that never mentions the key' },
-    { name: 'quoting-torture', label: 'Everything the shell would otherwise eat' },
+    {
+      name: 'deepseek-openrouter',
+      label: 'DeepSeek (OpenRouter)',
+      // All THREE: this fork's fixture maps haiku too (as providers.example.json
+      // does), because haiku is a selectable spawn tier here.
+      tiers: { opus: 'deepseek/deepseek-v4-pro', sonnet: 'deepseek/deepseek-v4-flash', haiku: 'deepseek/deepseek-v4-flash' },
+    },
+    { name: 'no-key-profile', label: 'Backend that never mentions the key', tiers: {} },
+    { name: 'pattern-bait', label: 'Looks like tiers, is not', tiers: { haiku: 'ds/haiku' } },
+    { name: 'quoting-torture', label: 'Everything the shell would otherwise eat', tiers: {} },
+    { name: 'sonnet-only', label: 'One tier only', tiers: { sonnet: 'some/cheap-model' } },
   ])
   // Each rejected entry, and why it must be rejected rather than half-applied.
   assert.equal(resolveProvider('Bad Name'), null) // reaches a path/audit line
@@ -336,11 +363,29 @@ test('END TO END, through a real tmux: an ATLAS chat reaches the profiled backen
   }
 })
 
-test('GET /api/providers cannot serve a profile env — the list shape has no room for one', () => {
+test('GET /api/providers serves the tier map and NOTHING else of a profile env', () => {
   const serialized = JSON.stringify({ providers: listProviders() })
   assert.ok(!serialized.includes(CANARY), 'the dropdown source leaked the API key')
   assert.ok(!serialized.includes('openrouter.ai'), 'the dropdown source leaked the endpoint')
-  for (const p of listProviders()) assert.deepEqual(Object.keys(p).sort(), ['label', 'name'])
+  assert.ok(!serialized.includes('example.invalid'), 'the dropdown source leaked the endpoint')
+  for (const p of listProviders()) assert.deepEqual(Object.keys(p).sort(), ['label', 'name', 'tiers'])
+  // The carve-out is THREE LITERAL KEY NAMES, never a pattern over the env block.
+  // `pattern-bait` maps only `haiku`; everything else it carries stays server-side.
+  const bait = listProviders().find((p) => p.name === 'pattern-bait')
+  assert.deepEqual(bait.tiers, { haiku: 'ds/haiku' })
+  for (const leaked of ['no/such-tier', 'sub/model', 'stale/slug'])
+    assert.ok(!serialized.includes(leaked), `a non-allowlisted env value (${leaked}) reached the browser`)
+  // …while the profile itself still carries all of it to the agent's tmux env.
+  assert.equal(resolveProvider('pattern-bait').env.CLAUDE_CODE_SUBAGENT_MODEL, 'sub/model')
+})
+
+test('tiersOf reads the three allowlisted names, and only when they hold a value', () => {
+  assert.deepEqual(tiersOf({ ANTHROPIC_DEFAULT_OPUS_MODEL: 'a/b', ANTHROPIC_DEFAULT_SONNET_MODEL: 'c/d', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'e/f' }), {
+    opus: 'a/b', sonnet: 'c/d', haiku: 'e/f',
+  })
+  assert.deepEqual(tiersOf({ ANTHROPIC_DEFAULT_OPUS_MODEL: '' }), {}) // empty ⇒ not a mapping
+  assert.deepEqual(tiersOf({}), {})
+  assert.deepEqual(tiersOf(undefined), {})
 })
 
 test('the session record + audit line carry the profile NAME only', async () => {
@@ -474,6 +519,58 @@ test('every combination the kit cannot honour is a 400, with the reason', async 
   // means none of these checks runs at all.
   const plain = await call({ task: 't', repo: 'demo' })
   assert.notEqual(plain.status, 400)
+})
+
+test('the mappable-tier gate is PER PROFILE — one kit-wide set is wrong in both directions', async () => {
+  const { agentRouter } = await import('../src/agent-routes.mjs')
+  const spawnRoute = findRoute(agentRouter((_r, _s, next) => next()), '/api/agents/spawn')
+  const call = (body) =>
+    new Promise((resolve) => {
+      spawnRoute({ body, method: 'POST', headers: {} }, {
+        status(code) { this._code = code; return this },
+        json(payload) { resolve({ status: this._code ?? 200, body: payload }) },
+      }, () => {})
+    })
+  // `demo` is in no agent-local-repos.json here, so a DEV spawn that CLEARS the
+  // tier gate stops one check later, at the box-local one. That refusal is how
+  // this test says "accepted" without driving git or tmux.
+  const passedTierGate = (r) => {
+    assert.equal(r.status, 400)
+    assert.match(r.body.error, /box-local/, `refused by the tier gate: ${r.body.error}`)
+  }
+
+  // A profile that maps ONE tier must refuse the other — the kit-wide set would
+  // have let `opus` through to fail at the agent's first turn, since the literal
+  // alias `opus` is all the gateway would get.
+  const opusOnSonnetOnly = await call({ task: 't', repo: 'demo', model: 'opus', provider: 'sonnet-only' })
+  assert.equal(opusOnSonnetOnly.status, 400)
+  assert.match(opusOnSonnetOnly.body.error, /mappable tier \(sonnet\)/)
+  assert.match(opusOnSonnetOnly.body.error, /"sonnet-only"/) // names the profile, not "a provider profile"
+  passedTierGate(await call({ task: 't', repo: 'demo', model: 'sonnet', provider: 'sonnet-only' }))
+  // A knowledge chat is gated by the same per-profile rule — the check sits above
+  // the kind branch, so both spawn forms answer to their profile's own tiers.
+  const chat = await call({ task: 't', kind: 'knowledge', model: 'opus', provider: 'sonnet-only' })
+  assert.equal(chat.status, 400)
+  assert.match(chat.body.error, /mappable tier \(sonnet\)/)
+
+  // The other direction: a profile that DOES map haiku must not be refused for
+  // it. Upstream stops one check EARLIER (haiku is in no kit-wide model list
+  // there); on THIS fork haiku is a real spawn model, so `pattern-bait` — which
+  // maps haiku and nothing else — must clear the gate outright.
+  passedTierGate(await call({ task: 't', repo: 'demo', model: 'haiku', provider: 'pattern-bait' }))
+  // …and the tiers that same profile does NOT map are still refused, listing it.
+  const opusOnBait = await call({ task: 't', repo: 'demo', model: 'opus', provider: 'pattern-bait' })
+  assert.equal(opusOnBait.status, 400)
+  assert.match(opusOnBait.body.error, /mappable tier \(haiku\)/)
+
+  // A profile declaring NO tier vars keeps today's behaviour exactly — this must
+  // not newly refuse a spawn that works today. "Today" on this fork is the
+  // three-tier fallback set, haiku included (PROVIDER_TIERS).
+  passedTierGate(await call({ task: 't', repo: 'demo', model: 'opus', provider: 'no-key-profile' }))
+  passedTierGate(await call({ task: 't', repo: 'demo', model: 'sonnet', provider: 'no-key-profile' }))
+  passedTierGate(await call({ task: 't', repo: 'demo', model: 'haiku', provider: 'no-key-profile' }))
+  const fable = await call({ task: 't', repo: 'demo', model: 'fable', provider: 'no-key-profile' })
+  assert.match(fable.body.error, /mappable tier \(opus\/sonnet\/haiku\)/)
 })
 
 /* Pull one route's handler out of an Express router without binding a port —
