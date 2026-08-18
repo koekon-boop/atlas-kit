@@ -1,0 +1,200 @@
+{
+  "_comment": "A REAL-SHAPED POST /air/offer_requests?return_offers=true body (Duffel-Version: v2), trimmed to the fields the adapter reads and to three offers. Hand-built from https://duffel.com/docs/api/v2/offers — no live call was ever made, and none may be: the addon's whole test suite is offline. The shapes that matter and are easy to get wrong are all present: total_amount is a STRING, departing_at/arriving_at are LOCAL wall clocks with NO offset, time_zone is on the airport object, duration is ISO 8601, baggages live per passenger per segment, and offer 3 is partial:true so the adapter has something to refuse.",
+  "data": {
+    "id": "orq_0000AfixtureRequest",
+    "live_mode": false,
+    "cabin_class": "economy",
+    "created_at": "2026-08-18T09:00:00.000Z",
+    "slices": [{ "origin": { "iata_code": "BER" }, "destination": { "iata_code": "HND" }, "departure_date": "2026-10-15" }],
+    "passengers": [{ "id": "pas_0000Afixture", "type": "adult" }],
+    "offers": [
+      {
+        "id": "off_0000AoneTicketTK",
+        "live_mode": false,
+        "partial": false,
+        "total_amount": "782.40",
+        "total_currency": "EUR",
+        "base_amount": "610.00",
+        "tax_amount": "172.40",
+        "total_emissions_kg": "1104",
+        "expires_at": "2026-08-18T09:30:00.000Z",
+        "owner": { "iata_code": "TK", "name": "Turkish Airlines" },
+        "conditions": {
+          "change_before_departure": { "allowed": true, "penalty_amount": "120.00", "penalty_currency": "EUR" },
+          "refund_before_departure": { "allowed": false, "penalty_amount": null, "penalty_currency": null }
+        },
+        "slices": [
+          {
+            "duration": "PT21H10M",
+            "fare_brand_name": "EcoFlex",
+            "origin": { "iata_code": "BER" },
+            "destination": { "iata_code": "HND" },
+            "segments": [
+              {
+                "id": "seg_0000A1",
+                "duration": "PT03H30M",
+                "departing_at": "2026-10-15T09:35:00",
+                "arriving_at": "2026-10-15T14:05:00",
+                "origin_terminal": "1",
+                "destination_terminal": "I",
+                "marketing_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "marketing_carrier_flight_number": "1728",
+                "operating_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "aircraft": { "name": "Airbus A321" },
+                "origin": {
+                  "iata_code": "BER",
+                  "name": "Berlin Brandenburg Airport",
+                  "iata_city_code": "BER",
+                  "city_name": "Berlin",
+                  "time_zone": "Europe/Berlin"
+                },
+                "destination": {
+                  "iata_code": "IST",
+                  "name": "Istanbul Airport",
+                  "iata_city_code": "IST",
+                  "city_name": "Istanbul",
+                  "time_zone": "Europe/Istanbul"
+                },
+                "passengers": [
+                  {
+                    "passenger_id": "pas_0000Afixture",
+                    "cabin_class": "economy",
+                    "cabin_class_marketing_name": "Economy",
+                    "baggages": [
+                      { "type": "carry_on", "quantity": 1 },
+                      { "type": "checked", "quantity": 1 }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "seg_0000A2",
+                "duration": "PT11H30M",
+                "departing_at": "2026-10-15T20:15:00",
+                "arriving_at": "2026-10-16T13:45:00",
+                "origin_terminal": "I",
+                "destination_terminal": "3",
+                "marketing_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "marketing_carrier_flight_number": "198",
+                "operating_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "aircraft": { "name": "Boeing 787-9" },
+                "origin": {
+                  "iata_code": "IST",
+                  "name": "Istanbul Airport",
+                  "iata_city_code": "IST",
+                  "city_name": "Istanbul",
+                  "time_zone": "Europe/Istanbul"
+                },
+                "destination": {
+                  "iata_code": "HND",
+                  "name": "Haneda Airport",
+                  "iata_city_code": "TYO",
+                  "city_name": "Tokyo",
+                  "time_zone": "Asia/Tokyo"
+                },
+                "passengers": [
+                  {
+                    "passenger_id": "pas_0000Afixture",
+                    "cabin_class": "economy",
+                    "cabin_class_marketing_name": "Economy",
+                    "baggages": [
+                      { "type": "carry_on", "quantity": 1 },
+                      { "type": "checked", "quantity": 1 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "off_0000AnonstopJL",
+        "live_mode": false,
+        "total_amount": "1240.00",
+        "total_currency": "EUR",
+        "base_amount": "980.00",
+        "tax_amount": "260.00",
+        "total_emissions_kg": "980",
+        "expires_at": "2026-08-18T09:30:00.000Z",
+        "owner": { "iata_code": "JL", "name": "Japan Airlines" },
+        "conditions": {
+          "change_before_departure": { "allowed": true, "penalty_amount": "0.00", "penalty_currency": "EUR" },
+          "refund_before_departure": { "allowed": true, "penalty_amount": "150.00", "penalty_currency": "EUR" }
+        },
+        "slices": [
+          {
+            "duration": "PT11H45M",
+            "fare_brand_name": "Standard",
+            "origin": { "iata_code": "BER" },
+            "destination": { "iata_code": "HND" },
+            "segments": [
+              {
+                "id": "seg_0000B1",
+                "duration": "PT11H45M",
+                "departing_at": "2026-10-15T11:00:00",
+                "arriving_at": "2026-10-16T05:45:00",
+                "marketing_carrier": { "iata_code": "JL", "name": "Japan Airlines" },
+                "marketing_carrier_flight_number": "408",
+                "operating_carrier": { "iata_code": "JL", "name": "Japan Airlines" },
+                "aircraft": { "name": "Boeing 787-8" },
+                "origin": {
+                  "iata_code": "BER",
+                  "name": "Berlin Brandenburg Airport",
+                  "iata_city_code": "BER",
+                  "city_name": "Berlin",
+                  "time_zone": "Europe/Berlin"
+                },
+                "destination": {
+                  "iata_code": "HND",
+                  "name": "Haneda Airport",
+                  "iata_city_code": "TYO",
+                  "city_name": "Tokyo",
+                  "time_zone": "Asia/Tokyo"
+                },
+                "passengers": [
+                  {
+                    "passenger_id": "pas_0000Afixture",
+                    "cabin_class": "economy",
+                    "cabin_class_marketing_name": "Economy Standard",
+                    "baggages": [
+                      { "type": "carry-on", "quantity": 1 },
+                      { "type": "checked", "quantity": 2 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "off_0000ApartialHalf",
+        "live_mode": false,
+        "partial": true,
+        "total_amount": "310.00",
+        "total_currency": "EUR",
+        "owner": { "iata_code": "TK", "name": "Turkish Airlines" },
+        "slices": [
+          {
+            "duration": "PT03H30M",
+            "segments": [
+              {
+                "id": "seg_0000C1",
+                "duration": "PT03H30M",
+                "departing_at": "2026-10-15T09:35:00",
+                "arriving_at": "2026-10-15T14:05:00",
+                "marketing_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "marketing_carrier_flight_number": "1728",
+                "operating_carrier": { "iata_code": "TK", "name": "Turkish Airlines" },
+                "origin": { "iata_code": "BER", "iata_city_code": "BER", "time_zone": "Europe/Berlin" },
+                "destination": { "iata_code": "IST", "iata_city_code": "IST", "time_zone": "Europe/Istanbul" },
+                "passengers": [{ "passenger_id": "pas_0000Afixture", "cabin_class": "economy", "baggages": [] }]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
