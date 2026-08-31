@@ -422,18 +422,21 @@ export interface TaskCategorySel {
   area?: string
 }
 
-/** Create a new Atlas task (Kanban "+ New task") — writes a type:task note to
- *  Tasks/ (status: inbox, optional `due`, optional free-text `body` below the
- *  title) and commits it via the single-writer commit queue. The bearer is
- *  injected server-side (Caddy); the browser holds none. With no `category`, the
- *  server infers a project/area from the title; pass one to set it explicitly.
- *  Returns the new task's path + resolved project/area on success. */
+/** Create a new Atlas task (Kanban "+ New task", the quick-capture screen) —
+ *  writes a type:task note to Tasks/ (status: inbox, optional `due`, optional
+ *  free-text `body` below the title) and commits it via the single-writer commit
+ *  queue. The bearer is injected server-side (Caddy); the browser holds none.
+ *  With no `category`, the server infers a project/area from the title; pass one
+ *  to set it explicitly. `source` writes the Legend `source:` provenance facet
+ *  verbatim (e.g. `capture` for the phone quick-capture surface). Returns the
+ *  new task's path + resolved project/area on success. */
 export async function createTask(
   title: string,
   due?: string,
   category?: TaskCategorySel,
   body?: string,
   vault?: string,
+  source?: string,
 ): Promise<{
   ok: boolean
   path?: string
@@ -454,6 +457,7 @@ export async function createTask(
         project: category?.project || undefined,
         projectIdea: category?.projectIdea || undefined,
         area: category?.area || undefined,
+        source: source || undefined,
         vault,
       }),
     })

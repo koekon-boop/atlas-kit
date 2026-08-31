@@ -1,0 +1,16 @@
+{
+  "name": "Atlas Capture",
+  "short_name": "Capture",
+  "start_url": "/capture",
+  "scope": "/capture",
+  "display": "standalone",
+  "background_color": "#f3eee2",
+  "theme_color": "#f3eee2",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any"
+    }
+  ]
+}
