@@ -13,7 +13,17 @@
  * ------------------------------------------------------------------ */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { agentName, deriveEvents, joinDictation, pickDictation, voiceStatus } from './voice.ts'
+import {
+  agentName,
+  cleanForSpeech,
+  deriveEvents,
+  joinDictation,
+  newestReply,
+  nextSpeech,
+  pickDictation,
+  replySig,
+  voiceStatus,
+} from './voice.ts'
 
 const AT = '2026-08-15T12:00:00.000Z'
 const session = (over) => ({ id: 'a1', task: 'do a thing', status: 'running', lastOutput: 'tail text', ...over })
@@ -105,4 +115,82 @@ test('voiceStatus tolerates an addon that is absent or answering something else'
   assert.equal(voiceStatus({ name: 'voice', description: '', hooks: [], status: { error: 'boom' } }), null)
   const real = { tts: { configured: false, available: false }, stt: { configured: false, available: false } }
   assert.equal(voiceStatus({ name: 'voice', description: '', hooks: [], status: real }), real)
+})
+
+/* --- read replies aloud (the header toggle) ----------------------------- *
+ * nextSpeech is what stops the toggle from narrating the backlog — a page load,
+ * a toggle flip or a chat switch must seed silently and only speak what arrives
+ * AFTER. Pure, so it is pinned here rather than in the browser.
+ */
+
+const reply = (over) => ({ role: 'assistant', ts: '2026-08-31T10:00:00Z', text: 'hello', tools: [], ...over })
+const hist = (...messages) => ({ messages })
+
+test('nextSpeech: nothing is spoken while the toggle is off', () => {
+  const r = nextSpeech({ armed: false, lastSig: null }, { on: false, loaded: true, idle: true, reply: reply() })
+  assert.equal(r.speak, null)
+  assert.equal(r.state.armed, false)
+})
+
+test('nextSpeech: arming on an existing chat only seeds — the backlog is never narrated', () => {
+  const seed = nextSpeech(
+    { armed: false, lastSig: null },
+    { on: true, loaded: true, idle: true, reply: reply({ text: 'an old backlog reply' }) },
+  )
+  assert.equal(seed.speak, null, 'the reply already on screen is not read out')
+  assert.equal(seed.state.armed, true)
+  const again = nextSpeech(seed.state, { on: true, loaded: true, idle: true, reply: reply({ text: 'an old backlog reply' }) })
+  assert.equal(again.speak, null, 'still the same newest reply → still silent')
+})
+
+test('nextSpeech: an unloaded history never speaks or arms', () => {
+  const r = nextSpeech({ armed: false, lastSig: null }, { on: true, loaded: false, idle: true, reply: null })
+  assert.equal(r.speak, null)
+  assert.equal(r.state.armed, false)
+})
+
+test('nextSpeech: a NEW reply after arming is spoken once, verbatim, only when the turn is done', () => {
+  const seed = nextSpeech({ armed: false, lastSig: null }, { on: true, loaded: true, idle: false, reply: null })
+  const streaming = nextSpeech(seed.state, { on: true, loaded: true, idle: false, reply: reply({ ts: 't2', text: 'partial…' }) })
+  assert.equal(streaming.speak, null, 'a reply mid-turn (agent still running) is not spoken')
+  const done = nextSpeech(streaming.state, { on: true, loaded: true, idle: true, reply: reply({ ts: 't2', text: 'the full answer' }) })
+  assert.equal(done.speak, 'the full answer')
+  const repoll = nextSpeech(done.state, { on: true, loaded: true, idle: true, reply: reply({ ts: 't2', text: 'the full answer' }) })
+  assert.equal(repoll.speak, null, 'the same reply is not spoken again on the next poll')
+})
+
+test('nextSpeech: turning the toggle off disarms — re-arming re-seeds, still no backlog', () => {
+  const spoke = nextSpeech({ armed: true, lastSig: 'old' }, { on: true, loaded: true, idle: true, reply: reply({ ts: 't9', text: 'newest' }) })
+  assert.equal(spoke.speak, 'newest')
+  const off = nextSpeech(spoke.state, { on: false, loaded: true, idle: true, reply: reply({ ts: 't9', text: 'newest' }) })
+  assert.equal(off.state.armed, false)
+  const back = nextSpeech(off.state, { on: true, loaded: true, idle: true, reply: reply({ ts: 't9', text: 'newest' }) })
+  assert.equal(back.speak, null, 're-seeded against what is on screen now')
+})
+
+test('newestReply picks the last assistant turn that actually said something', () => {
+  assert.equal(newestReply(null), null)
+  assert.equal(
+    newestReply(hist(reply({ text: 'a' }), { role: 'user', ts: null, text: 'q', tools: [] }, reply({ text: 'b' }))).text,
+    'b',
+  )
+  assert.equal(
+    newestReply(hist(reply({ text: 'real' }), reply({ text: '   ' }))).text,
+    'real',
+    'an empty / tool-only trailing turn does not count',
+  )
+})
+
+test('replySig changes when the reply grows or a new turn starts', () => {
+  assert.notEqual(replySig(reply({ ts: 't', text: 'hi' })), replySig(reply({ ts: 't', text: 'hi there' })))
+  assert.notEqual(replySig(reply({ ts: 't1', text: 'x' })), replySig(reply({ ts: 't2', text: 'x' })))
+})
+
+test('cleanForSpeech strips markdown, code fences and links down to plain prose', () => {
+  const md = '# Heading\n\nHere is `code` and a [link](https://x.com) and **bold**.\n\n```\nrm -rf /\n```\n\n- one\n- two'
+  const out = cleanForSpeech(md)
+  assert.doesNotMatch(out, /```|rm -rf|\]\(http|\*\*/)
+  assert.doesNotMatch(out, /^#/m)
+  assert.match(out, /Here is code and a link and bold/)
+  assert.match(out, /code block/)
 })

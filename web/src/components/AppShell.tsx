@@ -6,6 +6,7 @@ import { CommandCenter } from './CommandCenter'
 import { AtlasCenter } from './AtlasCenter'
 import { NewsCenter } from './NewsCenter'
 import { ThemeSwitcher } from './ThemeSwitcher'
+import { SpeakReplies } from './SpeakReplies'
 import { AsciiBackdrop } from './AsciiBackdrop'
 
 // One tasteful staggered reveal on load. No looping animation — this runs
@@ -65,7 +66,10 @@ export function AppShell() {
 
           <TabBar active={active} onSelect={setActive} />
 
-          <ThemeSwitcher />
+          <div className="flex items-center gap-3">
+            <SpeakReplies />
+            <ThemeSwitcher />
+          </div>
         </motion.header>
 
         <motion.main variants={rise} transition={reveal} className="relative mt-4 flex-1 sm:mt-6">

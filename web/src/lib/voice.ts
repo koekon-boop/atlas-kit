@@ -13,7 +13,7 @@
  * the event derivation is the part that decides how often anything speaks, and
  * an off-by-one there is a dashboard that narrates itself.
  * ------------------------------------------------------------------ */
-import type { AgentSession, AddonInfo } from './api'
+import type { AgentSession, AddonInfo, AgentHistoryMessage } from './api'
 // The one VALUE import here carries its extension (the type imports above erase),
 // so `node --test` can load this module directly through type-stripping — bare
 // specifiers are a bundler convention node does not share. See voice.test.mjs.
@@ -132,6 +132,98 @@ export function deriveEvents(
     })
   }
   return { events, snapshot }
+}
+
+/* --- read new agent replies aloud (the dashboard header toggle) ---------- *
+ * The pure half of the "read answers aloud" feature: which reply to speak, and
+ * the discipline that keeps it from narrating the backlog. The DOM/audio half
+ * is lib/speak.ts; the wiring is AgentList's AgentRow. Everything here is unit
+ * tested (voice.test.mjs) — the seed-then-speak decision is what stops a page
+ * load or a toggle flip from reciting the whole conversation.
+ * ----------------------------------------------------------------------- */
+
+/** Hard client cap on what is sent to be spoken — mirrors the voice addon's own
+ *  default (`ATLAS_VOICE_MAX_SPOKEN_CHARS`, 700): the on-box route slices to it
+ *  server-side anyway, and this keeps the browser fallback (which has no server
+ *  cap) from reading out a wall of text. Long replies are truncated, not
+ *  dropped. */
+export const SPOKEN_CAP = 700
+
+/** Markdown/code → plain prose for a TTS engine: no fences, no link or image
+ *  syntax, no heading/list/emphasis punctuation. Same intent as the voice
+ *  addon's own "no markdown, no code, no bullets" spoken-text rule. */
+export function cleanForSpeech(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, ' — code block — ')
+    .replace(/~~~[\s\S]*?~~~/g, ' — code block — ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s*([-*_])(?:\s*\1){2,}\s*$/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n{2,} */g, '. ')
+    .replace(/ *\n */g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([.,;:!?])/g, '$1')
+    .trim()
+}
+
+/** Signature that changes when the newest reply does — its timestamp plus its
+ *  final length: enough to tell "same turn, still streaming" from "a new turn". */
+export function replySig(m: AgentHistoryMessage): string {
+  return `${m.ts ?? ''}#${m.text.length}`
+}
+
+/** The newest assistant turn that actually said something — tool-only turns and
+ *  the empty in-progress turn do not count. */
+export function newestReply(
+  history: { messages: AgentHistoryMessage[] } | null | undefined,
+): AgentHistoryMessage | null {
+  const msgs = history?.messages
+  if (!msgs) return null
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant' && msgs[i].text.trim()) return msgs[i]
+  }
+  return null
+}
+
+export interface SpeakState {
+  /** false until the first history poll after the toggle was armed. */
+  armed: boolean
+  /** signature of the newest reply already accounted for. */
+  lastSig: string | null
+}
+
+export const IDLE_SPEAK_STATE: SpeakState = { armed: false, lastSig: null }
+
+/**
+ * Decide whether an incoming history poll should be read aloud.
+ *
+ * 🔴 THE BACKLOG IS NEVER NARRATED. The first poll after the toggle is armed
+ * (`on` true, history loaded) only SEEDS the marker; nothing is spoken then.
+ * Only a later reply — a different signature, on a finished turn (`idle`) — is
+ * spoken, and each one only once. Turning the toggle off, or closing the
+ * transcript, disarms; re-arming re-seeds against whatever is on screen at that
+ * moment. This mirrors deriveEvents' "a session first seen is never an event".
+ */
+export function nextSpeech(
+  prev: SpeakState,
+  input: { on: boolean; loaded: boolean; idle: boolean; reply: AgentHistoryMessage | null },
+): { state: SpeakState; speak: string | null } {
+  if (!input.on || !input.loaded) return { state: IDLE_SPEAK_STATE, speak: null }
+  const sig = input.reply ? replySig(input.reply) : null
+  if (!prev.armed) return { state: { armed: true, lastSig: sig }, speak: null }
+  if (!input.idle || sig == null || sig === prev.lastSig) return { state: prev, speak: null }
+  return { state: { armed: true, lastSig: sig }, speak: input.reply!.text }
 }
 
 /* --- dictation ------------------------------------------------------------ */
