@@ -7642,3 +7642,75 @@ button.capture-job__title--link {
 .prose__callout--done .prose__callout-title {
   color: var(--status-green);
 }
+
+/* ================================================================= *
+ * Quick capture — the one-field, home-screen to-do surface
+ * (web/src/components/QuickCapture.tsx, routed at /capture in main.tsx).
+ * Sized for one-handed iPhone use; themed off the same tokens as the
+ * rest, so it is correct in every theme (light and dark).
+ * ================================================================= */
+.qcap-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: max(1rem, env(safe-area-inset-top)) 1rem calc(1rem + env(safe-area-inset-bottom));
+}
+.qcap {
+  width: 100%;
+  max-width: 30rem;
+  margin-top: 12vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding: 1.25rem;
+}
+.qcap__title {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+.qcap__input {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  color: var(--text-bright);
+  font-family: var(--font-body);
+  /* ≥16px so iOS Safari does not zoom the viewport on focus. */
+  font-size: 1.1rem;
+  line-height: 1.4;
+  outline: 0;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.qcap__input:focus {
+  border-color: var(--hairline-strong);
+  box-shadow: 0 0 16px var(--glow-cyan);
+}
+.qcap__input::placeholder {
+  color: var(--text-faint);
+}
+/* Full-width, generous tap target — overrides the compact .btn sizing. */
+.qcap__submit {
+  width: 100%;
+  padding: 0.95rem 1rem;
+  font-size: 0.78rem;
+  border-radius: 10px;
+}
+.qcap__msg {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  min-height: 1.2em;
+}
+.qcap__msg--hint {
+  color: var(--text-faint);
+}
+.qcap__msg--ok {
+  color: var(--status-green);
+}
+.qcap__msg--err {
+  color: var(--status-red);
+}
