@@ -2,13 +2,11 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import { Card, EmptyState } from '../Card'
 import { useAddons } from '../../lib/addons'
 import { useAgents } from '../../lib/useAgents'
+import { sayAloud, stopAll, useSpeaking } from '../../lib/speak'
 import {
   deriveEvents,
   requestRecap,
-  speak,
   speechSupported,
-  stopSpeaking,
-  synthesize,
   voiceStatus,
   type AgentSnapshot,
   type FleetEvent,
@@ -75,49 +73,25 @@ function VoiceCard({ className, status }: { className: string; status: VoiceStat
   const [events, setEvents] = useState<FleetEvent[]>([])
   const [recaps, setRecaps] = useState<Record<string, string>>({})
   const [busyKey, setBusyKey] = useState('')
-  const [speaking, setSpeaking] = useState(false)
   const [note, setNote] = useState('')
   const [auto, setAuto] = useState(readPref)
 
   const snapRef = useRef<Record<string, AgentSnapshot>>({})
   const autoRef = useRef(auto)
   autoRef.current = auto
-  const audioRef = useRef<HTMLAudioElement | null>(null)
   const onBoxTts = !!status?.tts.available
+  // The shared speech path (lib/speak.ts) — the exact same try-on-box-then-
+  // browser `say()` this card used to carry inline, now also driven by the
+  // header "read replies aloud" toggle. `speaking` reflects either surface.
+  const speaking = useSpeaking()
 
-  /** Say something out loud: the on-box engine when the box has one, the
-   *  browser's own voice otherwise. Either way a new utterance replaces the one
-   *  in flight — a queue of stale recaps is worse than the newest one. */
+  /** Say something out loud; a new utterance replaces the one in flight. */
   const say = async (text: string) => {
-    stopSpeaking()
-    audioRef.current?.pause()
-    setSpeaking(true)
-    if (onBoxTts) {
-      const blob = await synthesize(text)
-      if (blob) {
-        const url = URL.createObjectURL(blob)
-        const el = new Audio(url)
-        audioRef.current = el
-        el.onended = el.onerror = () => {
-          URL.revokeObjectURL(url)
-          setSpeaking(false)
-        }
-        void el.play().catch(() => setSpeaking(false))
-        return
-      }
-      // The engine or the route is unreachable — fall through to the browser.
-    }
-    if (!speak(text, { onEnd: () => setSpeaking(false) })) {
-      setSpeaking(false)
-      setNote('this browser has no speech synthesis — the text is above')
-    }
+    const r = await sayAloud(text, { onBox: onBoxTts })
+    if (r === 'silent') setNote('this browser has no speech synthesis — the text is above')
   }
 
-  const stop = () => {
-    stopSpeaking()
-    audioRef.current?.pause()
-    setSpeaking(false)
-  }
+  const stop = () => stopAll()
 
   // One diff per fleet poll. `view` is replaced wholesale by the shared poll, so
   // it is the whole dependency.

@@ -46,6 +46,9 @@ import { modelOptions, keepModel, modelTitle } from '../../lib/modelTiers'
 import { lockBodyScroll } from '../../lib/scrollLock'
 import { MicField } from '../MicField'
 import { ScheduleButton } from '../ScheduleButton'
+import { useReadAloud } from '../../lib/readAloud'
+import { sayAloud } from '../../lib/speak'
+import { cleanForSpeech, newestReply, nextSpeech, IDLE_SPEAK_STATE, SPOKEN_CAP, type SpeakState } from '../../lib/voice'
 
 // The tiers a DEV spawn may pick, in dropdown order. A provider profile narrows
 // and relabels this list (modelTiers.ts); without one it renders verbatim.
@@ -1249,6 +1252,27 @@ export function AgentRow({
     if (s.menu && !prevMenu.current) setExpanded(true)
     prevMenu.current = s.menu
   }, [s.menu])
+
+  // Read replies aloud — the dashboard header's toggle (voice addon only, gated
+  // there). When it is on AND this transcript is open, each NEW finished agent
+  // reply here is spoken once, through the same on-box→browser path the Voice
+  // card uses (lib/speak.ts), verbatim — no model call. The backlog already on
+  // screen is never narrated: nextSpeech seeds a marker on the first poll and
+  // only speaks a later, different reply on a finished turn (lib/voice.ts,
+  // unit-tested). Switching the toggle off resets `on` here and stops the audio
+  // in the toggle itself.
+  const readAloud = useReadAloud()
+  const speechRef = useRef<SpeakState>(IDLE_SPEAK_STATE)
+  useEffect(() => {
+    const { state, speak: line } = nextSpeech(speechRef.current, {
+      on: readAloud && expanded,
+      loaded: !!history,
+      idle: s.status === 'idle',
+      reply: newestReply(history),
+    })
+    speechRef.current = state
+    if (line) void sayAloud(cleanForSpeech(line).slice(0, SPOKEN_CAP))
+  }, [readAloud, expanded, history, s.status])
 
   // While expanded, pull the fuller transcript; keep refreshing while the agent
   // is alive — 'running' (working) or 'idle' (its menu changes as you navigate).
