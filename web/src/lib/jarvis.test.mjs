@@ -142,7 +142,7 @@ test('brief: built only from readings present — missing sections are skipped, 
   assert.match(full, /In Home it is 14 degrees, overcast, between 10 and 20 today\./)
   assert.match(full, /1 task in progress, 1 overdue/)
   assert.match(full, /Top of the pile: Ship it\./)
-  assert.match(full, /Agents: 1 working, 1 waiting on you\./, 'background Atlas passes are not agents waiting on you')
+  assert.match(full, /Agents: 1 working, 1 idle\./, 'background Atlas passes are not counted')
   assert.match(full, /45 percent memory and 25 percent CPU load/)
   assert.match(full, /Latest headline: Something happened\.$/)
 

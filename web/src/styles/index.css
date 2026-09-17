@@ -7829,9 +7829,15 @@ button.capture-job__title--link {
 @media (min-width: 1280px) {
   .jv-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr);
-    grid-template-areas: 'clock core agenda' 'vitals core fleet' 'recall core fleet';
+    grid-template-areas: 'left core right';
     align-items: start;
   }
+}
+.jv-col { display: contents; }
+@media (min-width: 1280px) {
+  .jv-col { display: flex; flex-direction: column; gap: 0.9rem; min-width: 0; }
+  .jv-col--left { grid-area: left; }
+  .jv-col--right { grid-area: right; }
 }
 .jv-core { grid-area: core; }
 .jv-area-clock { grid-area: clock; }

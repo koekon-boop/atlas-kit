@@ -120,36 +120,39 @@ export function JarvisCenter() {
       <div className="jv">
         <Boot pages={pages?.length ?? null} voice={has('voice')} host={host} agents={view ? sessions.length : null} />
         <div className="jv-grid">
-          <section className="jv-panel jv-area-clock" aria-label="clock and weather">
-            <ClockPanel now={now} weatherOn={weatherOn} weather={weather.data} />
-          </section>
+          {/* Side columns are display:contents below the widest breakpoint, so
+              on a phone the panels reorder freely around the console. */}
+          <div className="jv-col jv-col--left">
+            <section className="jv-panel jv-area-clock" aria-label="clock and weather">
+              <ClockPanel now={now} weatherOn={weatherOn} weather={weather.data} />
+            </section>
+            <section className="jv-panel jv-area-vitals" aria-label="system vitals">
+              <Vitals host={host} />
+            </section>
+            <section className="jv-panel jv-area-recall" aria-label="memory">
+              <h2 className="jv-h">Memory · Atlas</h2>
+              <SearchBar onOpenWiki={openPath} vault={VAULT} placeholder="Recall from the vault…" />
+            </section>
+          </div>
 
           <section className="jv-core" aria-label="Jarvis">
             <Console brief={brief} />
           </section>
 
-          <section className="jv-panel jv-area-vitals" aria-label="system vitals">
-            <Vitals host={host} />
-          </section>
-
-          <section className="jv-panel jv-area-agenda" aria-label="agenda">
-            <AgendaPanel
-              tasks={tasks}
-              agenda={agenda}
-              events={events}
-              mail={dash?.gmailHighlights?.items ?? null}
-              onOpen={openPath}
-            />
-          </section>
-
-          <section className="jv-panel jv-area-fleet" aria-label="agents">
-            <Fleet sessions={view ? sessions : null} />
-          </section>
-
-          <section className="jv-panel jv-area-recall" aria-label="memory">
-            <h2 className="jv-h">Memory · Atlas</h2>
-            <SearchBar onOpenWiki={openPath} vault={VAULT} placeholder="Recall from the vault…" />
-          </section>
+          <div className="jv-col jv-col--right">
+            <section className="jv-panel jv-area-agenda" aria-label="agenda">
+              <AgendaPanel
+                tasks={tasks}
+                agenda={agenda}
+                events={events}
+                mail={dash?.gmailHighlights?.items ?? null}
+                onOpen={openPath}
+              />
+            </section>
+            <section className="jv-panel jv-area-fleet" aria-label="agents">
+              <Fleet sessions={view ? sessions : null} />
+            </section>
+          </div>
         </div>
         <Ticker on={newsOn} items={news.data?.items ?? null} onOpen={openPath} />
       </div>
@@ -733,7 +736,7 @@ function Fleet({ sessions }: { sessions: AgentSession[] | null }) {
   return (
     <>
       <h2 className="jv-h">
-        Agents <span className="jv-h__count tnum">{sessions ? `${running} working · ${list.length - running} waiting` : '…'}</span>
+        Agents <span className="jv-h__count tnum">{sessions ? `${running} working · ${list.length - running} idle` : '…'}</span>
       </h2>
       {sessions && list.length === 0 ? <div className="jv-note">No agents online.</div> : null}
       <ul className="jv-list">

@@ -224,8 +224,8 @@ export function composeBrief(b: BriefInput): string {
   const ag = (b.agents ?? []).filter((s) => s.kind !== 'atlas-pass')
   if (b.agents) {
     const running = ag.filter((s) => s.status === 'running').length
-    const waiting = ag.filter((s) => s.status === 'idle').length
-    out.push(running || waiting ? `Agents: ${running} working, ${waiting} waiting on you.` : 'No agents are running.')
+    const idle = ag.filter((s) => s.status === 'idle').length
+    out.push(running || idle ? `Agents: ${running} working, ${idle} idle.` : 'No agents are running.')
   }
 
   const h = b.host
