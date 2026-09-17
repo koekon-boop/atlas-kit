@@ -5,6 +5,7 @@ import { useAgentFocus } from '../lib/agentFocus'
 import { CommandCenter } from './CommandCenter'
 import { AtlasCenter } from './AtlasCenter'
 import { NewsCenter } from './NewsCenter'
+import { JarvisCenter } from './JarvisCenter'
 import { ThemeSwitcher } from './ThemeSwitcher'
 import { SpeakReplies } from './SpeakReplies'
 import { AsciiBackdrop } from './AsciiBackdrop'
@@ -73,7 +74,15 @@ export function AppShell() {
         </motion.header>
 
         <motion.main variants={rise} transition={reveal} className="relative mt-4 flex-1 sm:mt-6">
-          {active === 'command' ? <CommandCenter /> : active === 'atlas' ? <AtlasCenter /> : <NewsCenter />}
+          {active === 'command' ? (
+            <CommandCenter />
+          ) : active === 'atlas' ? (
+            <AtlasCenter />
+          ) : active === 'news' ? (
+            <NewsCenter />
+          ) : (
+            <JarvisCenter />
+          )}
         </motion.main>
       </motion.div>
     </div>

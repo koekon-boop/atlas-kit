@@ -1,11 +1,12 @@
 import { motion, type Transition, type Variants } from 'framer-motion'
 
-export type TabId = 'command' | 'atlas' | 'news'
+export type TabId = 'command' | 'atlas' | 'news' | 'jarvis'
 
 export const TABS: { id: TabId; label: string; short: string }[] = [
   { id: 'command', label: 'Home', short: 'Home' },
   { id: 'atlas', label: 'Atlas', short: 'Atlas' },
   { id: 'news', label: 'News', short: 'News' },
+  { id: 'jarvis', label: 'Jarvis', short: 'Jarvis' },
 ]
 
 const item: Variants = {

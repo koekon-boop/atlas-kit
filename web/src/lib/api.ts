@@ -296,6 +296,13 @@ export interface HostStats {
   mem: HostGauge
   /** null when the box has no swap configured. */
   swap: HostGauge | null
+  /** 1-minute load average and the core count to read it against (Jarvis vitals).
+   *  Optional: absent on an API that predates the fields. */
+  load1?: number
+  cpus?: number
+  uptimeS?: number
+  /** Cumulative rx/tx byte counters over non-loopback interfaces; null without /proc. */
+  net?: { rxBytes: number; txBytes: number } | null
 }
 
 /* --- Fetch helpers: return null/[] on failure so cards stay graceful */
@@ -333,6 +340,28 @@ export function fetchUsage(): Promise<ClaudeUsage | null> {
 
 export function fetchHost(): Promise<HostStats | null> {
   return getJson<HostStats>(`${API_BASE}/host`)
+}
+
+// Current weather from the optional `weather` addon (GET /api/weather). The
+// Jarvis tab only calls it where GET /api/addons says the addon is enabled.
+export interface WeatherView {
+  ok: boolean
+  error?: string
+  stale?: boolean
+  label?: string
+  tempC?: number
+  feelsC?: number | null
+  humidity?: number | null
+  windKmh?: number | null
+  summary?: string
+  highC?: number | null
+  lowC?: number | null
+  observedAt?: string
+  source?: string
+}
+
+export function fetchWeather(): Promise<WeatherView | null> {
+  return getJson<WeatherView>(`${API_BASE}/weather`)
 }
 
 /** Append a ?vault=/&vault= selector to a read path; absent → the configured default vault. */
