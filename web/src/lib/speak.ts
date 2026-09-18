@@ -27,6 +27,47 @@ function getAudio(): HTMLAudioElement | null {
   return audioEl
 }
 
+/* Playback level for the Jarvis reactor. The analyser is spliced in between the
+ * shared <audio> element and the speakers ONLY when the Jarvis tab asks for it,
+ * from a user gesture (an AudioContext created outside one starts suspended, and
+ * a suspended context would silence the element it now routes). Once spliced the
+ * element plays through the context for the rest of the page's life, so every
+ * play below resumes it first. Browser speechSynthesis has no audio stream to
+ * tap — the reactor animates that case without a level. */
+type AudioCtor = typeof AudioContext
+let actx: AudioContext | null = null
+let analyser: AnalyserNode | null = null
+
+export function speechAnalyser(): AnalyserNode | null {
+  if (analyser) return analyser
+  const el = getAudio()
+  const Ctx: AudioCtor | undefined =
+    typeof window === 'undefined' ? undefined : window.AudioContext || (window as unknown as { webkitAudioContext?: AudioCtor }).webkitAudioContext
+  if (!el || !Ctx) return null
+  try {
+    const ctx = new Ctx()
+    const node = ctx.createAnalyser()
+    node.fftSize = 512
+    ctx.createMediaElementSource(el).connect(node)
+    node.connect(ctx.destination)
+    actx = ctx
+    analyser = node
+  } catch {
+    return null
+  }
+  return analyser
+}
+
+/** The analyser if the Jarvis tab already spliced it in — never creates one
+ *  (safe to call from an animation frame, which is not a user gesture). */
+export function currentSpeechAnalyser(): AnalyserNode | null {
+  return analyser
+}
+
+function resumeAudioCtx() {
+  if (actx && actx.state === 'suspended') actx.resume().catch(() => {})
+}
+
 // Bumped by every new sayAloud() and by stopAll(), so a say() that is still
 // awaiting synthesize() when a newer one starts (or the toggle is switched off)
 // bails instead of playing stale audio over it.
@@ -67,6 +108,7 @@ export function stopAll() {
  *  shared element + the speech queue here is what lets later, poll-driven
  *  replies play. */
 export function primeAudio() {
+  resumeAudioCtx()
   const el = getAudio()
   if (el) {
     try {
@@ -117,6 +159,7 @@ export async function sayAloud(
       el.onended = el.onerror = () => {
         if (mine === gen) setSpeaking(false)
       }
+      resumeAudioCtx()
       try {
         await el.play()
       } catch {

@@ -11,15 +11,52 @@
  * Linux: parsed from /proc/meminfo (MemAvailable accounts for
  * reclaimable cache, unlike os.freemem, and it carries the swap figures).
  * Falls back to the os module (no swap) where /proc isn't present.
+ *
+ * Also carried (for the Jarvis tab's vitals panel): the 1-minute load average,
+ * the CPU count to read it against, uptime, and the cumulative network byte
+ * counters from /proc/net/dev. Counters, not rates — the client diffs two polls,
+ * so the cached server stays stateless. Additive fields only; `mem`/`swap` are
+ * unchanged for the Hero meters.
  * ------------------------------------------------------------------ */
 import express from 'express'
-import { totalmem, freemem } from 'node:os'
+import { totalmem, freemem, loadavg, cpus, uptime } from 'node:os'
 import { readFile } from 'node:fs/promises'
 
 const CACHE_TTL_MS = Number(process.env.HOST_CACHE_TTL_MS || 2000)
 let cache = null // { at: epochMs, payload }
 
 const mb = (kb) => Math.round(kb / 1024)
+
+/** Sum rx/tx bytes over every interface except loopback, from /proc/net/dev
+ *  text. null when nothing parses (no /proc, or an unexpected format). */
+export function parseNetDev(raw) {
+  let rxBytes = 0
+  let txBytes = 0
+  let seen = false
+  for (const line of String(raw).split('\n')) {
+    const m = line.match(/^\s*([^:\s]+):\s*(.*)$/)
+    if (!m || m[1] === 'lo') continue
+    const f = m[2].trim().split(/\s+/).map(Number)
+    // receive: bytes packets errs drop fifo frame compressed multicast | transmit: bytes …
+    if (f.length < 16 || !Number.isFinite(f[0]) || !Number.isFinite(f[8])) continue
+    rxBytes += f[0]
+    txBytes += f[8]
+    seen = true
+  }
+  return seen ? { rxBytes, txBytes } : null
+}
+
+function cpuStats() {
+  return { load1: loadavg()[0], cpus: cpus().length || 1, uptimeS: Math.round(uptime()) }
+}
+
+async function readNet() {
+  try {
+    return parseNetDev(await readFile('/proc/net/dev', 'utf8'))
+  } catch {
+    return null
+  }
+}
 
 async function readHost() {
   try {
@@ -36,6 +73,8 @@ async function readHost() {
     const swapUsed = swapTotal - (kv.SwapFree || 0)
     return {
       ok: true,
+      ...cpuStats(),
+      net: await readNet(),
       mem: { pct: (memUsed / memTotal) * 100, usedMb: mb(memUsed), totalMb: mb(memTotal) },
       swap:
         swapTotal > 0
@@ -50,6 +89,8 @@ async function readHost() {
     const used = total - freemem()
     return {
       ok: true,
+      ...cpuStats(),
+      net: null,
       mem: { pct: (used / total) * 100, usedMb: Math.round(used / 1048576), totalMb: Math.round(total / 1048576) },
       swap: null,
     }

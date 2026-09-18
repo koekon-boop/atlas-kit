@@ -28,15 +28,15 @@ test('News is a third top-level tab, alongside Home and Atlas', () => {
   assert.match(tabBar, /export type TabId = 'command' \| 'atlas' \| 'news'/)
   assert.match(tabBar, /\{\s*id:\s*'news',\s*label:\s*'News',\s*short:\s*'News'\s*\}/)
   // Registered after Home and Atlas, not ahead of them.
-  const order = ['command', 'atlas', 'news'].map((id) => tabBar.indexOf(`id: '${id}'`))
-  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'tabs stay in Home, Atlas, News order')
+  const order = ['command', 'atlas', 'news', 'jarvis'].map((id) => tabBar.indexOf(`id: '${id}'`))
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'tabs stay in Home, Atlas, News, Jarvis order')
 })
 
 test('AppShell routes the news tab to its own page component', () => {
   assert.match(appShell, /import \{ NewsCenter \} from '\.\/NewsCenter'/)
   assert.match(
     appShell,
-    /active === 'command'\s*\?\s*<CommandCenter \/>\s*:\s*active === 'atlas'\s*\?\s*<AtlasCenter \/>\s*:\s*<NewsCenter \/>/,
+    /active === 'command'\s*\?\s*\(?\s*<CommandCenter \/>\s*\)?\s*:\s*active === 'atlas'\s*\?\s*\(?\s*<AtlasCenter \/>\s*\)?\s*:\s*active === 'news'\s*\?\s*\(?\s*<NewsCenter \/>/,
   )
 })
 
