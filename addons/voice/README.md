@@ -68,7 +68,7 @@ just unreachable from the page. (`curl` with the token works either way.)
 | **Recap guards** | 1 per agent per 60 s, **100/day across the whole fleet**, and never twice on an unchanged terminal tail. All three are per-process and configurable. |
 | **`--engine espeak-ng`** | ~5 MB, offline, robotic. |
 | **`--engine piper`** | ~250 MB out of tree (venv + onnxruntime) plus ~60 MB per voice; a few hundred MB resident while synthesizing; roughly real-time on a modern CPU core. |
-| **`--engine kokoro`** | ~535 MB out of tree (a ~183 MB venv, a 326 MB model, a 27 MB voice pack) plus piper's own ~250 MB + 60 MB for the German half it is paired with; ~620 MB peak resident per synthesis call. A cold call (fresh process, no daemon — see below) is ~2–4 s for a one- or two-sentence reply, vs. piper's ~0.5–0.8 s. Noticeably less monotone than piper's voices; see "Kokoro vs. piper" below for the numbers behind that call. |
+| **`--engine kokoro`** | ~535 MB out of tree (a ~183 MB venv, a 326 MB model, a 27 MB voice pack) plus piper's own ~250 MB + 60 MB for the German half it is paired with. A **resident daemon** (on by default — see "Kokoro daemon" below) keeps the model loaded between calls: ~640 MB steady RSS while it's warm, released back to the OS `ATLAS_VOICE_KOKORO_IDLE_MS` after the last call. Only the very first call after a cold start (or after an idle exit) pays the old ~2–4 s load-and-synthesize cost; every call after that is a warm request over a local socket. Noticeably less monotone than piper's voices; see "Kokoro vs. piper" and "Kokoro daemon" below for the numbers behind both of those claims. |
 | **`--engine whisper`** (on-box STT) | ~210 MB out of tree (whisper.cpp build 67 MB + multilingual `base` model 142 MB + Silero VAD 1 MB), plus `ffmpeg` from the OS (and `git cmake g++ make` only to build). ~290 MB resident *only while a clip is transcribed*, 0 between clips — nothing stays loaded. ~2.5–3 s of 2 cores per spoken sentence on a quiet box, up to ~7 s while other agents load it. [Measured table below.](#on-box-dictation-whispercpp) |
 | **Storage** | None. No audio is written anywhere except a temp clip during an on-box transcription, deleted in the same call. Recap text is never persisted. |
 
@@ -157,7 +157,9 @@ all.
 
 **Latency, measured on this box** (4 CPUs, no GPU) for a one-sentence reply
 ("Agent seven finished its task and merged the pull request."), as a cold
-process — this addon spawns one subprocess per call, there is no warm daemon:
+process with **no daemon** (`ATLAS_VOICE_KOKORO_DAEMON=0` — the shape this
+addon shipped with before the daemon existed, and still the shape for every
+engine but Kokoro's English half):
 
 | engine | cold latency | notes |
 |---|---|---|
@@ -165,14 +167,77 @@ process — this addon spawns one subprocess per call, there is no warm daemon:
 | piper, `de_DE-thorsten-medium` | ~0.7–1.3 s | German, unchanged engine |
 | Kokoro, `bm_george` | ~2–4 s (of which ~1 s is loading the ONNX graph, the rest is synthesis) | int8 and pre-optimized-graph variants were both tried and came out *slower*, not faster — CPU int8 kernels on this box's onnxruntime build fall back to a slow path; this is the fp32 model |
 
-Kokoro is genuinely slower per call — 3–5× piper's cold latency — because
-there is no resident process to amortize the ~1 s model load across calls.
-That's a real tradeoff, not a rounding error, and it's why this stays an
-opt-in `--engine kokoro` rather than a forced replacement of the piper
-default: still well inside the 20 s `ATLAS_VOICE_TTS_TIMEOUT_MS`, and fine for
-a click-driven "read the reply aloud" UI, but a noticeably longer wait before
-audio starts than piper's near-instant response. If that wait matters more
-than the naturalness gain, `--engine piper` remains the answer.
+Kokoro is genuinely slower per call than piper — because there is no resident
+process to amortize the ~1 s model load across calls. That gap is what the
+resident daemon below closes for every call after the first; it's why the
+daemon is on by default rather than something you have to opt into.
+
+### Kokoro daemon
+
+`ATLAS_VOICE_TTS_CMD` still points at `tts_bilingual.py`, still runs as a
+fresh subprocess per call, and still speaks TEXT-in/WAV-out on stdin/stdout —
+nothing about the contract in "On-box engines" above changed. What changed is
+what that subprocess does for the English half: instead of loading Kokoro's
+ONNX graph itself, it asks a small resident server (`kokoro_daemon.py`, a
+Unix socket at `$ATLAS_VOICE_DIR/kokoro.sock`) to do it, starting that server
+on first use if it isn't already running.
+
+```
+tts_bilingual.py  (fresh process, one per /api/voice/speak call, unchanged)
+  └─ lang=en → kokoro_client.py ──[unix socket]──> kokoro_daemon.py (resident, loads Kokoro ONCE)
+  └─ lang=de → piper (unchanged, still a fresh subprocess every call)
+```
+
+This mirrors `addons/semantic-search`'s `ATLAS_EMBED_IDLE_MS` idiom (see
+`api/embed.mjs`) — load lazily, stay warm, evict yourself when idle — except
+the model lives in its own **process**, not a worker thread: a worker thread
+shares the API's address space, which works for semantic-search's Node/ONNX
+encoder but not for a Python model like Kokoro sitting behind a Node.js API.
+
+**Auto-recovery.** `kokoro_client.py` tries the socket first; if nothing
+answers (no daemon yet, or it just idled out), it starts one and waits for
+the socket, then retries — so the caller never sees "daemon not running", only
+one slow call while it comes up. If the daemon answers with a real synthesis
+error (bad input, a broken model file), that error is reported as-is rather
+than mistaken for "daemon unreachable" and retried into a second failure.
+
+**Measured on this box** (4 CPUs; a shared, already-loaded dev box, not an
+idle one — see the caveat below), one call end-to-end through the real
+`tts_bilingual.py` subprocess, same sentence as the table above:
+
+| call | latency | |
+|---|---|---|
+| cold, no daemon (`ATLAS_VOICE_KOKORO_DAEMON=0`) | ~2.1–2.9 s (avg ~2.4 s over 4 calls) | the pre-daemon behavior, unchanged |
+| cold, daemon disabled → enabled, 1st call (starts the daemon) | ~2.4 s | same cost as above — the daemon still has to load the model once |
+| **warm, daemon already up** | **~1.0–1.8 s (avg ~1.5 s over 4 calls)** | every call after the first — no ONNX graph reload |
+
+The warm numbers are noisier and higher than they'd be on an idle box — this
+container was running several other concurrent agent sessions plus the live
+API during the measurement (load average ~3.2 on 4 cores) — but the ~1 s ONNX
+load this eliminates is a fixed cost independent of that noise: an isolated
+warm call (same daemon, no other subprocess/socket overhead) measured 0.69 s.
+Both the "cold" and "warm" rows above were measured back-to-back in the same
+run so the *relative* improvement is real even where the absolute numbers are
+inflated by neighboring load.
+
+**RAM.** Resident RSS while the daemon is warm: **~640 MB** (measured:
+656,972 KB), replacing the baseline's ~620 MB *peak, per call* — i.e. the
+model now costs roughly the same memory, but held continuously instead of
+paid fresh every utterance. It's given back automatically
+`ATLAS_VOICE_KOKORO_IDLE_MS` after the last call.
+
+**Disable it** — fall back to the exact pre-daemon behavior (a fresh
+in-process Kokoro load on every call, no socket, no background process):
+
+```bash
+ATLAS_VOICE_KOKORO_DAEMON=0
+```
+
+| var | default | |
+|---|---|---|
+| `ATLAS_VOICE_KOKORO_DAEMON` | `1` | `0` disables the daemon — every call loads Kokoro fresh, in-process, exactly like before this feature |
+| `ATLAS_VOICE_KOKORO_IDLE_MS` | `600000` (10 min) | how long the daemon stays resident after its last call before it exits and frees the ~640 MB; `0` holds it forever. Shorter than semantic-search's 20-minute default — Jarvis's voice is bursty/interactive rather than a background service, and giving back ~640 MB sooner matters more on a small box than shaving the next cold start |
+| `ATLAS_VOICE_KOKORO_SOCK` | `$ATLAS_VOICE_DIR/kokoro.sock` | the daemon's Unix socket path |
 
 ### On-box dictation (whisper.cpp)
 
@@ -255,6 +320,9 @@ Without VAD a silent clip came back as "you"; with it, silence is no transcript.
 | `ATLAS_VOICE_KOKORO_VOICE` | `bm_george` | which Kokoro voice `tts_kokoro.py`/`tts_bilingual.py` speaks English with |
 | `ATLAS_VOICE_KOKORO_MODEL` / `_VOICES` | `$ATLAS_VOICE_DIR/kokoro-models/kokoro-v1.0.onnx` / `voices-v1.0.bin` | Kokoro's model + voice pack |
 | `ATLAS_VOICE_PIPER_BIN` / `_VOICE_DE` | `$ATLAS_VOICE_DIR/piper/bin/piper` / `$ATLAS_VOICE_DIR/voices/de_DE-thorsten-medium.onnx` | `tts_bilingual.py`'s German half |
+| `ATLAS_VOICE_KOKORO_DAEMON` | `1` | `0` disables the resident daemon (see "Kokoro daemon") |
+| `ATLAS_VOICE_KOKORO_IDLE_MS` | `600000` | how long the daemon idles before it frees its ~640 MB |
+| `ATLAS_VOICE_KOKORO_SOCK` | `$ATLAS_VOICE_DIR/kokoro.sock` | the daemon's Unix socket |
 
 `GET /api/addons` reports all of it — which engine is in use, whether it resolves,
 the model, and how much of today's budget is spent.
@@ -320,10 +388,16 @@ cd web && npm test                              # event derivation, MicField par
 
 Hermetic by construction: no mic, no engine, no model, no network. The "engines"
 are shell stubs on a temp `PATH` — which is precisely the contract a real one has
-to meet — and `claude` is stubbed the same way. `lang-detect.test.mjs` is the one
-exception that shells out to a real `python3` (stdlib only, no `kokoro-onnx`/piper
-installed) to test `engines/lang_detect.py`'s DE/EN vote directly, since a wrong
-answer there is silent and picks the wrong voice for a whole reply.
+to meet — and `claude` is stubbed the same way. `lang-detect.test.mjs` and
+`kokoro-daemon.test.mjs` are the two exceptions that shell out to a real
+`python3` (stdlib only, no `kokoro-onnx`/piper installed) rather than stubbing
+the interpreter itself: the first tests `engines/lang_detect.py`'s DE/EN vote
+directly, since a wrong answer there is silent and picks the wrong voice for a
+whole reply; the second stages `kokoro_daemon.py` + `kokoro_client.py` next to
+a stub `tts_kokoro.py` (no model, no onnxruntime) to prove the daemon/client
+wiring itself — autostart, warm reuse, idle self-eviction, auto-recovery after
+that eviction, and the `ATLAS_VOICE_KOKORO_DAEMON=0` bypass — killing its own
+daemon process before it exits.
 `install.test.sh` stages fake executables/files rather than actually installing
 Kokoro or piper (both need real network); the install SUCCESS path — the venv,
 the downloads, the bilingual routing proof — is exercised by actually running

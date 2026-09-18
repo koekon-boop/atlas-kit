@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bilingual TTS engine — TEXT on stdin, WAV on stdout, DE/EN picked from the
-text itself. Kokoro-82M (`bm_george`, a calm British male) speaks English;
+text itself. Kokoro-82M (`bm_george`, a calm British male) speaks English —
+via the resident daemon in `kokoro_client.py` so a warm process, not a fresh
+model load, answers most calls (see this addon's README, "Kokoro daemon").
 piper (`de_DE-thorsten-medium`) speaks German, because Kokoro ships no German
 voice at all — verified empirically, not assumed (see addons/voice/README.md).
 
@@ -15,6 +17,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kokoro_client  # noqa: E402
 import tts_kokoro  # noqa: E402
 from lang_detect import pick  # noqa: E402
 
@@ -54,7 +57,7 @@ def main():
     text = " ".join(raw.split())
     lang = pick(text)
     try:
-        audio = tts_kokoro.synth(text) if lang == "en" else synth_de(text)
+        audio = kokoro_client.synth(text) if lang == "en" else synth_de(text)
     except Exception as e:  # noqa: BLE001 - degrade, never crash (see engine.mjs)
         print(f"tts-bilingual: lang={lang} synthesis failed: {e}", file=sys.stderr)
         return 4
