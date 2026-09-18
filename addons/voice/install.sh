@@ -13,6 +13,14 @@
 #                                     whatever engines this box actually has
 #   --engine espeak-ng                apt-get espeak-ng (~5 MB) → TTS command
 #   --engine piper                    a venv + piper-tts + one voice (~250 MB)
+#   --engine kokoro                   Kokoro-82M (a newer, less monotone voice
+#                                     than piper's — ~535 MB) for English, PAIRED
+#                                     with piper for German (which Kokoro ships
+#                                     no voice for at all) via a bilingual
+#                                     stdin/stdout wrapper that picks the
+#                                     language from the text. See README.md
+#                                     "On-box engines" for the latency/quality
+#                                     numbers that make this the pairing.
 #   --engine whisper                  an STT wrapper around an EXISTING
 #                                     whisper.cpp + ffmpeg (installs neither)
 #
@@ -21,7 +29,7 @@
 #
 # MODES
 #   (no args)  detect what is here, write the sample, install nothing
-#   --engine <espeak-ng|piper|whisper>   install/wire that one engine
+#   --engine <espeak-ng|piper|kokoro|whisper>   install/wire that one engine
 #   --check    report state without changing anything:
 #                exit 0 — ready (either no engine is configured, i.e. the browser
 #                         default, or every configured one resolves)
@@ -36,10 +44,42 @@ SAMPLE="$STATE_DIR/voice.env.sample"
 PIPER_BIN="$DIR/piper/bin/piper"
 VOICE_NAME="${ATLAS_VOICE_PIPER_VOICE:-en_US-amy-medium}"
 VOICE_ONNX="$DIR/voices/$VOICE_NAME.onnx"
+
+# The rhasspy/piper-voices layout is <lang>/<lang_COUNTRY>/<name>/<quality>/ —
+# derived from the voice name itself so install_piper can fetch ANY voice
+# (amy for the default English install, thorsten for kokoro's German half)
+# without a second hardcoded URL to keep in sync.
+voice_url_base() {
+  local voice="$1" lang_country rest name quality
+  lang_country="${voice%%-*}"
+  rest="${voice#*-}"
+  name="${rest%-*}"
+  quality="${rest##*-}"
+  echo "https://huggingface.co/rhasspy/piper-voices/resolve/main/${lang_country%%_*}/$lang_country/$name/$quality"
+}
 # Overridable so a mirror, an air-gapped copy or a different voice needs no patch.
-VOICE_BASE="${ATLAS_VOICE_PIPER_VOICE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium}"
+VOICE_BASE="${ATLAS_VOICE_PIPER_VOICE_URL:-$(voice_url_base "$VOICE_NAME")}"
 STT_WRAPPER="$DIR/stt-whisper.sh"
 MIN_AVAIL_MB=600
+
+# Kokoro (English) + piper (German, reusing install_piper below) — the pairing
+# --engine kokoro installs. bm_george is a calm British male, in the same
+# register as alan was; ATLAS_VOICE_KOKORO_VOICE picks another (bm_lewis,
+# bm_daniel, bm_fable, or any af_*/am_* American voice).
+KOKORO_VENV="$DIR/kokoro"
+KOKORO_MODEL_DIR="$DIR/kokoro-models"
+KOKORO_MODEL="$KOKORO_MODEL_DIR/kokoro-v1.0.onnx"
+KOKORO_VOICES="$KOKORO_MODEL_DIR/voices-v1.0.bin"
+KOKORO_VOICE_NAME="${ATLAS_VOICE_KOKORO_VOICE:-bm_george}"
+KOKORO_RELEASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+KOKORO_MODEL_URL="${ATLAS_VOICE_KOKORO_MODEL_URL:-$KOKORO_RELEASE/kokoro-v1.0.onnx}"
+KOKORO_VOICES_URL="${ATLAS_VOICE_KOKORO_VOICES_URL:-$KOKORO_RELEASE/voices-v1.0.bin}"
+DE_VOICE_NAME="de_DE-thorsten-medium"
+DE_VOICE_ONNX="$DIR/voices/$DE_VOICE_NAME.onnx"
+BILINGUAL_SCRIPT="$ROOT/addons/voice/engines/tts_bilingual.py"
+# ~183 MB venv + 326 MB model + 27 MB voices, plus piper's own ~250 MB + 63 MB
+# voice if that is not already installed (install_kokoro calls install_piper).
+KOKORO_MIN_AVAIL_MB=1200
 
 log() { echo "[voice] $*"; }
 
@@ -49,7 +89,11 @@ cmd_bin() { echo "${1%% *}"; }
 
 resolves() { [ -n "$1" ] && command -v "$(cmd_bin "$1")" >/dev/null 2>&1; }
 
+# $1 (optional): MB required — defaults to $MIN_AVAIL_MB (a piper venv + one
+# voice). install_kokoro passes $KOKORO_MIN_AVAIL_MB, which also has to cover
+# piper's own venv + German voice.
 disk_ok() {
+  local need="${1:-$MIN_AVAIL_MB}"
   mkdir -p "$DIR" 2>/dev/null || true
   local avail
   avail=$(df -Pm "$DIR" 2>/dev/null | awk 'NR==2 {print $4}')
@@ -57,15 +101,17 @@ disk_ok() {
     echo "!! cannot read free space for $DIR" >&2
     return 1
   fi
-  [ "$avail" -ge "$MIN_AVAIL_MB" ] && return 0
-  echo "!! only ${avail} MB free — need ~${MIN_AVAIL_MB} MB for a venv + a voice" >&2
+  [ "$avail" -ge "$need" ] && return 0
+  echo "!! only ${avail} MB free — need ~${need} MB" >&2
   return 1
 }
 
 # What this box could speak/listen with right now, whether or not it is configured.
 detect() {
   local found=""
-  [ -x "$PIPER_BIN" ] && found="$found  piper (this addon's venv):        ATLAS_VOICE_TTS_CMD=\"$PIPER_BIN -m $VOICE_ONNX -f -\"\n"
+  [ -x "$KOKORO_VENV/bin/python3" ] && [ -s "$KOKORO_MODEL" ] && [ -x "$PIPER_BIN" ] && [ -s "$DE_VOICE_ONNX" ] && \
+    found="$found  kokoro + piper (bilingual, this addon):  ATLAS_VOICE_TTS_CMD=\"$KOKORO_VENV/bin/python3 $BILINGUAL_SCRIPT\"\n"
+  [ -x "$PIPER_BIN" ] && [ -s "$VOICE_ONNX" ] && found="$found  piper (this addon's venv):        ATLAS_VOICE_TTS_CMD=\"$PIPER_BIN -m $VOICE_ONNX -f -\"\n"
   command -v piper >/dev/null 2>&1 && found="$found  piper (on PATH):                 ATLAS_VOICE_TTS_CMD=\"piper -m /path/to/voice.onnx -f -\"\n"
   command -v espeak-ng >/dev/null 2>&1 && found="$found  espeak-ng (robotic but tiny):    ATLAS_VOICE_TTS_CMD=\"espeak-ng --stdout\"\n"
   [ -x "$STT_WRAPPER" ] && found="$found  whisper.cpp wrapper:             ATLAS_VOICE_STT_CMD=\"$STT_WRAPPER {file}\"\n"
@@ -134,7 +180,13 @@ install_espeak() {
   log 'ready → ATLAS_VOICE_TTS_CMD="espeak-ng --stdout"'
 }
 
+# $1 (optional): the voice to fetch — defaults to $VOICE_NAME (the standalone
+# `--engine piper` case). install_kokoro calls this with $DE_VOICE_NAME to get
+# piper's German half of the bilingual pairing, reusing the same venv.
 install_piper() {
+  local voice="${1:-$VOICE_NAME}"
+  local onnx="$DIR/voices/$voice.onnx"
+  local base="${ATLAS_VOICE_PIPER_VOICE_URL:-$(voice_url_base "$voice")}"
   disk_ok || exit 1
   if [ ! -x "$PIPER_BIN" ]; then
     command -v python3 >/dev/null 2>&1 || {
@@ -149,28 +201,102 @@ install_piper() {
     log "piper venv present → $PIPER_BIN"
   fi
   mkdir -p "$DIR/voices"
-  if [ ! -s "$VOICE_ONNX" ]; then
-    log "downloading voice $VOICE_NAME (~60 MB)"
-    curl -fSL --retry 2 -o "$VOICE_ONNX" "$VOICE_BASE/$VOICE_NAME.onnx" || {
-      rm -f "$VOICE_ONNX"
-      echo "!! could not download $VOICE_BASE/$VOICE_NAME.onnx — set ATLAS_VOICE_PIPER_VOICE_URL to a mirror, or drop the .onnx + .onnx.json into $DIR/voices yourself" >&2
+  if [ ! -s "$onnx" ]; then
+    log "downloading voice $voice (~60 MB)"
+    curl -fSL --retry 2 -o "$onnx" "$base/$voice.onnx" || {
+      rm -f "$onnx"
+      echo "!! could not download $base/$voice.onnx — set ATLAS_VOICE_PIPER_VOICE_URL to a mirror, or drop the .onnx + .onnx.json into $DIR/voices yourself" >&2
       exit 1
     }
-    curl -fSL --retry 2 -o "$VOICE_ONNX.json" "$VOICE_BASE/$VOICE_NAME.onnx.json" || {
-      rm -f "$VOICE_ONNX" "$VOICE_ONNX.json"
+    curl -fSL --retry 2 -o "$onnx.json" "$base/$voice.onnx.json" || {
+      rm -f "$onnx" "$onnx.json"
       echo "!! the voice config did not download — removed the half-installed voice" >&2
       exit 1
     }
   else
-    log "voice present → $VOICE_ONNX"
+    log "voice present → $onnx"
   fi
   # Prove it before telling the operator to configure it: a command line that
   # does not actually synthesize is worse than no command line.
-  echo 'test' | "$PIPER_BIN" -m "$VOICE_ONNX" -f - > /dev/null 2>&1 || {
+  echo 'test' | "$PIPER_BIN" -m "$onnx" -f - > /dev/null 2>&1 || {
     echo "!! piper is installed but did not synthesize — see $DIR/piper" >&2
     exit 1
   }
-  log "ready → ATLAS_VOICE_TTS_CMD=\"$PIPER_BIN -m $VOICE_ONNX -f -\""
+  log "ready → ATLAS_VOICE_TTS_CMD=\"$PIPER_BIN -m $onnx -f -\""
+}
+
+# Kokoro-82M for English, paired with piper (via install_piper) for German —
+# Kokoro ships no German voice at all, confirmed by actually asking it for one
+# (see README.md). Installs both halves and proves the ROUTING, not just each
+# engine in isolation, before handing back a single ATLAS_VOICE_TTS_CMD.
+install_kokoro() {
+  disk_ok "$KOKORO_MIN_AVAIL_MB" || exit 1
+
+  if [ ! -x "$KOKORO_VENV/bin/python3" ]; then
+    command -v python3 >/dev/null 2>&1 || {
+      echo "!! python3 is required for kokoro" >&2
+      exit 1
+    }
+    log "creating a venv at $KOKORO_VENV (~183 MB — onnxruntime, no torch)"
+    python3 -m venv "$KOKORO_VENV"
+    "$KOKORO_VENV/bin/pip" install --quiet --upgrade pip
+    "$KOKORO_VENV/bin/pip" install --quiet kokoro-onnx soundfile
+  else
+    log "kokoro venv present → $KOKORO_VENV"
+  fi
+
+  mkdir -p "$KOKORO_MODEL_DIR"
+  if [ ! -s "$KOKORO_MODEL" ]; then
+    log "downloading kokoro-v1.0.onnx (~326 MB)"
+    curl -fSL --retry 2 -o "$KOKORO_MODEL" "$KOKORO_MODEL_URL" || {
+      rm -f "$KOKORO_MODEL"
+      echo "!! could not download $KOKORO_MODEL_URL — set ATLAS_VOICE_KOKORO_MODEL_URL to a mirror, or drop the file in yourself" >&2
+      exit 1
+    }
+  else
+    log "model present → $KOKORO_MODEL"
+  fi
+  if [ ! -s "$KOKORO_VOICES" ]; then
+    log "downloading voices-v1.0.bin (~27 MB)"
+    curl -fSL --retry 2 -o "$KOKORO_VOICES" "$KOKORO_VOICES_URL" || {
+      rm -f "$KOKORO_VOICES"
+      echo "!! could not download $KOKORO_VOICES_URL — set ATLAS_VOICE_KOKORO_VOICES_URL to a mirror, or drop the file in yourself" >&2
+      exit 1
+    }
+  else
+    log "voices present → $KOKORO_VOICES"
+  fi
+
+  # Prove the English half before touching the German half — a command line
+  # that does not actually synthesize is worse than no command line.
+  local verify_log
+  verify_log="$(mktemp -t atlas-kit-kokoro-verify-XXXXXX.log)"
+  echo 'This is a test.' | ATLAS_VOICE_DIR="$DIR" ATLAS_VOICE_KOKORO_VOICE="$KOKORO_VOICE_NAME" \
+    "$KOKORO_VENV/bin/python3" "$ROOT/addons/voice/engines/tts_kokoro.py" > /dev/null 2>"$verify_log" || {
+    echo "!! kokoro is installed but did not synthesize:" >&2
+    cat "$verify_log" >&2
+    rm -f "$verify_log"
+    exit 1
+  }
+  rm -f "$verify_log"
+
+  # The German half: piper, unchanged engine, a different voice.
+  install_piper "$DE_VOICE_NAME"
+
+  # Prove the ROUTING itself, in both directions — a wrapper that resolves
+  # both engines but picks the wrong one for either language is worse than
+  # either engine alone, and would regress German silently.
+  local en_lang de_lang
+  en_lang=$(echo 'This is a test.' | ATLAS_VOICE_DIR="$DIR" ATLAS_VOICE_KOKORO_VOICE="$KOKORO_VOICE_NAME" \
+    "$KOKORO_VENV/bin/python3" "$BILINGUAL_SCRIPT" 2>&1 >/dev/null | grep -o 'lang=..' | cut -d= -f2)
+  de_lang=$(echo 'Das ist ein Test.' | ATLAS_VOICE_DIR="$DIR" ATLAS_VOICE_KOKORO_VOICE="$KOKORO_VOICE_NAME" \
+    "$KOKORO_VENV/bin/python3" "$BILINGUAL_SCRIPT" 2>&1 >/dev/null | grep -o 'lang=..' | cut -d= -f2)
+  if [ "$en_lang" != "en" ] || [ "$de_lang" != "de" ]; then
+    echo "!! bilingual routing check failed (English text → lang=${en_lang:-?}, German text → lang=${de_lang:-?}) — see $BILINGUAL_SCRIPT" >&2
+    exit 1
+  fi
+
+  log "ready → ATLAS_VOICE_TTS_CMD=\"$KOKORO_VENV/bin/python3 $BILINGUAL_SCRIPT\""
 }
 
 # whisper.cpp is a build, not a package, so this INSTALLS NOTHING: it writes the
@@ -230,9 +356,10 @@ case "${1:-}" in
     case "${2:-}" in
       espeak-ng) install_espeak ;;
       piper) install_piper ;;
+      kokoro) install_kokoro ;;
       whisper) install_whisper_wrapper ;;
       *)
-        echo "usage: install.sh --engine <espeak-ng|piper|whisper>" >&2
+        echo "usage: install.sh --engine <espeak-ng|piper|kokoro|whisper>" >&2
         exit 2
         ;;
     esac
@@ -252,6 +379,7 @@ case "${1:-}" in
       echo "No on-box engine here — the browser speaks and listens, which needs nothing."
       echo "Want one anyway?  bash addons/voice/install.sh --engine espeak-ng   (tiny, offline)"
       echo "                  bash addons/voice/install.sh --engine piper       (~250 MB, natural)"
+      echo "                  bash addons/voice/install.sh --engine kokoro      (~535 MB, less monotone, bilingual w/ piper)"
     fi
     echo
     echo "Next:"
@@ -261,7 +389,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "usage: install.sh [--check | --engine <espeak-ng|piper|whisper>]" >&2
+    echo "usage: install.sh [--check | --engine <espeak-ng|piper|kokoro|whisper>]" >&2
     exit 2
     ;;
 esac
