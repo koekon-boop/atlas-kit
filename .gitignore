@@ -2,6 +2,7 @@
 node_modules
 web/dist/
 api/.state/
+__pycache__/
 # Operator-local config (see the *.example.json templates):
 #   which optional addons this box runs (ATLAS_ADDONS overrides it)
 addons.json
