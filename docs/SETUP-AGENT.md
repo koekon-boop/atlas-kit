@@ -185,8 +185,8 @@ it costs, taken from that README's **"What it costs"** table:
   dashboard already had, and its Web Speech API does the listening. Two things are not
   free and both are opt-in: a **Recap** button spends one `claude -p` call (guarded to
   1/agent/60 s and 100/day fleet-wide), and an on-box engine instead of the browser's is
-  ~5 MB (`espeak-ng`) to ~310 MB (`piper` + a voice) out of tree, ~150 MB for a
-  whisper.cpp model. ⚠️ Browser **dictation is a cloud service in Chrome and Safari** —
+  ~5 MB (`espeak-ng`) to ~310 MB (`piper` + a voice) out of tree, ~210 MB for
+  whisper.cpp + its `base` model (plus `ffmpeg` and a build toolchain from apt). ⚠️ Browser **dictation is a cloud service in Chrome and Safari** —
   their audio goes to Google/Apple; the README's privacy table says which path goes where,
   and an on-box engine is the answer if that is not acceptable.
 
@@ -247,8 +247,9 @@ For each addon they say yes to, five moves in this order:
 - **`voice` — enabling it is the whole install; the rest is opt-in.** Step 1 downloads
   nothing: `bash addons/voice/install.sh` only *detects* what is already here (`--check`
   reports it), and installs an engine only when they name one (`--engine espeak-ng` |
-  `piper` | `whisper`) — a download, so Safety §2 applies (`--engine whisper` only wires a
-  wrapper around a whisper.cpp + ffmpeg this box already has; it installs neither). Leave it out and the browser
+  `piper` | `whisper`) — a download, so Safety §2 applies (`--engine whisper` builds a
+  pinned whisper.cpp and downloads the 148 MB `base` model; it needs `ffmpeg git cmake g++
+  make` from apt first, and reuses a `whisper-cli` + `WHISPER_MODEL` the box already has). Leave it out and the browser
   path is the whole feature. Two `.env` lines exist and both are optional:
   `ATLAS_VOICE_TTS_CMD` / `ATLAS_VOICE_STT_CMD` (an on-box engine takes over from the
   browser). ⚠️ **Its three routes need a Caddyfile handler** — `infra/Caddyfile.example`

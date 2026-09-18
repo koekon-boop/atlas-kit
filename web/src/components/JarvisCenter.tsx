@@ -63,7 +63,9 @@ import {
  * Built from docs/jarvis-features.md (what "Jarvis AI" builds on Instagram
  * actually show). Nothing here is a second system: the brain is an Atlas
  * knowledge chat (spawn/prompt/queue + the transcript), the ears are
- * useDictation and the browser's SpeechRecognition, the voice is lib/speak.ts
+ * useDictation (on-box whisper when the box has it, else the browser's
+ * SpeechRecognition) plus the wake word, which is browser-only — see
+ * useWakeWord. The voice is lib/speak.ts
  * (on-box piper via POST /api/voice/speak, browser fallback), and every panel
  * reads an existing endpoint — /api/host, /api/usage, /api/tasks, /api/agents,
  * /api/dashboard, /api/news, and the optional weather addon.
@@ -372,7 +374,7 @@ function Console({ brief }: { brief: () => string }) {
     ? 'speaking'
     : dict.recording || wake.armed
       ? 'listening'
-      : busy || live?.status === 'running'
+      : busy || dict.busy || live?.status === 'running'
         ? 'thinking'
         : wakeOn && wake.listening
           ? 'listening'
@@ -383,7 +385,9 @@ function Console({ brief }: { brief: () => string }) {
       ? `Speaking · ${onBoxTts ? 'on-box voice' : 'browser voice'}`
       : dict.recording
         ? 'Listening…'
-        : wake.armed
+        : dict.busy
+          ? 'Transcribing on this box…'
+          : wake.armed
           ? 'Yes? I am listening.'
           : mode === 'thinking'
             ? 'Working on it…'
@@ -466,7 +470,11 @@ function Console({ brief }: { brief: () => string }) {
               engage()
               setWakeOn(!wakeOn)
             }}
-            title="Listen for “Jarvis, …”. The mic stays open while this is on — in Chrome that audio goes to Google’s speech service."
+            title={
+              dict.engine === 'on-box'
+                ? 'Listen for “Jarvis, …”. Push-to-talk is transcribed on this box, but the wake word uses the browser’s recogniser: while this is on, the open mic goes to Google’s speech service in Chrome.'
+                : 'Listen for “Jarvis, …”. The mic stays open while this is on — in Chrome that audio goes to Google’s speech service.'
+            }
           >
             Wake word {wakeOn ? 'on' : 'off'}
           </button>
