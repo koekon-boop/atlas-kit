@@ -69,7 +69,7 @@ just unreachable from the page. (`curl` with the token works either way.)
 | **`--engine espeak-ng`** | ~5 MB, offline, robotic. |
 | **`--engine piper`** | ~250 MB out of tree (venv + onnxruntime) plus ~60 MB per voice; a few hundred MB resident while synthesizing; roughly real-time on a modern CPU core. |
 | **`--engine kokoro`** | ~535 MB out of tree (a ~183 MB venv, a 326 MB model, a 27 MB voice pack) plus piper's own ~250 MB + 60 MB for the German half it is paired with; ~620 MB peak resident per synthesis call. A cold call (fresh process, no daemon — see below) is ~2–4 s for a one- or two-sentence reply, vs. piper's ~0.5–0.8 s. Noticeably less monotone than piper's voices; see "Kokoro vs. piper" below for the numbers behind that call. |
-| **On-box STT (whisper.cpp)** | Whatever your model costs (~150 MB for `base`), and CPU: a whisper-class model on CPU is *seconds* per utterance, not milliseconds. |
+| **`--engine whisper`** (on-box STT) | ~210 MB out of tree (whisper.cpp build 67 MB + multilingual `base` model 142 MB + Silero VAD 1 MB), plus `ffmpeg` from the OS (and `git cmake g++ make` only to build). ~290 MB resident *only while a clip is transcribed*, 0 between clips — nothing stays loaded. ~2.5–3 s of 2 cores per spoken sentence on a quiet box, up to ~7 s while other agents load it. [Measured table below.](#on-box-dictation-whispercpp) |
 | **Storage** | None. No audio is written anywhere except a temp clip during an on-box transcription, deleted in the same call. Recap text is never persisted. |
 
 The guards are the cost control, and they exist because a recap is fired by an
@@ -85,8 +85,9 @@ is an event source with no natural rate limit.
 |---|---|
 | **Speaking** (browser `speechSynthesis`) | Stays on your device — the OS voice. ⚠️ Chrome also offers *network* voices (the ones it labels "Google …"); which one it picks is a browser/OS setting, not ours. |
 | **Speaking** (on-box engine) | Stays on the box. Nothing leaves it. |
-| **Dictation** (browser Web Speech API) | ⚠️ **In Chrome and Safari this is a cloud service** — your audio goes to Google/Apple. That is how the API is implemented; the kit cannot change it. If that is not acceptable, use the on-box engine (and a browser with no Web Speech API, e.g. Firefox, so it is actually taken). |
+| **Dictation** (browser Web Speech API) | ⚠️ **In Chrome and Safari this is a cloud service** — your audio goes to Google/Apple. That is how the API is implemented; the kit cannot change it. If that is not acceptable, configure the on-box engine: once `ATLAS_VOICE_STT_CMD` resolves, every mic button uses it, **in every browser** — the browser engine is only the fallback for a box without one. |
 | **Dictation** (on-box engine) | The clip is posted to *your* box, transcribed by *your* command, and the temp file is deleted. Nothing goes to a third party. |
+| **Jarvis wake word** | ⚠️ Always the browser's recogniser, even with an on-box engine — so in Chrome, a Google round-trip for as long as the switch is on. Off by default; push-to-talk on the same tab uses the on-box engine. |
 | **A recap** | The agent's terminal tail is sent to Anthropic by the `claude` CLI on your subscription — exactly like every other `claude -p` call the kit makes. No API key is ever used (`ANTHROPIC_API_KEY` is blanked for the call). |
 
 No API keys, no accounts, no third-party TTS/STT vendor anywhere in this addon.
@@ -131,8 +132,7 @@ the engine by synthesizing before they tell you to configure it: a command line
 that does not actually work is worse than none. `--engine kokoro` additionally
 proves the bilingual ROUTING — that English text actually comes back through
 Kokoro and German through piper, not just that each engine works in isolation.
-`--engine whisper` installs nothing — it wraps a `whisper-cli` and a
-`WHISPER_MODEL` you already have.
+`--engine whisper` does the same by transcribing whisper.cpp's own sample clip.
 
 ### Kokoro vs. piper — why, and the numbers behind it
 
@@ -174,6 +174,66 @@ a click-driven "read the reply aloud" UI, but a noticeably longer wait before
 audio starts than piper's near-instant response. If that wait matters more
 than the naturalness gain, `--engine piper` remains the answer.
 
+### On-box dictation (whisper.cpp)
+
+```bash
+# once: the OS pieces — ffmpeg decodes the browser's webm/opus clip, the rest only
+# builds (~420 MB installed on Ubuntu 24.04; the toolchain can go after the build)
+apt-get install --no-install-recommends ffmpeg git cmake g++ make
+
+bash addons/voice/install.sh --engine whisper     # ~1 min: build (-j2, niced) + 143 MB download
+bash addons/voice/install.sh --check              # wrapper, binary, model and ffmpeg all there?
+```
+
+It builds whisper.cpp from a pinned release tag into `$ATLAS_VOICE_DIR/whisper.cpp`
+(static, nothing else from the tree is needed at runtime), downloads the
+multilingual `base` model and the Silero VAD model into `$ATLAS_VOICE_DIR/models`,
+writes `$ATLAS_VOICE_DIR/stt-whisper.sh`, proves it on whisper.cpp's sample clip,
+and prints the line to paste. Re-running skips everything already there. Already
+have a `whisper-cli` on PATH? Then `WHISPER_MODEL=/path/to/ggml-*.bin` and it
+builds and downloads nothing but the 1 MB VAD model.
+
+```bash
+# .env — the line install.sh printed (an absolute path: .env does not expand
+# $HOME), then scripts/serve.sh restart
+ATLAS_VOICE_STT_CMD="/root/.atlas-kit/voice/stt-whisper.sh {file}"
+# optional — the defaults shown
+# ATLAS_VOICE_STT_LANG=auto
+# ATLAS_VOICE_STT_LANGS=de,en
+```
+
+With that set, **every mic button prefers the box** — MicField, and the Jarvis
+tab's push-to-talk — in Chrome too; the browser engine is only the fallback when
+the box has no engine (see `pickDictation` in `web/src/lib/voice.ts`).
+
+**Language.** German and English out of the box, like the piper voices. Each clip
+is language-detected first; only the languages in `ATLAS_VOICE_STT_LANGS` are
+accepted, and anything else it detects (a short German clip heard as Dutch) falls
+back to the first one listed. `ATLAS_VOICE_STT_LANG=de` pins one language and
+skips the detect pass (~0.5 s cheaper). All three knobs are read by the wrapper at
+call time — edit `.env`, restart, no re-install.
+
+**Measured on the reference box** (a cloud VPS: 4 vCPU x86_64, no GPU, 16 GB,
+live dashboard running, load 1.5–5). Full wrapper — webm/opus clip → ffmpeg →
+language detect → transcription — median of 3, 2 threads. Clips: a 5.6 s German
+and a 6.2 s English dictation sentence (piper-voiced, then Opus-encoded like
+Chrome's MediaRecorder) and whisper.cpp's 11 s `jfk` recording of a real voice.
+
+| model | file | peak RSS | per clip | German clip came back as |
+|---|---|---|---|---|
+| `tiny` | 78 MB | 180 MB | **1.3–1.5 s** | "…morgen **und** 10 Uhr den **Steuerbarater**…" — misheard |
+| **`base`** ✅ | 148 MB | 290 MB | **2.5–2.8 s** (3–7 s at load 3–5) | "Erstelle eine neue Aufgabe, morgen um 10 Uhr den Steuerberater…" |
+| `base-q5_1` | 60 MB | 200 MB | 3.0–3.2 s | same as `base` — quantized is *slower* on this CPU |
+| `small` | 488 MB | 770 MB | 8.5–9.9 s | same, plus "add on" right in English |
+| `small-q5_1` | 190 MB | 470 MB | 10.1–10.6 s | same as `small` |
+| `large-v3-turbo-q5_0` | 574 MB | 810 MB | 51–60 s | same — unusable interactively on CPU |
+
+`base` is the default: the largest model inside "a few seconds". 4 threads were
+*not* faster than 2 on the loaded box, so the wrapper uses half the cores. Pick
+another with `ATLAS_VOICE_WHISPER_MODEL=small bash addons/voice/install.sh
+--engine whisper` (the name of any `ggml-<name>.bin` in whisper.cpp's model repo).
+Without VAD a silent clip came back as "you"; with it, silence is no transcript.
+
 ### Every knob
 
 | var | default | |
@@ -187,6 +247,9 @@ than the naturalness gain, `--engine piper` remains the answer.
 | `ATLAS_VOICE_RECAP_TIMEOUT_MS` | `30000` | |
 | `ATLAS_VOICE_TTS_CMD` / `_TTS_MIME` / `_TTS_TIMEOUT_MS` | *(none)* / `audio/wav` / `20000` | on-box speech |
 | `ATLAS_VOICE_STT_CMD` / `_STT_TIMEOUT_MS` | *(none)* / `60000` | on-box dictation |
+| `ATLAS_VOICE_STT_LANG` / `_STT_LANGS` | `auto` / `de,en` | whisper wrapper: pin a language, or what auto-detect may pick (first = fallback) |
+| `ATLAS_VOICE_STT_THREADS` | half the cores | whisper wrapper: CPU threads per transcription |
+| `ATLAS_VOICE_WHISPER_MODEL` / `_TAG` / `_JOBS` | `base` / `v1.9.4` / `2` | install.sh only: which model, which whisper.cpp release, build parallelism |
 | `ATLAS_VOICE_MAX_AUDIO_BYTES` | `12582912` | bound on a clip and on an engine's output |
 | `ATLAS_VOICE_DIR` | `$AGENT_LOCAL_DIR/voice` | where install.sh puts things |
 | `ATLAS_VOICE_KOKORO_VOICE` | `bm_george` | which Kokoro voice `tts_kokoro.py`/`tts_bilingual.py` speaks English with |
@@ -222,8 +285,18 @@ cannot see at all.
   browser from the fleet poll the page already runs. Close the tab and there is no
   voice, no queue, and no backlog waiting for you — and opening it never recites
   history, because the first poll only seeds the baseline.
-- **No wake word, no hands-free loop.** The mic starts on a click and stops on a
-  click; dictation lands in a field for review and never sends anything.
+- **No hands-free dictation.** The mic starts on a click and stops on a click;
+  dictation lands in a field for review and never sends anything. The Jarvis
+  tab's opt-in wake word is the one exception, and it is **browser-only**: an
+  always-listening on-box recogniser would be whisper running continuously on a
+  CPU that also serves the dashboard.
+- **On-box STT is not live, and not instant.** Nothing appears while you speak;
+  the words land ~2.5–7 s after you stop (`base`, 2 cores, depending on what else the box is doing). A 30 s monologue is
+  proportionally slower, and two people dictating at once share those cores.
+- **On-box accuracy is `base`-sized.** Plain dictation in German and English is
+  right; rare proper nouns and invented words are not ("Drohnenrechnung" came
+  back as "Turunenrechnung" from every model up to `large-v3-turbo`). Code-mixed
+  sentences are transcribed in the ONE language detected for the clip.
 - **On-box dictation has no live partials.** One pass on stop, because a CPU STT
   model re-transcribing a growing clip every second is a load generator, not a
   feature. The browser engine does stream words live.
@@ -241,6 +314,7 @@ cannot see at all.
 ```bash
 node --test addons/voice/test/*.test.mjs        # guards, engines, routes, DE/EN routing
 bash addons/voice/test/install.test.sh          # install.sh's kokoro/bilingual wiring
+bash addons/voice/test/whisper-install.test.sh  # --engine whisper + its wrapper
 cd web && npm test                              # event derivation, MicField parity
 ```
 

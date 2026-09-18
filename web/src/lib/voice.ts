@@ -237,11 +237,14 @@ export const joinDictation = (base: string, spoken: string): string => {
 }
 
 /** Which dictation engine this browser+box combination can actually use.
+ *  The box wins when it has one: configuring ATLAS_VOICE_STT_CMD is the
+ *  operator saying "keep the audio here", and in Chrome the browser engine is a
+ *  Google round-trip — preferring it would make that setting a no-op there.
  *  `'none'` carries the reason, because "the mic is missing" and "the mic is
  *  broken" are different facts and the button's tooltip has to say which. */
 export function pickDictation(hasWebSpeech: boolean, onBoxAvailable: boolean): { engine: 'browser' | 'on-box' | 'none'; reason: string } {
-  if (hasWebSpeech) return { engine: 'browser', reason: '' }
   if (onBoxAvailable) return { engine: 'on-box', reason: '' }
+  if (hasWebSpeech) return { engine: 'browser', reason: '' }
   return {
     engine: 'none',
     reason: 'no dictation engine: this browser has no Web Speech API and this box has no ATLAS_VOICE_STT_CMD',

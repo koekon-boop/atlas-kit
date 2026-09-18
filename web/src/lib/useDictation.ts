@@ -3,15 +3,15 @@
  * MicField's props were kept identical while the kit shipped without voice.
  *
  * TWO ENGINES, PICKED AT RUNTIME (voice.ts → pickDictation):
- *   · browser  — the Web Speech API. Zero install, live interim words, and the
- *                default wherever it exists. ⚠️ In Chrome it is a GOOGLE
- *                round-trip: the audio leaves the machine. The addon README says
- *                so plainly, and an operator who minds that configures the box
- *                engine and uses a browser without Web Speech (Firefox).
  *   · on-box   — MediaRecorder here, one POST to /api/voice/transcribe on stop,
- *                whatever ATLAS_VOICE_STT_CMD runs there. No live partials: a
+ *                whatever ATLAS_VOICE_STT_CMD runs there. Preferred whenever the
+ *                box has one, so the audio never leaves it. No live partials: a
  *                CPU STT pass is seconds, and a per-second re-transcribe of a
  *                growing clip is how you turn a mic into a load generator.
+ *   · browser  — the Web Speech API. Zero install, live interim words, and the
+ *                fallback when the box has no engine. ⚠️ In Chrome it is a
+ *                GOOGLE round-trip: the audio leaves the machine. The addon
+ *                README says so plainly.
  *
  * The transcript lands in the FIELD for review and NEVER auto-sends. `value` is
  * read when recording starts (the base dictation appends to); `onChange` is the

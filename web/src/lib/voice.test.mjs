@@ -100,8 +100,8 @@ test('dictation appends to the draft — it never replaces it', () => {
   assert.equal(joinDictation('typed only', ''), 'typed only')
 })
 
-test('the browser engine wins where it exists; the box is the fallback; neither is a reason', () => {
-  assert.deepEqual(pickDictation(true, true), { engine: 'browser', reason: '' })
+test('the box engine wins where it is configured — even over Chrome\'s; the browser is the fallback; neither is a reason', () => {
+  assert.deepEqual(pickDictation(true, true), { engine: 'on-box', reason: '' }, 'an on-box STT must keep Chrome audio off Google')
   assert.deepEqual(pickDictation(true, false), { engine: 'browser', reason: '' })
   assert.equal(pickDictation(false, true).engine, 'on-box')
   const none = pickDictation(false, false)

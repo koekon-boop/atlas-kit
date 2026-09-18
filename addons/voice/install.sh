@@ -21,8 +21,10 @@
 #                                     language from the text. See README.md
 #                                     "On-box engines" for the latency/quality
 #                                     numbers that make this the pairing.
-#   --engine whisper                  an STT wrapper around an EXISTING
-#                                     whisper.cpp + ffmpeg (installs neither)
+#   --engine whisper                  whisper.cpp built from a pinned tag + the
+#                                     multilingual `base` model (~150 MB) and the
+#                                     STT wrapper; reuses a whisper-cli on PATH
+#                                     and WHISPER_MODEL when you have them
 #
 # WHAT IT WILL NEVER DO: edit your .env, pick your voice, or install a model you
 # did not ask for by name. It prints the two lines you paste, and stops.
@@ -60,6 +62,22 @@ voice_url_base() {
 # Overridable so a mirror, an air-gapped copy or a different voice needs no patch.
 VOICE_BASE="${ATLAS_VOICE_PIPER_VOICE_URL:-$(voice_url_base "$VOICE_NAME")}"
 STT_WRAPPER="$DIR/stt-whisper.sh"
+# whisper.cpp, pinned: a release tag, built from source because there is no
+# official Linux binary. Multilingual `base` (148 MB) is the default because it
+# is the largest model that answers a spoken sentence in a few seconds on a
+# 4-core CPU — `small` took ~9 s for the same clip (the README's measured table).
+WHISPER_TAG="${ATLAS_VOICE_WHISPER_TAG:-v1.9.4}"
+WHISPER_REPO="${ATLAS_VOICE_WHISPER_REPO:-https://github.com/ggml-org/whisper.cpp}"
+WHISPER_SRC="$DIR/whisper.cpp"
+WHISPER_BUILT="$WHISPER_SRC/build/bin/whisper-cli"
+WHISPER_JOBS="${ATLAS_VOICE_WHISPER_JOBS:-2}"
+WHISPER_MODEL_NAME="${ATLAS_VOICE_WHISPER_MODEL:-base}"
+WHISPER_MODEL_FILE="$DIR/models/ggml-$WHISPER_MODEL_NAME.bin"
+WHISPER_MODEL_URL="${ATLAS_VOICE_WHISPER_MODEL_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main}"
+# Silero voice-activity detection (<1 MB): without it whisper "hears" words in a
+# silent clip ("you", "Thanks for watching") — with it, silence is no transcript.
+WHISPER_VAD_FILE="$DIR/models/ggml-silero-v6.2.0.bin"
+WHISPER_VAD_URL="${ATLAS_VOICE_WHISPER_VAD_URL:-https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin}"
 MIN_AVAIL_MB=600
 
 # Kokoro (English) + piper (German, reusing install_piper below) — the pairing
@@ -299,35 +317,131 @@ install_kokoro() {
   log "ready → ATLAS_VOICE_TTS_CMD=\"$KOKORO_VENV/bin/python3 $BILINGUAL_SCRIPT\""
 }
 
-# whisper.cpp is a build, not a package, so this INSTALLS NOTHING: it writes the
-# wrapper that turns the browser's webm/opus clip into the 16 kHz mono wav
-# whisper wants, around a whisper-cli and a model you already have.
-install_whisper_wrapper() {
-  local model="${WHISPER_MODEL:-}"
-  command -v whisper-cli >/dev/null 2>&1 || {
-    echo "!! whisper-cli is not on PATH — build whisper.cpp first, then re-run this" >&2
-    exit 1
-  }
+# whisper.cpp is a build, not a package: this compiles a PINNED release out of
+# tree (make -j2 under nice, so a live box keeps serving) and downloads ONE
+# multilingual ggml model. Both are skipped when already there, and a
+# `whisper-cli` on PATH plus WHISPER_MODEL=/path/to/ggml-*.bin is used as-is —
+# nothing is built or downloaded then. The wrapper it writes decodes the
+# browser's webm/opus clip to the 16 kHz mono wav whisper wants, picks the
+# language, and prints the transcript.
+install_whisper() {
+  local bin model
   command -v ffmpeg >/dev/null 2>&1 || {
-    echo "!! ffmpeg is required to decode the browser's clip" >&2
+    echo "!! ffmpeg is required to decode the browser's clip:  apt-get install --no-install-recommends ffmpeg" >&2
     exit 1
   }
-  [ -s "$model" ] || {
-    echo "!! set WHISPER_MODEL to your ggml model:  WHISPER_MODEL=/path/ggml-base.en.bin bash addons/voice/install.sh --engine whisper" >&2
-    exit 1
-  }
+  if command -v whisper-cli >/dev/null 2>&1; then
+    bin="$(command -v whisper-cli)"
+    log "whisper-cli on PATH → $bin (not building)"
+  elif [ -x "$WHISPER_BUILT" ]; then
+    bin="$WHISPER_BUILT"
+    log "whisper.cpp present → $bin"
+  else
+    local missing=""
+    for t in git cmake c++; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+    [ -z "$missing" ] || {
+      echo "!! building whisper.cpp needs:$missing —  apt-get install --no-install-recommends git cmake g++ make" >&2
+      exit 1
+    }
+    disk_ok || exit 1
+    log "building whisper.cpp $WHISPER_TAG in $WHISPER_SRC (-j$WHISPER_JOBS, ~1 min on 2 cores)"
+    rm -rf "$WHISPER_SRC"
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "$WHISPER_TAG" "$WHISPER_REPO" "$WHISPER_SRC"
+    # Static libs: the binary then needs nothing from the source tree at runtime.
+    nice -n 10 cmake -S "$WHISPER_SRC" -B "$WHISPER_SRC/build" -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF > /dev/null
+    nice -n 10 cmake --build "$WHISPER_SRC/build" -j "$WHISPER_JOBS" --target whisper-cli > "$WHISPER_SRC/build.log" 2>&1 || {
+      echo "!! whisper.cpp did not build — see $WHISPER_SRC/build.log" >&2
+      exit 1
+    }
+    bin="$WHISPER_BUILT"
+  fi
+
+  if [ -n "${WHISPER_MODEL:-}" ]; then
+    model="$WHISPER_MODEL"
+    [ -s "$model" ] || { echo "!! WHISPER_MODEL=$model is not a file" >&2; exit 1; }
+  else
+    model="$WHISPER_MODEL_FILE"
+    if [ ! -s "$model" ]; then
+      disk_ok || exit 1
+      mkdir -p "$(dirname "$model")"
+      log "downloading model ggml-$WHISPER_MODEL_NAME.bin"
+      curl -fSL --retry 2 -o "$model.part" "$WHISPER_MODEL_URL/ggml-$WHISPER_MODEL_NAME.bin" || {
+        rm -f "$model.part"
+        echo "!! could not download $WHISPER_MODEL_URL/ggml-$WHISPER_MODEL_NAME.bin — set ATLAS_VOICE_WHISPER_MODEL_URL to a mirror, or WHISPER_MODEL to a model you have" >&2
+        exit 1
+      }
+      mv "$model.part" "$model"
+    else
+      log "model present → $model"
+    fi
+  fi
+
+  local vad="$WHISPER_VAD_FILE"
+  if [ ! -s "$vad" ]; then
+    mkdir -p "$(dirname "$vad")"
+    curl -fsSL --retry 2 -o "$vad.part" "$WHISPER_VAD_URL" && mv "$vad.part" "$vad" || {
+      rm -f "$vad.part"
+      vad=""
+      log "no VAD model ($WHISPER_VAD_URL did not download) — works without, but a silent clip may come back as a stray word"
+    }
+  fi
+
   mkdir -p "$DIR"
   cat > "$STT_WRAPPER" <<EOF
 #!/bin/sh
 # Generated by addons/voice/install.sh — browser clip → 16 kHz wav → whisper.cpp.
 # Called as: $STT_WRAPPER <clip>   (the addon substitutes {file})
-set -e
+#            $STT_WRAPPER --check  (binary, model and ffmpeg all present?)
+# Read at call time from the API's environment (.env), so no re-install to change:
+#   ATLAS_VOICE_STT_LANG     auto (default): detect per clip · or pin one code, e.g. de
+#   ATLAS_VOICE_STT_LANGS    de,en (default): what auto may pick; anything else it
+#                            detects falls back to the FIRST one listed
+#   ATLAS_VOICE_STT_THREADS  default: half the cores (this box also serves the dashboard)
+set -eu
+BIN="$bin"
+MODEL="$model"
+VAD="$vad"
+if [ "\${1:-}" = --check ]; then
+  [ -x "\$BIN" ] || { echo "whisper-cli missing: \$BIN" >&2; exit 1; }
+  [ -s "\$MODEL" ] || { echo "whisper model missing: \$MODEL" >&2; exit 1; }
+  command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg missing" >&2; exit 1; }
+  echo "ok"
+  exit 0
+fi
+[ -n "\${1:-}" ] || { echo "usage: \$0 <clip> | --check" >&2; exit 2; }
+clip="\$1"
+t="\${ATLAS_VOICE_STT_THREADS:-\$(( \$(nproc 2>/dev/null || echo 2) / 2 ))}"
+[ "\$t" -ge 1 ] 2>/dev/null || t=1
+langs="\${ATLAS_VOICE_STT_LANGS:-de,en}"
+lang="\${ATLAS_VOICE_STT_LANG:-auto}"
 wav="\$(mktemp -t atlas-kit-stt-XXXXXX.wav)"
 trap 'rm -f "\$wav"' EXIT
-ffmpeg -loglevel error -y -i "\$1" -ar 16000 -ac 1 "\$wav"
-whisper-cli -m "$model" -f "\$wav" -nt 2>/dev/null
+ffmpeg -nostdin -loglevel error -y -i "\$clip" -ar 16000 -ac 1 -f wav "\$wav"
+if [ -s "\$VAD" ]; then set -- --vad -vm "\$VAD"; else set --; fi
+if [ "\$lang" = auto ]; then
+  # A short clip can be mis-detected as a neighbouring language (German as
+  # Dutch); only the languages the operator actually speaks are accepted.
+  lang="\$("\$BIN" -m "\$MODEL" -f "\$wav" -t "\$t" -l auto -dl 2>&1 | sed -n 's/.*auto-detected language: \([a-z]*\).*/\1/p' | head -n 1)"
+  case ",\$langs," in
+    *",\$lang,"*) [ -n "\$lang" ] || lang="\${langs%%,*}" ;;
+    *) lang="\${langs%%,*}" ;;
+  esac
+fi
+"\$BIN" -m "\$MODEL" -f "\$wav" -t "\$t" -l "\$lang" -nt -np "\$@"
 EOF
   chmod 700 "$STT_WRAPPER"
+  "$STT_WRAPPER" --check > /dev/null || exit 1
+
+  # Prove it before telling the operator to configure it — on whisper.cpp's own
+  # English sample when the source tree is here.
+  if [ -s "$WHISPER_SRC/samples/jfk.wav" ]; then
+    "$STT_WRAPPER" "$WHISPER_SRC/samples/jfk.wav" 2>&1 | grep -qi 'country' || {
+      echo "!! the wrapper ran but did not transcribe whisper.cpp's sample — try it by hand:  $STT_WRAPPER $WHISPER_SRC/samples/jfk.wav" >&2
+      exit 1
+    }
+    log "transcribed whisper.cpp's sample clip — the engine works"
+  fi
   log "ready → ATLAS_VOICE_STT_CMD=\"$STT_WRAPPER {file}\""
 }
 
@@ -338,6 +452,10 @@ case "${1:-}" in
       cmd="${!var:-}"
       if [ -z "$cmd" ]; then
         echo "$var unset — the browser handles it (zero-install default)"
+      elif [ "$(cmd_bin "$cmd")" = "$STT_WRAPPER" ] && [ -x "$STT_WRAPPER" ] && ! why="$("$STT_WRAPPER" --check 2>&1)"; then
+        # The wrapper resolves, but what it wraps (binary, model, ffmpeg) may not.
+        echo "$var names $STT_WRAPPER, but $why — re-run  bash addons/voice/install.sh --engine whisper" >&2
+        rc=2
       elif resolves "$cmd"; then
         echo "$var ok → $(cmd_bin "$cmd")"
       else
@@ -357,7 +475,7 @@ case "${1:-}" in
       espeak-ng) install_espeak ;;
       piper) install_piper ;;
       kokoro) install_kokoro ;;
-      whisper) install_whisper_wrapper ;;
+      whisper) install_whisper ;;
       *)
         echo "usage: install.sh --engine <espeak-ng|piper|kokoro|whisper>" >&2
         exit 2
