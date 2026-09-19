@@ -19,6 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kokoro_client  # noqa: E402
 import tts_kokoro  # noqa: E402
+from audio_normalize import normalize_wav  # noqa: E402
 from lang_detect import pick  # noqa: E402
 
 
@@ -64,6 +65,11 @@ def main():
     if not audio:
         print(f"tts-bilingual: lang={lang} produced no audio", file=sys.stderr)
         return 5
+    # piper and Kokoro synthesize at measurably different natural loudness
+    # (see README.md's "Loudness" section) — normalize both to one consistent
+    # level here, the one place both legs pass through, rather than device
+    # volume being the only lever.
+    audio = normalize_wav(audio)
     print(f"tts-bilingual: lang={lang}", file=sys.stderr)
     # Only now does anything reach stdout — a partial WAV is worse than none.
     sys.stdout.buffer.write(audio)
