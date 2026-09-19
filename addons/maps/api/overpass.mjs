@@ -12,7 +12,7 @@
  * a down/overloaded Overpass instance, or a malformed reply are each
  * `{ ok: false, error }`.
  * ------------------------------------------------------------------ */
-import { CATEGORIES, defaultRadiusM, maxNearbyResults, nearbyCacheTtlMs, overpassBase } from './config.mjs'
+import { CATEGORIES, defaultRadiusM, maxNearbyResults, nearbyCacheTtlMs, overpassBase, userAgent } from './config.mjs'
 
 /** Great-circle distance in km — plenty accurate for "how far is the nearest
  *  X", and needs no library. */
@@ -49,7 +49,9 @@ export async function nearbyPlaces({ lat, lon, category, radiusM }, { fetchImpl 
     const q = overpassQuery({ lat, lon, tag: cat.tag, value: cat.value, radiusM: radius })
     const res = await fetchImpl(overpassBase(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      // Overpass answers HTTP 406 to a request with no User-Agent — same
+      // identifying-header discipline as nominatim.mjs, same function.
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': userAgent() },
       body: `data=${encodeURIComponent(q)}`,
       signal: AbortSignal.timeout(15000),
     })

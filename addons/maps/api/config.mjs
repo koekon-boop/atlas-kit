@@ -36,7 +36,12 @@ export const overpassBase = () => str('ATLAS_MAPS_OVERPASS_BASE', 'https://overp
  *  config (.env), never baked into this public repo. */
 export const userAgent = () => {
   const contact = str('ATLAS_MAPS_CONTACT', '')
-  return `atlas-kit-maps-addon/1.0${contact ? ` (${contact})` : ' (contact not configured — set ATLAS_MAPS_CONTACT in .env)'}`
+  const ua = `atlas-kit-maps-addon/1.0${contact ? ` (${contact})` : ' (contact not configured - set ATLAS_MAPS_CONTACT in .env)'}`
+  // Header values must be ByteString (Latin-1) — Node's fetch/Headers throws a
+  // TypeError otherwise, and that throw would surface as a confusing "geocoding
+  // unavailable" error rather than pointing at this string. Catch it here instead.
+  if (!/^[\x00-\xff]*$/.test(ua)) throw new Error(`userAgent() produced a non-Latin-1 string, unsafe as a header value: ${ua}`)
+  return ua
 }
 
 export const routeCacheTtlMs = () => Math.max(60000, num('ATLAS_MAPS_ROUTE_CACHE_TTL_MS', 5 * 60 * 1000))
