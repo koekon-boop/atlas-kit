@@ -299,6 +299,54 @@ another with `ATLAS_VOICE_WHISPER_MODEL=small bash addons/voice/install.sh
 --engine whisper` (the name of any `ggml-<name>.bin` in whisper.cpp's model repo).
 Without VAD a silent clip came back as "you"; with it, silence is no transcript.
 
+### Loudness — both voices normalized to one level
+
+The operator reported the on-box voice sounding quiet even at full device
+volume. Measured on this box (real piper + Kokoro, not stubs) for a
+representative sentence in each language:
+
+| | peak (before) | RMS (before) | peak (after) | RMS (after) |
+|---|---|---|---|---|
+| Kokoro, `bm_george` (EN) | -7.09 dBFS | -20.74 dBFS | -2.00 dBFS | -15.65 dBFS |
+| piper, `de_DE-thorsten-medium` (DE) | -0.00 dBFS | -15.28 dBFS | -2.00 dBFS | -17.28 dBFS |
+
+Kokoro's output really was ~5.5 dB quieter (RMS) than piper's before this —
+not a device-volume problem, the two engines synthesize at genuinely
+different natural levels. Piper's German, meanwhile, was already peaking at
+essentially 0 dBFS — full scale, no headroom, and a real risk of clipping
+after a playback chain's reconstruction filter (inter-sample peaks can exceed
+0 dBFS even when no individual sample does).
+
+`engines/audio_normalize.py`'s `normalize_wav()` fixes both in the one place
+they both pass through — `tts_bilingual.py`, right before `sys.stdout.buffer
+.write(audio)` — by **peak-normalizing** every clip to -2 dBFS (headroom
+against clipping and inter-sample peaks, not 0 dBFS):
+
+- **Peak, not RMS/LUFS.** Measured crest factor (peak − RMS) landed within
+  ~2 dB between the two engines (~15 dB piper, ~14 dB Kokoro) — normal,
+  continuous speech, no rogue clicks or long silence padding that would make
+  peak a bad loudness proxy here. Matching peaks therefore came within ~1.6 dB
+  of matching RMS too (-15.65 vs -17.28 above), for a fraction of the CPU an
+  LUFS/ITU-R BS.1770 implementation would cost.
+- **Never amplifies silence into noise.** A clip peaking below -50 dBFS is
+  left untouched rather than boosted — there's no real signal there to find
+  the loudness of, only whatever noise floor the engine produced.
+- **Gain is capped at ±24 dB** even if the target says more, so a pathological
+  input can't get scaled into something absurd.
+- **Pure stdlib** (`wave` + `array`), deliberately: `audioop` was removed in
+  Python 3.13 and this runs inside whichever venv `install.sh` happened to
+  create with whatever `python3` was on the box at install time; `numpy`
+  happens to be present in the kokoro venv (onnxruntime pulls it in) but
+  isn't a dependency this repo declares or controls.
+- **Cost:** ~13–14 ms added per call, measured — noise next to piper's
+  ~1 s or Kokoro's ~2–4 s cold synthesis.
+
+There's a hard ceiling this can't fix: normalization only closes the gap
+*between* the two engines and gives consistent headroom against clipping —
+it can't make either engine louder than -2 dBFS peak without introducing
+audible distortion, and it doesn't compensate for a genuinely quiet phone
+speaker or an external system's own volume setting.
+
 ### Every knob
 
 | var | default | |
@@ -388,16 +436,19 @@ cd web && npm test                              # event derivation, MicField par
 
 Hermetic by construction: no mic, no engine, no model, no network. The "engines"
 are shell stubs on a temp `PATH` — which is precisely the contract a real one has
-to meet — and `claude` is stubbed the same way. `lang-detect.test.mjs` and
-`kokoro-daemon.test.mjs` are the two exceptions that shell out to a real
-`python3` (stdlib only, no `kokoro-onnx`/piper installed) rather than stubbing
-the interpreter itself: the first tests `engines/lang_detect.py`'s DE/EN vote
-directly, since a wrong answer there is silent and picks the wrong voice for a
-whole reply; the second stages `kokoro_daemon.py` + `kokoro_client.py` next to
+to meet — and `claude` is stubbed the same way. `lang-detect.test.mjs`,
+`kokoro-daemon.test.mjs` and `audio-normalize.test.mjs` are the three exceptions
+that shell out to a real `python3` (stdlib only, no `kokoro-onnx`/piper installed)
+rather than stubbing the interpreter itself: the first tests `engines/lang_detect.py`'s
+DE/EN vote directly, since a wrong answer there is silent and picks the wrong voice
+for a whole reply; the second stages `kokoro_daemon.py` + `kokoro_client.py` next to
 a stub `tts_kokoro.py` (no model, no onnxruntime) to prove the daemon/client
 wiring itself — autostart, warm reuse, idle self-eviction, auto-recovery after
 that eviction, and the `ATLAS_VOICE_KOKORO_DAEMON=0` bypass — killing its own
-daemon process before it exits.
+daemon process before it exits; the third tests `engines/audio_normalize.py`'s
+`normalize_wav()` directly against synthetic WAV bytes — silence, a quiet clip, a
+clip already at full scale — since a wrong answer there is also silent: audio
+that's still too quiet, or that clips.
 `install.test.sh` stages fake executables/files rather than actually installing
 Kokoro or piper (both need real network); the install SUCCESS path — the venv,
 the downloads, the bilingual routing proof — is exercised by actually running
