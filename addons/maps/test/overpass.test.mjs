@@ -52,6 +52,7 @@ test('nearest first, unnamed places get the category label, POSTed as form-encod
   assert.ok(r.places.find((p) => p.name === 'fuel station'), 'unnamed element falls back to the category label')
   assert.equal(calls[0].opts.method, 'POST')
   assert.match(calls[0].opts.headers['Content-Type'], /x-www-form-urlencoded/)
+  assert.match(calls[0].opts.headers['User-Agent'], /atlas-kit-maps-addon/, 'Overpass answers HTTP 406 without a User-Agent')
   assert.match(decodeURIComponent(calls[0].opts.body), /amenity.*fuel/)
 })
 
