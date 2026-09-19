@@ -43,10 +43,18 @@ test('addon-backed parts are gated at runtime and never fetched while off', () =
 })
 
 test('the brain is the existing knowledge-chat API over the Atlas', () => {
-  assert.match(jarvis, /spawnAgent\(\{ task: jarvisTask\(t\), kind: 'knowledge', vault: VAULT/)
+  assert.match(jarvis, /spawnAgent\(\{ task: jarvisTask\(t, fix\), kind: 'knowledge', vault: VAULT/)
   assert.match(jarvis, /queueAgent\(/)
   assert.match(jarvis, /promptAgent\(/)
   assert.match(jarvis, /fetchAgentHistory\(/)
+})
+
+test('maps (addons/maps): a GPS fix is taken only for a NEW chat, gated on the addon', () => {
+  assert.match(jarvis, /addons\.enabled\('maps'\)/)
+  assert.match(jarvis, /const fix = mode === 'spawn' && mapsOn \? await location\.get\(\) : null/)
+  // A follow-up (queue/prompt) never re-requests location — only jarvisTask(t, fix) does.
+  assert.ok(!/queueAgent\(\{ id: live!\.id, text: t, fix/.test(jarvis))
+  assert.ok(!/promptAgent\(\{ id: live!\.id, text: t, fix/.test(jarvis))
 })
 
 test('voice reuses the shared paths instead of a second implementation', () => {

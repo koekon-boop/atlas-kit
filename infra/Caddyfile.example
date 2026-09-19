@@ -84,6 +84,15 @@
 			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
 		}
 	}
+	# maps: POST /api/maps/route and /api/maps/nearby are bearer-gated by the
+	# addon's own middleware, same as instagram-ingest/voice — neither mutates
+	# any state, but a non-GET route needs the same injection or the Jarvis
+	# tab's own asks 401 (addons/maps/README.md).
+	handle /api/maps/* {
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+		}
+	}
 
 	# --- Read routes (open; Cloudflare Access gates them at the edge) ---
 	handle /api/* {

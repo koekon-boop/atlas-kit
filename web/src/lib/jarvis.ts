@@ -23,9 +23,24 @@ const PERSONA =
   'Keep replies short and spoken-style — two to four sentences, no tables, no code blocks, no bullet lists unless asked. ' +
   'Answer in the language the question was asked in. Do the actual work with your normal tools, then say what you did.'
 
-/** The spawn task for a new Jarvis chat. */
-export function jarvisTask(question: string): string {
-  return `${JARVIS_MARK} ${question.trim()}\n\n${PERSONA}`
+export interface JarvisLocation {
+  lat: number
+  lon: number
+  accuracyM?: number
+}
+
+/** The spawn task for a new Jarvis chat. `location` — the phone's GPS fix, if
+ *  one was taken for this send (addons/maps) — is folded in as plain text
+ *  after the persona so a maps question ("how far to X") has a starting point
+ *  without the operator having to state one. Only a NEW chat's opening turn
+ *  gets a fix; a follow-up later in the same conversation does not. */
+export function jarvisTask(question: string, location?: JarvisLocation | null): string {
+  const loc = location
+    ? `\n\nThe operator's phone reports its current location as latitude ${location.lat.toFixed(5)}, longitude ${location.lon.toFixed(5)}` +
+      `${location.accuracyM != null ? ` (±${Math.round(location.accuracyM)} m)` : ''}. ` +
+      'If the question needs a starting point (a route, "near me") and none is stated, use this one.'
+    : ''
+  return `${JARVIS_MARK} ${question.trim()}\n\n${PERSONA}${loc}`
 }
 
 /** The question a Jarvis task was opened with (marker and persona stripped).

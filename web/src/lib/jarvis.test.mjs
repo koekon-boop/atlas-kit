@@ -47,6 +47,12 @@ test('Jarvis chats are knowledge chats marked in their task; the live one is con
   assert.equal(jarvisQuestion(task), 'status report')
   assert.equal(jarvisQuestion(`You are a knowledge agent…\n\nQuestion:\n${task}`), 'status report', 'found inside the chat preamble')
   assert.equal(jarvisQuestion('a follow-up'), 'a follow-up')
+  assert.ok(!/latitude/.test(task), 'no location given → nothing about it in the task')
+
+  const withLoc = jarvisTask('how far to the Hauptbahnhof', { lat: 48.14, lon: 11.58, accuracyM: 12.4 })
+  assert.equal(jarvisQuestion(withLoc), 'how far to the Hauptbahnhof', 'the location tail does not leak into the displayed question')
+  assert.match(withLoc, /latitude 48\.14000, longitude 11\.58000/)
+  assert.match(withLoc, /±12 m/)
   assert.equal(isJarvisSession({ kind: 'knowledge', task }), true)
   assert.equal(isJarvisSession({ kind: 'dev', task }), false)
   assert.equal(isJarvisSession({ kind: 'knowledge', task: 'plain atlas chat' }), false)

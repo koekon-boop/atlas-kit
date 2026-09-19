@@ -12,6 +12,7 @@ import { useHost, gb } from '../lib/useHost'
 import { useUsage, fmtReset } from '../lib/useUsage'
 import { useDraft } from '../lib/useDraft'
 import { useDictation } from '../lib/useDictation'
+import { useLocationOnDemand } from '../lib/geolocation'
 import { useWakeWord } from '../lib/useWakeWord'
 import { useMicLevel, readLevel } from '../lib/audioLevel'
 import { useReadAloud } from '../lib/readAloud'
@@ -226,9 +227,11 @@ function Console({ brief }: { brief: () => string }) {
   const sessions = view?.sessions ?? []
   const addons = useAddons()
   const voiceOn = addons.ready && addons.enabled('voice')
+  const mapsOn = addons.ready && addons.enabled('maps')
   const vs = voiceStatus(addons.get('voice'))
   const onBoxTts = !!vs?.tts.available
   const executor = !!view && view.localRepos.length > 0
+  const location = useLocationOnDemand()
 
   // Which conversation: the one this console spawned (by id), else the newest
   // live Jarvis chat — unless "new conversation" was pressed.
@@ -288,9 +291,13 @@ function Console({ brief }: { brief: () => string }) {
     }
     setBusy(true)
     setErr('')
+    // A GPS fix is only worth taking for a NEW chat's opening turn — a
+    // follow-up later in the conversation sends its raw text unmodified (see
+    // jarvisTask), so this never re-prompts mid-conversation.
+    const fix = mode === 'spawn' && mapsOn ? await location.get() : null
     const r =
       mode === 'spawn'
-        ? await spawnAgent({ task: jarvisTask(t), kind: 'knowledge', vault: VAULT, model: 'sonnet', effort: 'high' })
+        ? await spawnAgent({ task: jarvisTask(t, fix), kind: 'knowledge', vault: VAULT, model: 'sonnet', effort: 'high' })
         : mode === 'queue'
           ? await queueAgent({ id: live!.id, text: t })
           : await promptAgent({ id: live!.id, text: t })
@@ -507,6 +514,11 @@ function Console({ brief }: { brief: () => string }) {
       {err || wake.error || dict.error ? <div className="jv-err">✗ {err || wake.error || dict.error}</div> : null}
       {!voiceOn && addons.ready ? (
         <div className="jv-note">Voice in/out is off on this box — enable the voice addon (addons/voice).</div>
+      ) : null}
+      {!mapsOn && addons.ready ? (
+        <div className="jv-note">Route/ETA and nearby places are off on this box — enable the maps addon (addons/maps).</div>
+      ) : mapsOn && location.error ? (
+        <div className="jv-note">Location: {location.error} — a route/nearby question will need a place stated explicitly.</div>
       ) : null}
 
       <div className="jv-log" ref={logRef} aria-label="conversation">
