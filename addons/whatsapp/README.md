@@ -50,8 +50,9 @@ dashboard's agent list, where you can look and steer it.
   console. Its access token from the API Setup page **expires after ~24 hours** —
   for anything lasting, make a System User token (step 3). You cannot use the test
   number to talk to the public, and it is not for production use.
-- **Text only.** Images, voice notes, locations, reactions… get one short "can't read
-  that yet" back and never reach the agent. Replies are text only too.
+- **Text and voice notes in, text out.** Images, documents, stickers, locations,
+  reactions… get one short "can't read that yet" back and never reach the agent
+  (voice notes: see below). Replies are text only.
 - **One session for everyone on the allowlist.** Two numbers in
   `WHATSAPP_ALLOWED_FROM` share one conversation. Put in only numbers that may read
   each other's questions — normally just yours.
@@ -59,6 +60,63 @@ dashboard's agent list, where you can look and steer it.
   the next message creates a fresh one (the old context is not carried over).
 - Message ids are deduped **in memory** (last 1000): a Meta redelivery straight after
   an API restart can be handled twice.
+
+## Voice notes
+
+A voice note (or an audio file attached from the gallery — same message type, `voice: false`)
+is turned into text and handed to the agent like a typed message, marked so it knows:
+
+```
+[WhatsApp from 4915…] [Sprachnachricht, transkribiert] Was steht heute an?
+```
+
+1. `GET graph.facebook.com/v21.0/<media-id>` → `url`, `mime_type`, `file_size`.
+   `file_size` is checked against the limit **before anything is downloaded**.
+2. `GET <url>` — with the same `Authorization: Bearer` access token (the lookaside URL answers `401`
+   without it; the bridge only sends it to an `https://` URL).
+3. `POST http://127.0.0.1:$API_PORT/api/voice/transcribe` with the raw bytes and the file's
+   `content-type`, authenticated with `DASHBOARD_BEARER_TOKEN` — the route `addons/voice` serves. The
+   bridge does not run Whisper itself and imports nothing from `addons/voice`.
+4. The transcript goes through the normal forward path; the agent answers with `/api/whatsapp/send` as always.
+
+The audio is held **in memory only** — never written to disk, the vault or the repo. It all happens
+after the webhook has answered `200`, in the same one-message-at-a-time queue as text, so a
+long transcription delays the message behind it. Dedupe, the sender allowlist, the signature check
+and the 24-hour window apply exactly as for text.
+
+### It needs `addons/voice` with a working on-box STT
+
+Enable `voice` **and** point `ATLAS_VOICE_STT_CMD` at an engine (`bash addons/voice/install.sh --engine whisper`
+builds whisper.cpp and prints the line; `bash addons/voice/install.sh --check` tells you it resolves).
+The browser's own speech recognition — the voice addon's zero-install default — is no use here: no
+browser is involved.
+
+When that is missing the sender is **never left in silence** and the agent is never bothered:
+
+| what happened | what the sender gets | counter |
+|---|---|---|
+| voice addon off, no `ATLAS_VOICE_STT_CMD`, whisper missing or failing (`503`/`404` from the route) | "Spracherkennung ist auf der Box gerade nicht aktiv — schreib es mir bitte" (the route's own error text stays in the log) | `transcribeErrors` |
+| Whisper heard nothing | "In der Sprachnachricht war nichts zu hören …" | `transcribeEmpty` |
+| `file_size` over the limit, or the voice route's `413` | "… zu lang für mich …" | `audioTooLarge` (`413`: `transcribeErrors`) |
+| media lookup or download failed (Graph error, `401`, network) | "Ich konnte die Sprachnachricht nicht laden …" | `mediaErrors` |
+| the route errored otherwise or timed out | "… nicht auswerten …" | `transcribeErrors` |
+
+Every failure is logged with its status code and text (`[whatsapp] media lookup failed: HTTP 400: …`).
+`GET /api/addons` shows `voiceNotes.transcription` — `ready`, `NOT AVAILABLE — <why>` or `unknown` (the
+first answer after a restart, before the probe of the voice addon's status has come back) — and
+`bash addons/whatsapp/install.sh --check` reports it too. A **restart** of the API is needed after
+changing `.env`.
+
+### Limits and timeouts
+
+| | default | env | why |
+|---|---|---|---|
+| audio size | **16 MB** | `WHATSAPP_MAX_AUDIO_BYTES` | Meta's own cap for audio messages. A voice note is Opus at roughly 6 KB/s, so this is far more than anyone speaks; it only stops something absurd being downloaded into memory. ⚠️ `addons/voice` caps its upload at `ATLAS_VOICE_MAX_AUDIO_BYTES` (**12 MB**) — a clip between the two is downloaded and then refused with the "too long" hint. Raise that variable too if you want the full 16 MB. |
+| Meta requests | 30 s each | `WHATSAPP_MEDIA_TIMEOUT_MS` | the lookup and the download are each one request; a voice note is a few hundred KB |
+| transcription | 120 s | `WHATSAPP_TRANSCRIBE_TIMEOUT_MS` | whisper.cpp needs several seconds per minute of audio on this kind of box; the voice route kills its engine after `ATLAS_VOICE_STT_TIMEOUT_MS` (60 s), so this stays **above** that and the route's precise error wins over a blind abort |
+
+Cost: one on-box Whisper run per voice note (~290 MB RAM for the `base` model, only while it
+transcribes). No API call, no key.
 
 ## Security model
 
@@ -167,6 +225,7 @@ missing (`inbound`/`outbound` list the unset variables) and the counters:
 | `badSignature` rising | wrong `WHATSAPP_APP_SECRET` (a different app's?) |
 | `rawBodyMissing` rising | the Caddy webhook block lacks the Content-Type rewrite |
 | `dropped` rising | the sender is not in `WHATSAPP_ALLOWED_FROM` (format: digits only, no `+`) |
+| `audioReceived` rising but `transcribed` not | see the voice-note table above: `transcribeErrors` → speech recognition (`addons/voice/install.sh --check`); `mediaErrors` → the log line has Meta's status and text (an expired `WHATSAPP_ACCESS_TOKEN` is the usual one) |
 | `forwardErrors` rising | the agent routes refused — the API log has the reason; the sender gets a "can't reach the agent" message |
 | all zero | Meta is not calling: webhook not subscribed to `messages`, wrong callback URL, or Access still blocking |
 
@@ -182,5 +241,5 @@ outlive the addon. The state file and the agent session can be deleted by hand.
 
 ## Tests
 
-`node --test addons/whatsapp/test/*.test.mjs` (also part of `cd api && npm test`). Meta and
-the agent routes are stubbed; nothing leaves the process and no credential is real.
+`node --test addons/whatsapp/test/*.test.mjs` (also part of `cd api && npm test`). Meta, the
+transcription route and the agent routes are stubbed; nothing leaves the process and no credential is real.

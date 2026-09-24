@@ -382,6 +382,8 @@ test('POST /send: missing outbound credentials say exactly which', async () => {
 /* --- loading with nothing configured ------------------------------------------ */
 
 test('with NO env set the addon loads cleanly and status() reports it honestly', () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('offline') } // status() probes the voice addon; never the real API
   const keep = { ...process.env }
   for (const k of Object.keys(process.env)) if (k.startsWith('WHATSAPP_') || k === 'DASHBOARD_BEARER_TOKEN') delete process.env[k]
   process.env.WHATSAPP_STATE_FILE = path.join(TMP, 'none.json')
@@ -398,12 +400,15 @@ test('with NO env set the addon loads cleanly and status() reports it honestly',
     assert.match(st.session, /none yet/)
     assert.equal(JSON.stringify(st).includes('secret'), false)
   } finally {
+    globalThis.fetch = realFetch
     for (const k of Object.keys(process.env)) if (!(k in keep)) delete process.env[k]
     Object.assign(process.env, keep)
   }
 })
 
 test('status() with everything set says ready, tracks the 24 h window, and leaks no secret', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('offline') }
   const keep = { ...process.env }
   Object.assign(process.env, ENV, { WHATSAPP_STATE_FILE: path.join(TMP, 'ready.json') })
   fs.writeFileSync(process.env.WHATSAPP_STATE_FILE, JSON.stringify({ sessionId: 'kb-atlas-3', lastInboundAt: new Date().toISOString() }))
@@ -419,6 +424,7 @@ test('status() with everything set says ready, tracks the 24 h window, and leaks
     fs.writeFileSync(process.env.WHATSAPP_STATE_FILE, JSON.stringify({ lastInboundAt: new Date(Date.now() - 25 * 3600e3).toISOString() }))
     assert.equal(registerAddon(ctx).status().windowOpen, false)
   } finally {
+    globalThis.fetch = realFetch
     for (const k of Object.keys(process.env)) if (!(k in keep)) delete process.env[k]
     Object.assign(process.env, keep)
   }

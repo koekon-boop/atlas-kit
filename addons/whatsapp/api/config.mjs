@@ -30,6 +30,11 @@ export const NEEDS = {
 /** Names still unset for a half ('inbound' | 'outbound'). */
 export const missing = (half, env = process.env) => NEEDS[half].filter((k) => !str(env, k))
 
+const posInt = (env, k, d) => {
+  const n = Number(env[k])
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : d
+}
+
 export const config = (env = process.env) => ({
   verifyToken: str(env, 'WHATSAPP_VERIFY_TOKEN'),
   appSecret: str(env, 'WHATSAPP_APP_SECRET'),
@@ -39,6 +44,10 @@ export const config = (env = process.env) => ({
   bearer: str(env, 'DASHBOARD_BEARER_TOKEN'),
   apiBase: `http://127.0.0.1:${str(env, 'API_PORT', '3001')}`,
   apiPort: str(env, 'API_PORT', '3001'),
+  // Voice notes (README "Voice notes"): the size cap is checked BEFORE any download.
+  maxAudioBytes: posInt(env, 'WHATSAPP_MAX_AUDIO_BYTES', 16 * 1024 * 1024),
+  mediaTimeoutMs: posInt(env, 'WHATSAPP_MEDIA_TIMEOUT_MS', 30000), // per request: the media lookup, then the byte download
+  transcribeTimeoutMs: posInt(env, 'WHATSAPP_TRANSCRIBE_TIMEOUT_MS', 120000),
 })
 
 export const GRAPH_BASE = 'https://graph.facebook.com/v21.0'

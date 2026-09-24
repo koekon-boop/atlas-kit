@@ -27,6 +27,7 @@
  * ------------------------------------------------------------------ */
 import { config, missing, normalizeNumber, stateFile } from './config.mjs'
 import { readState } from './agent.mjs'
+import { createSttProbe } from './audio.mjs'
 import { createInbound } from './inbound.mjs'
 import { safeEqual, sendText, verifyHandshake, verifySignature } from './meta.mjs'
 
@@ -35,6 +36,7 @@ const DAY_MS = 24 * 60 * 60 * 1000
 export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file } = {}) {
   const routes = Router()
   const inbound = createInbound({ env, fetch: f, log, file })
+  const stt = createSttProbe({ env, fetch: f })
 
   function bearerAuth(req, res, next) {
     const token = config(env).bearer
@@ -94,14 +96,23 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
     res.status(r.ok ? 200 : 502).json(r)
   })
 
-  return { routes, inbound }
+  return { routes, inbound, stt }
+}
+
+/** Voice notes need addons/voice with a working on-box STT — say honestly whether it is there. */
+function voiceNotesStatus(stt) {
+  const s = stt.get()
+  return {
+    transcription: s.available === true ? 'ready' : s.available === false ? `NOT AVAILABLE — ${s.reason}` : `unknown — ${s.reason}`,
+    maxAudioBytes: config().maxAudioBytes,
+  }
 }
 
 export default function register(ctx) {
-  const { routes, inbound } = buildRoutes(ctx)
+  const { routes, inbound, stt } = buildRoutes(ctx)
   return {
     description:
-      'WhatsApp Cloud API ↔ one standing Atlas agent session: inbound webhook (HMAC-verified) into the agent, and a bearer-gated send route the agent answers through.',
+      'WhatsApp Cloud API ↔ one standing Atlas agent session: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through.',
     routes,
     status: () => {
       const inMiss = missing('inbound')
@@ -115,6 +126,7 @@ export default function register(ctx) {
         session: st.sessionId || 'none yet (created on the first message)',
         lastInboundAt: st.lastInboundAt || null,
         windowOpen: Number.isFinite(last) ? Date.now() - last < DAY_MS : null,
+        voiceNotes: voiceNotesStatus(stt),
         counters: { ...inbound.counters },
         ...(inbound.counters.rawBodyMissing
           ? { warning: 'webhook bodies arrive already parsed — the Caddy webhook block is missing its Content-Type rewrite (README)' }
