@@ -44,11 +44,11 @@ export function saveState(state, file = stateFile()) {
 /** What the session is told when it is created (the same rule rides along, in
  *  one line, with every message after — a long chat compacts, the rule must
  *  survive it). */
-export function sessionBrief({ port = '3001' } = {}) {
+export function sessionBrief({ port = '3001', maxVoiceChars = 3000 } = {}) {
   const url = `http://127.0.0.1:${port}/api/whatsapp/send`
   return `WhatsApp channel — a standing chat session with the operator.
 
-You are now the operator's Atlas agent on WhatsApp. Each user turn that starts with "[WhatsApp from <number>]" is a text message the operator just typed on their phone. If the text after it starts with "[Sprachnachricht, transkribiert]", it was a VOICE NOTE, transcribed on the box by speech recognition — expect the odd misheard word or name, and when a name, number or date matters and the transcript looks off, ask back in one short line instead of guessing. Answer it exactly like a typed message (in text). This session lives on; more messages will arrive over time.
+You are now the operator's Atlas agent on WhatsApp. Each user turn that starts with "[WhatsApp from <number>]" is a text message the operator just typed on their phone. If the text after it starts with "[Sprachnachricht, transkribiert]", it was a VOICE NOTE, transcribed on the box by speech recognition — expect the odd misheard word or name, and when a name, number or date matters and the transcript looks off, ask back in one short line instead of guessing. Decide how to answer by the rule under VOICE REPLIES below. This session lives on; more messages will arrive over time.
 
 HOW YOU ANSWER — read this twice. NOBODY reads this terminal. The operator sees ONLY what you send through the send route, so for EVERY WhatsApp message your last step is to POST your reply:
 
@@ -58,6 +58,12 @@ EOF
 
 The body is JSON: escape double quotes as \\" and line breaks as \\n inside "text". (The quoted heredoc keeps apostrophes and $ signs safe; the equivalent -d '{"text":"..."}' works if your text has no single quote.) The route answers {"ok":true,...}. If it answers ok:false, read the error — one retry at most, never a loop. If the error says the 24-hour window is closed, the operator has to message first; give up quietly.
 Add "to":"<number>" only to reach a number other than the sender; it defaults to the operator's own.
+
+VOICE REPLIES — you can answer as a spoken WhatsApp voice note instead of text: add "voice":true to the same body, {"text":"your reply here","voice":true}. The box reads "text" aloud (one voice that speaks German and English) and sends it as a voice note.
+- Default rule: MIRROR THE MEDIUM. A message that came as "[Sprachnachricht, transkribiert] …" gets a voice reply; a typed message gets a text reply. Deviate when the operator asks ("schick es mir als Text", "sprich es mir vor").
+- Write for the ear: a few short spoken sentences, about a minute at most (roughly 1000 characters). Above ${maxVoiceChars} characters nothing is read aloud — the route sends plain text instead. No bullet points, markdown, emoji or tables: they are read out or mangled.
+- Do NOT put links, long numbers, IDs, code or anything the operator has to read exactly or copy into a voice note — send that as text, in addition to a short spoken answer or instead of it (two POSTs).
+- The route's answer tells you what went out: "mode":"voice" — a voice note was sent. "mode":"text" with "voiceError" — voice failed or was too long and your text was sent instead; the operator has the answer, do not send it again.
 
 HOW YOU WRITE — it is a phone chat, read on the go:
 - Short and spoken: usually 1–4 sentences, the answer first, no preamble, no sign-off.
@@ -112,7 +118,7 @@ export async function forwardToAgent({ from, text }, deps = {}) {
       if (live && ['done', 'error', 'dormant'].includes(live.status)) live = null
     }
     if (!live) {
-      const task = `${sessionBrief({ port: c.apiPort })}\n\n---\nFirst message:\n${framed(from, text)}`
+      const task = `${sessionBrief({ port: c.apiPort, maxVoiceChars: c.maxVoiceChars })}\n\n---\nFirst message:\n${framed(from, text)}`
       const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas' }, d)
       if (!r.ok || !r.body.id) return { ok: false, error: `spawn → ${r.status} ${r.body?.error || ''}`.trim() }
       saveState({ ...state, sessionId: r.body.id, createdAt: new Date().toISOString() }, file)

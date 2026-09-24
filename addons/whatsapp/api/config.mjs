@@ -48,6 +48,12 @@ export const config = (env = process.env) => ({
   maxAudioBytes: posInt(env, 'WHATSAPP_MAX_AUDIO_BYTES', 16 * 1024 * 1024),
   mediaTimeoutMs: posInt(env, 'WHATSAPP_MEDIA_TIMEOUT_MS', 30000), // per request: the media lookup, then the byte download
   transcribeTimeoutMs: posInt(env, 'WHATSAPP_TRANSCRIBE_TIMEOUT_MS', 120000),
+  // Voice replies (README "Voice replies"). maxSpokenChars pairs with addons/voice's
+  // ATLAS_VOICE_MAX_SPOKEN_CHARS, which silently truncates: keep it at or below that.
+  maxSpokenChars: Math.max(50, posInt(env, 'WHATSAPP_MAX_SPOKEN_CHARS', 700)), // per /api/voice/speak call
+  maxVoiceChars: posInt(env, 'WHATSAPP_MAX_VOICE_CHARS', 3000), // above this the reply goes out as text
+  ttsTimeoutMs: posInt(env, 'WHATSAPP_TTS_TIMEOUT_MS', 30000), // per chunk
+  ffmpegTimeoutMs: posInt(env, 'WHATSAPP_FFMPEG_TIMEOUT_MS', 60000),
 })
 
 export const GRAPH_BASE = 'https://graph.facebook.com/v21.0'

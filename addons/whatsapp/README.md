@@ -13,7 +13,7 @@ phone ◄── Meta Cloud API ◄── POST /api/whatsapp/send ◄── the a
 
 - `GET  /api/whatsapp/webhook` — Meta's verification handshake.
 - `POST /api/whatsapp/webhook` — inbound messages, authenticated by Meta's HMAC signature.
-- `POST /api/whatsapp/send` — `{ to?, text }`, **bearer-gated**; splits texts over 4096 characters at paragraph boundaries. This is how the agent answers.
+- `POST /api/whatsapp/send` — `{ to?, text, voice? }`, **bearer-gated**; splits texts over 4096 characters at paragraph boundaries. This is how the agent answers — as text, or with `voice: true` as a read-aloud voice note ([Voice replies](#voice-replies)).
 
 **Replies are pushed, not scraped.** Nothing reads the session's terminal. The session
 is told at creation (see `sessionBrief()` in `api/agent.mjs`) that nobody sees its
@@ -33,9 +33,14 @@ dashboard's agent list, where you can look and steer it.
 - **Box:** nothing on disk except one JSON file with the session id
   (`<AGENT_LOCAL_DIR>/whatsapp.json`, default `~/.atlas-kit/whatsapp.json`); a
   small in-memory dedupe set; no dependency, no cron.
+  A voice reply also needs a short-lived temp dir (removed straight after) and costs one on-box TTS run
+  per ~700 characters plus a few seconds of ffmpeg CPU — nothing when you never send `voice: true`.
 - **Privacy:** WhatsApp Cloud API messages pass through Meta's servers **unencrypted
   end to end** (Meta is the business-side endpoint). Do not put in it what you would
   not put in any Meta business account.
+  Voice replies add one more hop: **the text is handed to your `ATLAS_VOICE_TTS_CMD`** — if that is a
+  cloud engine (an edge-tts wrapper talks to Microsoft) the spoken text leaves the box that way; a
+  local engine (piper, kokoro) keeps it on the box.
 
 ## What it cannot do — read this before you count on it
 
@@ -50,9 +55,10 @@ dashboard's agent list, where you can look and steer it.
   console. Its access token from the API Setup page **expires after ~24 hours** —
   for anything lasting, make a System User token (step 3). You cannot use the test
   number to talk to the public, and it is not for production use.
-- **Text and voice notes in, text out.** Images, documents, stickers, locations,
+- **Text and voice notes in, text or a voice note out.** Images, documents, stickers, locations,
   reactions… get one short "can't read that yet" back and never reach the agent
-  (voice notes: see below). Replies are text only.
+  (voice notes: see below). Replies are text, or — with `voice: true` — a read-aloud voice note
+  (see [Voice replies](#voice-replies)); never images or files.
 - **One session for everyone on the allowlist.** Two numbers in
   `WHATSAPP_ALLOWED_FROM` share one conversation. Put in only numbers that may read
   each other's questions — normally just yours.
@@ -118,6 +124,108 @@ changing `.env`.
 Cost: one on-box Whisper run per voice note (~290 MB RAM for the `base` model, only while it
 transcribes). No API call, no key.
 
+## Voice replies
+
+The way back of the voice notes above: the agent can answer as a **spoken WhatsApp voice note**
+instead of text. `POST /api/whatsapp/send` takes `{ "text": "…", "to"?: "…", "voice"?: true }`.
+**Without `voice` nothing changes** — the same text send, the same `{"ok":true,"sent":1,"parts":1}` answer.
+With `"voice": true`:
+
+```
+text ─► chunk (≤ WHATSAPP_MAX_SPOKEN_CHARS) ─► POST /api/voice/speak  (once per chunk, in order)
+     ─► ffmpeg: all clips → ONE mono OGG/Opus ─► POST graph/<phone-id>/media  (multipart, type=audio/ogg)
+     ─► POST graph/<phone-id>/messages  { type: "audio", audio: { id } }
+```
+
+1. **Read aloud through the box's own route.** `POST http://127.0.0.1:$API_PORT/api/voice/speak` with the
+   dashboard bearer and `{ text }`, the route `addons/voice` serves — the same loopback pattern as
+   `/api/voice/transcribe`. The bridge starts no TTS itself and imports nothing from `addons/voice`. The
+   answer's `content-type` is used only as the temp file's extension; ffmpeg decides by the bytes, so
+   nothing assumes WAV (the voice addon labels its output `audio/wav` by default even when the engine
+   emits something else — trusting the label would turn that into a hard failure).
+2. **Re-encode** with `ffmpeg -c:a libopus -ac 1 -b:a 20k -application voip -f ogg`. The clips are joined by
+   ffmpeg's `concat` *filter*, which decodes each first, so different formats or sample rates still
+   join — **no tone and no pause between the parts; it plays like one recording.**
+3. **Upload** as `multipart/form-data` (`messaging_product=whatsapp`, `type=audio/ogg`, the file) → `{ id }`.
+4. **Send** `{ messaging_product, to, type: "audio", audio: { id } }`.
+
+`to` is checked against `WHATSAPP_ALLOWED_FROM` exactly as for text. `voice` must be `true` or `false`
+(anything else is a `400`: a string `"true"` must not silently turn into text).
+
+**The answer says what went out:**
+
+| | answer |
+|---|---|
+| voice note sent | `200 {"ok":true,"mode":"voice","sent":1,"parts":1,"chunks":<n>,"mediaId":"…"}` — `chunks` is how many pieces were read, `parts`/`sent` count WhatsApp messages (always 1) |
+| voice failed or too long, text sent | `200 {"ok":true,"mode":"text","voiceError":"<why>","sent":…,"parts":…}` |
+| voice failed **and** the text send failed | `502 {"ok":false,"mode":"text","voiceError":"…","error":"<Meta's text>","status":…}` |
+
+### Why OGG/Opus, mono — and why 20 kbps
+
+Checked against Meta's Cloud API documentation (audio messages and supported media types):
+
+- WhatsApp shows a file as a real **voice message** (microphone icon, waveform, optional transcription) only
+  if it is **`.ogg` with the OPUS codec** — `audio/ogg` without Opus is not accepted, and the Opus input must
+  be **mono**. mp3 / m4a / aac / amr are accepted but arrive as an **audio file** (music icon, manual play).
+- Audio is capped at **16 MB**, and **the play button appears only for files of 512 KB or less** — larger
+  ones show a download icon. That is what fixes the bitrate: 20 kbps Opus (`voip` tuning, plenty for speech)
+  is ~2.5 KB/s, so 512 KB ≈ 200 s, and the 3000-character default cap (≈ 3 min of speech) stays inside it.
+  32 kbps (~128 s) would not.
+- What a *phone* actually draws (waveform vs. file, play vs. download) cannot be checked from the box — the
+  first live voice reply is that test.
+
+### It needs `addons/voice` with an on-box TTS and ffmpeg with libopus
+
+| | needed | if it is missing |
+|---|---|---|
+| `addons/voice` enabled + `ATLAS_VOICE_TTS_CMD` set to a working engine (text on stdin → audio on stdout, e.g. a wrapper around edge-tts, piper, kokoro) | speech | `/api/voice/speak` answers `503`/`404` → **text**, `ttsErrors` |
+| `ffmpeg` on `PATH` **with `libopus`** | re-encoding to OGG/Opus | ffmpeg not found, or failing → **text**, `ffmpegErrors` |
+| Meta accepts the upload and the audio message | delivery | upload or send refused → **text**, `uploadErrors` (Meta's status and text in the log) |
+
+The browser's own speech synthesis — the voice addon's zero-install default — is no use here.
+**Every** failure ends in the ordinary text message, **once**: there is no retry loop, and the operator
+always gets the answer. `voiceFallbacks` counts every time that happened.
+(One corner: if Meta accepted the voice note but the answer was lost on the way back, the text goes out
+as well — a duplicate beats a lost reply.)
+
+### Two length limits — and how they relate to `ATLAS_VOICE_MAX_SPOKEN_CHARS`
+
+| | default | env | what it does |
+|---|---|---|---|
+| per TTS call | **700** | `WHATSAPP_MAX_SPOKEN_CHARS` | the text is cut at paragraph, then sentence, then (one endless sentence) word boundaries into pieces of at most this many characters; each is read separately and the clips are joined into one voice note |
+| whole reply | **3000** (≈ 3 min) | `WHATSAPP_MAX_VOICE_CHARS` | above this **nothing is read aloud**: the text goes out as a normal message, `mode:"text"`, with the reason in `voiceError`. A phone chat does not need a ten-minute monologue |
+
+⚠️ **`WHATSAPP_MAX_SPOKEN_CHARS` and the voice addon's `ATLAS_VOICE_MAX_SPOKEN_CHARS` (default 700)
+belong together.** `/api/voice/speak` **silently cuts** any longer text at that limit — no error — so a
+reply would just stop mid-sentence. The bridge therefore never sends more than its own limit per call.
+The addon does not read the voice addon's setting: if you raise `ATLAS_VOICE_MAX_SPOKEN_CHARS`, raise this
+one to match (fewer, longer pieces); **never set this one higher** than the voice addon's. (Values under 50
+are ignored — a runaway number of TTS calls is never what anyone meant.)
+
+Timeouts: `WHATSAPP_TTS_TIMEOUT_MS` (30 s per piece; the voice route kills its engine after
+`ATLAS_VOICE_TTS_TIMEOUT_MS`, 20 s, so this stays **above** it and the route's precise error wins),
+`WHATSAPP_FFMPEG_TIMEOUT_MS` (60 s), and `WHATSAPP_MEDIA_TIMEOUT_MS` (30 s) also covers the upload.
+The pieces are read one after the other, so a long reply takes a few seconds per piece before it is sent.
+
+### Temp files, status, and the agent
+
+ffmpeg needs files: each reply gets one `mkdtemp` directory under the OS temp dir (`TMPDIR`), removed in a
+`finally` — also when anything fails. Nothing goes to the vault or the repo.
+
+`GET /api/addons` shows `voiceReplies` — `synthesis` (`ready`, `NOT AVAILABLE — <why>`, or `unknown` for
+the first answer after a restart), `ffmpeg` (found on `PATH`), `maxSpokenChars`, `maxVoiceChars` — and the
+counters `voiceSent`, `voiceFallbacks`, `ttsErrors`, `ffmpegErrors`, `uploadErrors` (`uploadErrors` counts
+Meta refusing either the media upload or the audio message). A disabled voice addon only makes
+`synthesis` read `NOT AVAILABLE — the voice addon is not enabled`. `bash addons/whatsapp/install.sh --check`
+reports the same, plus whether ffmpeg has `libopus` (a fact only it can see).
+
+**Telling the agent.** A session created **after** this change is briefed (`sessionBrief()` in
+`api/agent.mjs`): `voice: true` sends a voice note; **mirror the medium** by default (a
+`[Sprachnachricht, transkribiert] …` message gets a voice note, a typed one gets text) unless the
+operator asks otherwise; short, spoken sentences, no bullets; never voice links, long numbers, IDs or code —
+send those as text; and the length cap. ⚠️ The **already running session keeps its old brief** (it only
+knows text) — until it is closed and the next message spawns a fresh one, it will not use `voice`.
+
 ## Security model
 
 | what | how it is protected |
@@ -125,7 +233,7 @@ transcribes). No API call, no key.
 | `POST …/webhook` (public, called by Meta) | `X-Hub-Signature-256` = HMAC-SHA256 of the **raw** body with `WHATSAPP_APP_SECRET`, constant-time. **No secret set → the route refuses (503)**, it never waves a request through. |
 | `GET …/webhook` (handshake) | `hub.verify_token` compared in constant time to `WHATSAPP_VERIFY_TOKEN`; an unset token never matches. |
 | who may talk to the agent | `WHATSAPP_ALLOWED_FROM` only. Anyone else is dropped **silently** (no reply, so no sign the number is live) and counted. An empty list accepts nobody. |
-| `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `to` must be in the allowlist, so a prompt-injected agent cannot message arbitrary numbers. |
+| `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `to` must be in the allowlist, so a prompt-injected agent cannot message arbitrary numbers (voice or text alike). |
 
 Add to that: the webhook path is the **only** thing you expose publicly, its body is
 capped at 256 KB, and it answers `200` immediately and works afterwards (Meta retries
@@ -226,6 +334,7 @@ missing (`inbound`/`outbound` list the unset variables) and the counters:
 | `rawBodyMissing` rising | the Caddy webhook block lacks the Content-Type rewrite |
 | `dropped` rising | the sender is not in `WHATSAPP_ALLOWED_FROM` (format: digits only, no `+`) |
 | `audioReceived` rising but `transcribed` not | see the voice-note table above: `transcribeErrors` → speech recognition (`addons/voice/install.sh --check`); `mediaErrors` → the log line has Meta's status and text (an expired `WHATSAPP_ACCESS_TOKEN` is the usual one) |
+| `voiceFallbacks` rising | voice replies are being sent as text: `ttsErrors` → the TTS command (`addons/voice/install.sh --check`); `ffmpegErrors` → `ffmpeg` missing or without `libopus` (`addons/whatsapp/install.sh --check`); `uploadErrors` → Meta refused the upload or the voice note — the log line has its status and text; none of the three → the text was over `WHATSAPP_MAX_VOICE_CHARS` |
 | `forwardErrors` rising | the agent routes refused — the API log has the reason; the sender gets a "can't reach the agent" message |
 | all zero | Meta is not calling: webhook not subscribed to `messages`, wrong callback URL, or Access still blocking |
 
@@ -242,4 +351,5 @@ outlive the addon. The state file and the agent session can be deleted by hand.
 ## Tests
 
 `node --test addons/whatsapp/test/*.test.mjs` (also part of `cd api && npm test`). Meta, the
-transcription route and the agent routes are stubbed; nothing leaves the process and no credential is real.
+transcription and speech routes, the agent routes and ffmpeg are all stubbed; nothing leaves the process,
+no ffmpeg runs and no credential is real. (`install.sh --check` is exercised on a copy in a scratch tree.)

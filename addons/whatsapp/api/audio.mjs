@@ -17,10 +17,10 @@
  * ------------------------------------------------------------------ */
 import { config, GRAPH_BASE } from './config.mjs'
 
-const clip = (s, n = 300) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n)
+export const clip = (s, n = 300) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n)
 
 /** Best-effort: Graph's `error.message`, else the first bytes of whatever came back. */
-async function reasonOf(r) {
+export async function reasonOf(r) {
   const text = await r.text().catch(() => '')
   try {
     const e = JSON.parse(text)?.error
@@ -116,14 +116,16 @@ export async function transcribe(audio, mime, { env = process.env, fetch: f = gl
 }
 
 /**
- * What `status()` (which is synchronous) can say about on-box transcription:
- * `get()` returns the last answer and, when it is older than `ttlMs`, starts a
- * refresh in the background. The answer comes from the voice addon's own status
- * block in `GET /api/addons` — a disabled voice addon is just "not enabled".
- * That request reaches this addon's status() too; the in-flight flag stops the
- * echo from probing again.
+ * What `status()` (which is synchronous) can say about an on-box engine of the
+ * voice addon — `section` is its status key, 'stt' (voice notes in) or 'tts'
+ * (voice replies out): `get()` returns the last answer and, when it is older than
+ * `ttlMs`, starts a refresh in the background. The answer comes from the voice
+ * addon's own status block in `GET /api/addons` — a disabled voice addon is just
+ * "not enabled". That request reaches this addon's status() too; the in-flight
+ * flag stops the echo from probing again.
  */
-export function createSttProbe({ env = process.env, fetch: f = globalThis.fetch, ttlMs = 30000 } = {}) {
+export function createVoiceProbe(section, { env = process.env, fetch: f = globalThis.fetch, ttlMs = 30000 } = {}) {
+  const what = section === 'tts' ? 'speech synthesis' : 'speech recognition'
   let cached = { available: null, reason: 'not checked yet — ask again in a moment' }
   let inflight = false
   let at = 0
@@ -132,10 +134,10 @@ export function createSttProbe({ env = process.env, fetch: f = globalThis.fetch,
     try {
       const r = await f(`${config(env).apiBase}/api/addons`, { signal: AbortSignal.timeout(3000) })
       const voice = (await r.json())?.addons?.find((a) => a?.name === 'voice')
-      const stt = voice?.status?.stt
+      const st = voice?.status?.[section]
       if (!voice) cached = { available: false, reason: 'the voice addon is not enabled' }
-      else if (!stt) cached = { available: null, reason: 'the voice addon reported no STT status' }
-      else cached = { available: stt.available === true, reason: stt.available ? 'on-box speech recognition is ready' : clip(stt.reason) }
+      else if (!st) cached = { available: null, reason: `the voice addon reported no ${section.toUpperCase()} status` }
+      else cached = { available: st.available === true, reason: st.available ? `on-box ${what} is ready` : clip(st.reason) }
     } catch (e) {
       cached = { available: null, reason: `could not ask the API: ${clip(e?.message || e)}` }
     } finally {
@@ -152,3 +154,6 @@ export function createSttProbe({ env = process.env, fetch: f = globalThis.fetch,
     },
   }
 }
+
+export const createSttProbe = (opts) => createVoiceProbe('stt', opts)
+export const createTtsProbe = (opts) => createVoiceProbe('tts', opts)

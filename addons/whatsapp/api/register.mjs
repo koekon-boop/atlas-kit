@@ -4,7 +4,8 @@
  *
  *   GET  /api/whatsapp/webhook   Meta's verification handshake
  *   POST /api/whatsapp/webhook   inbound messages (HMAC-signed by Meta)
- *   POST /api/whatsapp/send      the agent's reply path (bearer-gated)
+ *   POST /api/whatsapp/send      the agent's reply path (bearer-gated): text, or with
+ *                                `voice: true` a read-aloud voice note (text on any failure)
  *
  * Disable it and the kit is byte-identical to one that never had it
  * (docs/ADDONS.md): no route, no state file, no outbound call.
@@ -27,16 +28,19 @@
  * ------------------------------------------------------------------ */
 import { config, missing, normalizeNumber, stateFile } from './config.mjs'
 import { readState } from './agent.mjs'
-import { createSttProbe } from './audio.mjs'
+import { createSttProbe, createTtsProbe } from './audio.mjs'
 import { createInbound } from './inbound.mjs'
 import { safeEqual, sendText, verifyHandshake, verifySignature } from './meta.mjs'
+import { createVoiceReplies, onPath, run } from './voice-reply.mjs'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file } = {}) {
+export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
   const routes = Router()
   const inbound = createInbound({ env, fetch: f, log, file })
   const stt = createSttProbe({ env, fetch: f })
+  const tts = createTtsProbe({ env, fetch: f })
+  const voice = createVoiceReplies({ env, fetch: f, log, exec })
 
   function bearerAuth(req, res, next) {
     const token = config(env).bearer
@@ -87,16 +91,17 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
     const absent = missing('outbound', env)
     if (absent.length) return res.status(503).json({ ok: false, error: `not configured — set ${absent.join(', ')}` })
     const c = config(env)
-    const { to, text } = req.body || {}
+    const { to, text, voice: wantVoice } = req.body || {}
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ ok: false, error: 'missing "text"' })
     const target = to == null || to === '' ? c.allowedFrom[0] : normalizeNumber(to)
     // A prompt-injected agent must not be able to message arbitrary numbers.
     if (!c.allowedFrom.includes(target)) return res.status(400).json({ ok: false, error: '"to" is not in WHATSAPP_ALLOWED_FROM' })
-    const r = await sendText({ to: target, text }, { env, fetch: f, log })
+    if (wantVoice != null && typeof wantVoice !== 'boolean') return res.status(400).json({ ok: false, error: '"voice" must be true or false' })
+    const r = wantVoice ? await voice.send({ to: target, text }) : await sendText({ to: target, text }, { env, fetch: f, log })
     res.status(r.ok ? 200 : 502).json(r)
   })
 
-  return { routes, inbound, stt }
+  return { routes, inbound, stt, tts, voice }
 }
 
 /** Voice notes need addons/voice with a working on-box STT — say honestly whether it is there. */
@@ -108,11 +113,24 @@ function voiceNotesStatus(stt) {
   }
 }
 
+/** Voice replies need addons/voice with an on-box TTS command AND ffmpeg (with libopus,
+ *  which only install.sh --check can see) — say honestly whether they are there. */
+function voiceRepliesStatus(tts) {
+  const s = tts.get()
+  const c = config()
+  return {
+    synthesis: s.available === true ? 'ready' : s.available === false ? `NOT AVAILABLE — ${s.reason}` : `unknown — ${s.reason}`,
+    ffmpeg: onPath('ffmpeg'),
+    maxSpokenChars: c.maxSpokenChars,
+    maxVoiceChars: c.maxVoiceChars,
+  }
+}
+
 export default function register(ctx) {
-  const { routes, inbound, stt } = buildRoutes(ctx)
+  const { routes, inbound, stt, tts, voice } = buildRoutes(ctx)
   return {
     description:
-      'WhatsApp Cloud API ↔ one standing Atlas agent session: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through.',
+      'WhatsApp Cloud API ↔ one standing Atlas agent session: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
     routes,
     status: () => {
       const inMiss = missing('inbound')
@@ -127,7 +145,8 @@ export default function register(ctx) {
         lastInboundAt: st.lastInboundAt || null,
         windowOpen: Number.isFinite(last) ? Date.now() - last < DAY_MS : null,
         voiceNotes: voiceNotesStatus(stt),
-        counters: { ...inbound.counters },
+        voiceReplies: voiceRepliesStatus(tts),
+        counters: { ...inbound.counters, ...voice.counters },
         ...(inbound.counters.rawBodyMissing
           ? { warning: 'webhook bodies arrive already parsed — the Caddy webhook block is missing its Content-Type rewrite (README)' }
           : {}),
