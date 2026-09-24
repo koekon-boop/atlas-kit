@@ -1,4 +1,4 @@
 {
-  "_comment": "Copy to addons.json (gitignored) and list the addons this box runs. Each name is a directory under addons/. The ATLAS_ADDONS env var overrides this file whenever it is set — ATLAS_ADDONS= (empty) means no addons at all. See docs/ADDONS.md.",
+  "_comment": "Copy to addons.json (gitignored) and list the addons this box runs. Each name is a directory under addons/. The ATLAS_ADDONS env var overrides this file whenever it is set — ATLAS_ADDONS= (empty) means no addons at all. See docs/ADDONS.md. Example for the WhatsApp bridge: {\"enabled\": [\"whatsapp\"]} — but set the WHATSAPP_* variables in .env first (addons/whatsapp/README.md); it is left out of the default list so a fresh copy of this file enables nothing.",
   "enabled": []
 }
