@@ -5,7 +5,8 @@
 #
 # MODES
 #   (no args) | --check
-#     exit 0 — installed: every env var set, addon enabled, Caddy block present
+#     exit 0 — installed: every env var set, addon enabled, Caddy block present,
+#              and speech recognition for voice notes configured (addons/voice)
 #     exit 2 — installable: something above is still to do (each gap is printed)
 #     exit 1 — cannot: node missing
 #
@@ -46,6 +47,41 @@ else
     || gap "infra/Caddyfile has no 'handle /api/whatsapp/webhook' block with the Content-Type rewrite — copy it from infra/Caddyfile.example (without it every webhook is refused), then scripts/serve.sh restart"
   grep -q 'handle /api/whatsapp/\*' "$CADDY" \
     || gap "infra/Caddyfile has no 'handle /api/whatsapp/*' bearer block — /send would 401 through the proxy"
+fi
+
+# 4. Voice notes need addons/voice with an on-box STT: enabled, ATLAS_VOICE_STT_CMD set and its
+#    binary on PATH. (The browser's own speech recognition, the voice addon's default, cannot help
+#    here.) If the API is running, also ask it what it actually loaded — informational: an API
+#    that predates a config change just needs a restart.
+voice_on=$(ROOT="$ROOT" node -e "
+const fs = require('fs')
+let names
+if (process.env.ATLAS_ADDONS !== undefined) names = process.env.ATLAS_ADDONS.split(',').map((s) => s.trim())
+else { try { names = JSON.parse(fs.readFileSync(process.env.ROOT + '/addons.json', 'utf8')).enabled || [] } catch { names = [] } }
+process.stdout.write(names.includes('voice') ? 'yes' : 'no')
+")
+if [ "$voice_on" != "yes" ]; then
+  gap "voice notes need the voice addon — enable 'voice' (addons.json / ATLAS_ADDONS); without it a voice note gets a 'speech recognition is not active' reply"
+elif [ -z "${ATLAS_VOICE_STT_CMD:-}" ]; then
+  gap "voice notes need on-box speech recognition — set ATLAS_VOICE_STT_CMD (bash addons/voice/install.sh --engine whisper prints the line)"
+elif ! command -v "${ATLAS_VOICE_STT_CMD%% *}" >/dev/null 2>&1; then
+  gap "ATLAS_VOICE_STT_CMD names '${ATLAS_VOICE_STT_CMD%% *}', which is not an executable — run: bash addons/voice/install.sh --check"
+else
+  live=$(PORT="${API_PORT:-3001}" node -e "
+fetch('http://127.0.0.1:' + process.env.PORT + '/api/addons', { signal: AbortSignal.timeout(3000) })
+  .then((r) => r.json())
+  .then((j) => {
+    const v = (j.addons || []).find((a) => a.name === 'voice')
+    const s = v && v.status && v.status.stt
+    process.stdout.write(!v ? 'the running API has no voice addon loaded (restart it?)' : s && s.available ? 'yes' : 'the running API says: ' + ((s && s.reason) || 'no STT status'))
+  })
+  .catch(() => process.stdout.write('the API is not answering on 127.0.0.1 — cannot ask'))
+")
+  if [ "$live" = "yes" ]; then
+    echo "[whatsapp] voice notes: speech recognition reachable (ATLAS_VOICE_STT_CMD resolves, the running API reports it available)"
+  else
+    echo "[whatsapp] voice notes: ATLAS_VOICE_STT_CMD resolves, but $live" >&2
+  fi
 fi
 
 if [ "$gaps" -eq 0 ]; then
