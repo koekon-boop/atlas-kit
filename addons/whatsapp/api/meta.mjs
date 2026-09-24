@@ -76,6 +76,16 @@ export function splitMessage(text, max = 4096) {
 /** Meta error 131047 = "re-engagement message": the 24-hour window is closed. */
 const WINDOW_CLOSED = 131047
 
+/** A non-2xx answer from Meta: log status + text, → `{ status, error }`. */
+async function metaFailure(r, what, log) {
+  const j = await r.json().catch(() => null)
+  const code = j?.error?.code
+  let error = j?.error?.message || `HTTP ${r.status}`
+  if (code === WINDOW_CLOSED) error += ' — the 24-hour window is closed: the user has to message first'
+  log(`[whatsapp] Meta rejected ${what}: HTTP ${r.status}${code ? ` (code ${code})` : ''}: ${error}`)
+  return { status: r.status, error }
+}
+
 /**
  * Send `text` to `to`, split into as many messages as the cap needs.
  * Never throws: → `{ ok, sent, parts, error?, status? }`. It stops at the first
@@ -97,14 +107,7 @@ export async function sendText({ to, text }, { env = process.env, fetch: f = glo
         body: JSON.stringify({ messaging_product: 'whatsapp', to: normalizeNumber(to), type: 'text', text: { body } }),
         signal: AbortSignal.timeout(15000),
       })
-      if (!r.ok) {
-        const j = await r.json().catch(() => null)
-        const code = j?.error?.code
-        let error = j?.error?.message || `HTTP ${r.status}`
-        if (code === WINDOW_CLOSED) error += ' — the 24-hour window is closed: the user has to message first'
-        log(`[whatsapp] Meta rejected a send: HTTP ${r.status}${code ? ` (code ${code})` : ''}: ${error}`)
-        return { ok: false, sent, parts: parts.length, status: r.status, error }
-      }
+      if (!r.ok) return { ok: false, sent, parts: parts.length, ...(await metaFailure(r, 'a send', log)) }
       sent++
     } catch (e) {
       log(`[whatsapp] send failed: ${e?.message || e}`)
@@ -112,4 +115,54 @@ export async function sendText({ to, text }, { env = process.env, fetch: f = glo
     }
   }
   return { ok: true, sent, parts: parts.length }
+}
+
+/**
+ * Upload audio bytes to Meta's media store (multipart/form-data) → `{ ok: true, id }`
+ * | `{ ok: false, status?, error }`. Never throws. The `type` field is the MIME type;
+ * WhatsApp shows a file as a real voice note (waveform) only for `audio/ogg` + Opus.
+ */
+export async function uploadMedia({ bytes, mime, filename }, { env = process.env, fetch: f = globalThis.fetch, log = console.error } = {}) {
+  const c = config(env)
+  const form = new FormData()
+  form.append('messaging_product', 'whatsapp')
+  form.append('type', mime)
+  form.append('file', new Blob([bytes], { type: mime }), filename)
+  try {
+    // No Content-Type header: fetch adds the multipart one, boundary included.
+    const r = await f(`${GRAPH_BASE}/${encodeURIComponent(c.phoneNumberId)}/media`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${c.accessToken}` },
+      body: form,
+      signal: AbortSignal.timeout(c.mediaTimeoutMs),
+    })
+    if (!r.ok) return { ok: false, ...(await metaFailure(r, 'a media upload', log)) }
+    const id = (await r.json().catch(() => null))?.id
+    if (typeof id !== 'string' || !id) {
+      log('[whatsapp] media upload answered without an id')
+      return { ok: false, error: 'Meta answered the upload without a media id' }
+    }
+    return { ok: true, id }
+  } catch (e) {
+    log(`[whatsapp] media upload failed: ${e?.message || e}`)
+    return { ok: false, error: String(e?.message || e) }
+  }
+}
+
+/** Send one already-uploaded audio message. Never throws → `{ ok, status?, error? }`. */
+export async function sendAudio({ to, mediaId }, { env = process.env, fetch: f = globalThis.fetch, log = console.error } = {}) {
+  const c = config(env)
+  try {
+    const r = await f(`${GRAPH_BASE}/${encodeURIComponent(c.phoneNumberId)}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${c.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: normalizeNumber(to), type: 'audio', audio: { id: mediaId } }),
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!r.ok) return { ok: false, ...(await metaFailure(r, 'a voice-note send', log)) }
+    return { ok: true }
+  } catch (e) {
+    log(`[whatsapp] voice-note send failed: ${e?.message || e}`)
+    return { ok: false, error: String(e?.message || e) }
+  }
 }

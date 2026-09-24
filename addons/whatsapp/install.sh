@@ -6,7 +6,8 @@
 # MODES
 #   (no args) | --check
 #     exit 0 — installed: every env var set, addon enabled, Caddy block present,
-#              and speech recognition for voice notes configured (addons/voice)
+#              speech recognition for voice notes and speech synthesis + ffmpeg (with libopus)
+#              for voice replies configured (addons/voice)
 #     exit 2 — installable: something above is still to do (each gap is printed)
 #     exit 1 — cannot: node missing
 #
@@ -49,10 +50,10 @@ else
     || gap "infra/Caddyfile has no 'handle /api/whatsapp/*' bearer block — /send would 401 through the proxy"
 fi
 
-# 4. Voice notes need addons/voice with an on-box STT: enabled, ATLAS_VOICE_STT_CMD set and its
-#    binary on PATH. (The browser's own speech recognition, the voice addon's default, cannot help
-#    here.) If the API is running, also ask it what it actually loaded — informational: an API
-#    that predates a config change just needs a restart.
+# 4. Voice notes (in) and voice replies (out) need addons/voice with on-box engines: enabled, the
+#    command var set and its binary on PATH. (The browser's own speech engines, the voice addon's
+#    default, cannot help here.) If the API is running, also ask it what it actually loaded —
+#    informational: an API that predates a config change just needs a restart.
 voice_on=$(ROOT="$ROOT" node -e "
 const fs = require('fs')
 let names
@@ -60,27 +61,56 @@ if (process.env.ATLAS_ADDONS !== undefined) names = process.env.ATLAS_ADDONS.spl
 else { try { names = JSON.parse(fs.readFileSync(process.env.ROOT + '/addons.json', 'utf8')).enabled || [] } catch { names = [] } }
 process.stdout.write(names.includes('voice') ? 'yes' : 'no')
 ")
-if [ "$voice_on" != "yes" ]; then
-  gap "voice notes need the voice addon — enable 'voice' (addons.json / ATLAS_ADDONS); without it a voice note gets a 'speech recognition is not active' reply"
-elif [ -z "${ATLAS_VOICE_STT_CMD:-}" ]; then
-  gap "voice notes need on-box speech recognition — set ATLAS_VOICE_STT_CMD (bash addons/voice/install.sh --engine whisper prints the line)"
-elif ! command -v "${ATLAS_VOICE_STT_CMD%% *}" >/dev/null 2>&1; then
-  gap "ATLAS_VOICE_STT_CMD names '${ATLAS_VOICE_STT_CMD%% *}', which is not an executable — run: bash addons/voice/install.sh --check"
-else
-  live=$(PORT="${API_PORT:-3001}" node -e "
+
+# voice_live <stt|tts> → "yes", or why the running API does not report that engine available
+voice_live() {
+  SECTION="$1" PORT="${API_PORT:-3001}" node -e "
 fetch('http://127.0.0.1:' + process.env.PORT + '/api/addons', { signal: AbortSignal.timeout(3000) })
   .then((r) => r.json())
   .then((j) => {
     const v = (j.addons || []).find((a) => a.name === 'voice')
-    const s = v && v.status && v.status.stt
-    process.stdout.write(!v ? 'the running API has no voice addon loaded (restart it?)' : s && s.available ? 'yes' : 'the running API says: ' + ((s && s.reason) || 'no STT status'))
+    const s = v && v.status && v.status[process.env.SECTION]
+    process.stdout.write(!v ? 'the running API has no voice addon loaded (restart it?)' : s && s.available ? 'yes' : 'the running API says: ' + ((s && s.reason) || 'no status for it'))
   })
   .catch(() => process.stdout.write('the API is not answering on 127.0.0.1 — cannot ask'))
-")
-  if [ "$live" = "yes" ]; then
-    echo "[whatsapp] voice notes: speech recognition reachable (ATLAS_VOICE_STT_CMD resolves, the running API reports it available)"
+"
+}
+
+# voice_engine <stt|tts> <label> <ENV_VAR> <noun> <advice> — one gap, or one "reachable" line
+voice_engine() {
+  local section="$1" label="$2" var="$3" noun="$4" advice="$5" cmd="${!3:-}" live
+  if [ -z "$cmd" ]; then
+    gap "$label need on-box speech $noun — set $var ($advice)"
+  elif ! command -v "${cmd%% *}" >/dev/null 2>&1; then
+    gap "$var names '${cmd%% *}', which is not an executable — run: bash addons/voice/install.sh --check"
   else
-    echo "[whatsapp] voice notes: ATLAS_VOICE_STT_CMD resolves, but $live" >&2
+    live=$(voice_live "$section")
+    if [ "$live" = "yes" ]; then
+      echo "[whatsapp] $label: $var resolves, the running API reports it available"
+    else
+      echo "[whatsapp] $label: $var resolves, but $live" >&2
+    fi
+  fi
+}
+
+if [ "$voice_on" != "yes" ]; then
+  gap "voice notes and voice replies need the voice addon — enable 'voice' (addons.json / ATLAS_ADDONS); without it a voice note gets a 'speech recognition is not active' reply and voice: true replies go out as text"
+else
+  voice_engine stt "voice notes" ATLAS_VOICE_STT_CMD recognition "bash addons/voice/install.sh --engine whisper prints the line"
+  voice_engine tts "voice replies" ATLAS_VOICE_TTS_CMD synthesis "a command: text on stdin, audio on stdout — see addons/voice/README.md"
+fi
+
+# 5. Voice replies re-encode with ffmpeg: WhatsApp shows a voice note (waveform) only for OGG/Opus, so
+#    it needs the libopus encoder. (Without it every voice: true reply falls back to text.)
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  gap "voice replies need ffmpeg (with libopus) on PATH — apt install ffmpeg; without it voice: true replies go out as text"
+else
+  # captured first: 'ffmpeg | grep -q' would trip pipefail when grep exits early
+  encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+  if grep -q libopus <<<"$encoders"; then
+    echo "[whatsapp] voice replies: ffmpeg with libopus found"
+  else
+    gap "ffmpeg has no libopus encoder — voice replies need it for OGG/Opus (install a full ffmpeg build); voice: true replies go out as text meanwhile"
   fi
 fi
 
