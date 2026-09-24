@@ -94,6 +94,35 @@
 		}
 	}
 
+	# whatsapp: TWO blocks, webhook FIRST (Caddy takes the first matching handle).
+	#  · /api/whatsapp/webhook is called by META, which can hold neither the
+	#    dashboard bearer nor a Cloudflare Access login — the operator exempts
+	#    EXACTLY this path from Access (a Bypass policy, README "Step 6"). Its
+	#    authentication is the HMAC signature the addon checks, not this file.
+	#    The block also rewrites Content-Type: core's global JSON parser would
+	#    otherwise consume the body, and the signature is over the RAW bytes; a
+	#    non-JSON type makes body-parser stand aside and the addon reads the raw
+	#    body itself (it fails CLOSED if it ever sees an already-parsed one).
+	#    The bearer line is here only because addon-caddyfile-bearer.test.mjs
+	#    wants one on every non-GET addon route — the webhook route never reads
+	#    Authorization, so injecting it is inert on this exact path.
+	#  · /api/whatsapp/send (and anything else under the prefix) is the normal
+	#    bearer-injected write route and STAYS behind Cloudflare Access.
+	handle /api/whatsapp/webhook {
+		request_body {
+			max_size 256KB
+		}
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+			header_up Content-Type "application/octet-stream"
+		}
+	}
+	handle /api/whatsapp/* {
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+		}
+	}
+
 	# --- Read routes (open; Cloudflare Access gates them at the edge) ---
 	handle /api/* {
 		reverse_proxy localhost:3001
