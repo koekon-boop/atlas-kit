@@ -2,11 +2,12 @@
 
 Chat with the Atlas agent from **WhatsApp**: you write on your phone, a standing
 Atlas knowledge session on the `atlas` vault reads it, and answers in the same chat.
+Every allowed number gets its **own** session ([Several people](#several-people)).
 
 ```
 phone ──► Meta Cloud API ──► POST /api/whatsapp/webhook ──► (verify HMAC, dedupe, allowlist)
                                                                    │
-                        core: POST /api/agents/spawn | prompt | queue   (one session, reused)
+                        core: POST /api/agents/spawn | prompt | queue   (one session per number, reused)
                                                                    ▼
 phone ◄── Meta Cloud API ◄── POST /api/whatsapp/send ◄── the agent, via curl
 ```
@@ -30,7 +31,7 @@ dashboard's agent list, where you can look and steer it.
   page before relying on this.
 - **Claude:** the session is an ordinary Atlas chat on your subscription; every
   message you send is one agent turn (and it can search the vault, so some turns are long).
-- **Box:** nothing on disk except one JSON file with the session id
+- **Box:** nothing on disk except one JSON file with the session id of each sender
   (`<AGENT_LOCAL_DIR>/whatsapp.json`, default `~/.atlas-kit/whatsapp.json`); a
   small in-memory dedupe set; no dependency, no cron.
   A voice reply also needs a short-lived temp dir (removed straight after) and costs one on-box TTS run
@@ -59,13 +60,83 @@ dashboard's agent list, where you can look and steer it.
   reactions… get one short "can't read that yet" back and never reach the agent
   (voice notes: see below). Replies are text, or — with `voice: true` — a read-aloud voice note
   (see [Voice replies](#voice-replies)); never images or files.
-- **One session for everyone on the allowlist.** Two numbers in
-  `WHATSAPP_ALLOWED_FROM` share one conversation. Put in only numbers that may read
-  each other's questions — normally just yours.
-- The session **remembers across messages** until it is closed or its tmux dies; then
-  the next message creates a fresh one (the old context is not carried over).
+- **The conversations are separate, the knowledge is not.** Every number in
+  `WHATSAPP_ALLOWED_FROM` has its own session, but all of them work on the same `atlas`
+  vault — someone you add can, by asking, get the agent to read whatever the agent can read.
+  Put in only people you would let into that vault.
+- A session **remembers across messages** until it is closed or its tmux dies; then
+  that number's next message creates a fresh one (the old context is not carried over).
 - Message ids are deduped **in memory** (last 1000): a Meta redelivery straight after
   an API restart can be handled twice.
+
+## Several people
+
+`WHATSAPP_ALLOWED_FROM` is a comma list, and **every number in it gets its own standing
+session**: a second person never lands in the first one's chat, and each has their own
+context, their own 24-hour window and their own replies. The vault stays the same
+(`atlas`) — the conversations are separated, not the knowledge.
+
+```bash
+WHATSAPP_ALLOWED_FROM=491701234567,491512345678        # the FIRST number is the operator's
+WHATSAPP_SENDER_NAMES=491701234567=Ko,491512345678=Jessi   # optional
+```
+
+**State file.** `<AGENT_LOCAL_DIR>/whatsapp.json` is now keyed by number:
+
+```json
+{
+  "lastInboundAt": "2026-09-25T09:12:00.000Z",
+  "senders": {
+    "491701234567": { "sessionId": "kb-atlas-1", "createdAt": "…", "lastInboundAt": "…" },
+    "491512345678": { "sessionId": "kb-atlas-2", "createdAt": "…", "lastInboundAt": "…" }
+  }
+}
+```
+
+`forwardToAgent` looks the sender up, creates the session on that number's first message and
+uses it afterwards — idle → `/prompt`, running → `/queue`, gone or finished → a fresh session
+*for that number only*. `lastInboundAt` is kept per sender because Meta's 24-hour window is per
+user; the top-level one is only "last message from anyone".
+
+**Migration — nothing is lost.** A file in the old shape (`{ "sessionId", "createdAt", "lastInboundAt" }`)
+is converted on its first read by a message: the existing session becomes the **first number of
+`WHATSAPP_ALLOWED_FROM`** (the operator) and the file is rewritten in the new shape. The running
+chat continues as if nothing happened. `GET /api/addons` and `install.sh --check` read an old file
+the same way but never rewrite it. ⚠️ So keep the operator's number **first** in the list when you
+add people, and add new ones behind it.
+
+**🔴 Every send must carry `"to"` — the trap.** `POST /api/whatsapp/send` without `to` goes to the
+**first** allowed number. That default is unchanged (nothing existing breaks), but with several
+people a session that forgets `to` answers in the *operator's* chat — the wrong person reads it.
+Three guards:
+- the session brief names the session's **own number** and says that *every* send carries
+  `"to":"<that number>"`, in the curl example, the voice example and a dedicated rule;
+- the one-line reminder that rides along with every forwarded message repeats it
+  (`… with "to":"<number>" — the terminal is not read.`), so a long chat that compacted the brief keeps it;
+- a send **without** `to` while more than one number is allowed still goes out to the default, but logs
+  ``[whatsapp] reply without `to` while N senders are configured — went to the default number (49…678)``.
+  Watch for that line: it means a session is not following its brief.
+
+A session that was created **before** this change keeps its old brief (no number, `to` optional) — only
+the per-message reminder reaches it. After a migration that is the operator's session; close it whenever
+convenient and the next message starts one with the new brief. Until then, replies without `to` still
+reach the operator, which is exactly right for that session.
+
+**Names.** `WHATSAPP_SENDER_NAMES` is a comma list of `number=name` pairs. Spaces around numbers and names are
+ignored (a `+` or spaces inside a number too, like in the allowlist), empty entries and entries without `=`
+are skipped, and only the first `=` splits (a name may contain one). With a name the brief says
+"You are talking to Jessi (WhatsApp number …)"; without one it names the number only. It only affects sessions
+created after the variable is set. Names are not secrets, numbers are: keep both in `.env`, never in the repo.
+
+**Status.** `GET /api/addons` and `bash addons/whatsapp/install.sh --check` list one row per allowed number:
+masked number (`49…678`), name, session id, since when, and whether *that* number's 24-hour window is
+open. A dropped message from an unknown number is still silent and counted in `dropped`.
+
+**Meta side — a second number is not just an env edit.** Meta's free **test number** knows **at most 5
+allowed recipients**, and every one of them must be added in the console (WhatsApp → API Setup → *To* →
+*Manage phone number list*) and **confirmed with a code sent to that person's phone**. A number in
+`WHATSAPP_ALLOWED_FROM` that Meta has not verified can write to the agent but never receives an answer
+(the send is rejected — `Meta rejected a send` in the log). Both places, then restart the API.
 
 ## Voice notes
 
@@ -83,7 +154,7 @@ is turned into text and handed to the agent like a typed message, marked so it k
 3. `POST http://127.0.0.1:$API_PORT/api/voice/transcribe` with the raw bytes and the file's
    `content-type`, authenticated with `DASHBOARD_BEARER_TOKEN` — the route `addons/voice` serves. The
    bridge does not run Whisper itself and imports nothing from `addons/voice`.
-4. The transcript goes through the normal forward path; the agent answers with `/api/whatsapp/send` as always.
+4. The transcript goes through the normal forward path (to that sender's own session); the agent answers with `/api/whatsapp/send` as always.
 
 The audio is held **in memory only** — never written to disk, the vault or the repo. It all happens
 after the webhook has answered `200`, in the same one-message-at-a-time queue as text, so a
@@ -149,7 +220,7 @@ text ─► chunk (≤ WHATSAPP_MAX_SPOKEN_CHARS) ─► POST /api/voice/speak  
 3. **Upload** as `multipart/form-data` (`messaging_product=whatsapp`, `type=audio/ogg`, the file) → `{ id }`.
 4. **Send** `{ messaging_product, to, type: "audio", audio: { id } }`.
 
-`to` is checked against `WHATSAPP_ALLOWED_FROM` exactly as for text. `voice` must be `true` or `false`
+`to` is checked against `WHATSAPP_ALLOWED_FROM` exactly as for text (and is mandatory in practice with several senders — [Several people](#several-people)). `voice` must be `true` or `false`
 (anything else is a `400`: a string `"true"` must not silently turn into text).
 
 **The answer says what went out:**
@@ -333,6 +404,8 @@ missing (`inbound`/`outbound` list the unset variables) and the counters:
 | `badSignature` rising | wrong `WHATSAPP_APP_SECRET` (a different app's?) |
 | `rawBodyMissing` rising | the Caddy webhook block lacks the Content-Type rewrite |
 | `dropped` rising | the sender is not in `WHATSAPP_ALLOWED_FROM` (format: digits only, no `+`) |
+| a person gets no answer, `Meta rejected a send` in the log | the number is in `WHATSAPP_ALLOWED_FROM` but not (yet) verified as a recipient in Meta's console — or its own 24-hour window is closed (`sessions[].windowOpen` in `GET /api/addons`) |
+| log: ``reply without `to` while N senders …`` | a session sent without `"to"` and the answer went to the first number — see [Several people](#several-people) |
 | `audioReceived` rising but `transcribed` not | see the voice-note table above: `transcribeErrors` → speech recognition (`addons/voice/install.sh --check`); `mediaErrors` → the log line has Meta's status and text (an expired `WHATSAPP_ACCESS_TOKEN` is the usual one) |
 | `voiceFallbacks` rising | voice replies are being sent as text: `ttsErrors` → the TTS command (`addons/voice/install.sh --check`); `ffmpegErrors` → `ffmpeg` missing or without `libopus` (`addons/whatsapp/install.sh --check`); `uploadErrors` → Meta refused the upload or the voice note — the log line has its status and text; none of the three → the text was over `WHATSAPP_MAX_VOICE_CHARS` |
 | `forwardErrors` rising | the agent routes refused — the API log has the reason; the sender gets a "can't reach the agent" message |
@@ -346,7 +419,7 @@ logged as `[whatsapp] Meta rejected a send: HTTP … (code …): …` and return
 
 Remove `whatsapp` from `addons.json` / `ATLAS_ADDONS` and restart: no route, no outbound
 call. Then delete the webhook in Meta's console and the Access bypass in Cloudflare — those
-outlive the addon. The state file and the agent session can be deleted by hand.
+outlive the addon. The state file and the agent sessions can be deleted by hand.
 
 ## Tests
 
