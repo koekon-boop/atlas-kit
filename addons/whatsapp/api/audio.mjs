@@ -12,7 +12,8 @@
  *   createSttProbe()    what status() knows about that route (via GET /api/addons)
  *
  * Every function is total: failures come back as `{ ok: false, kind, error }` and
- * the audio lives in memory only — nothing is written to disk.
+ * the audio lives in memory only — nothing is written to disk. (`fetchMedia` is the
+ * same path for pictures, videos and documents — media.mjs saves those.)
  * Everything takes its `fetch` as an argument, so the tests never leave the process.
  * ------------------------------------------------------------------ */
 import { config, GRAPH_BASE } from './config.mjs'
@@ -31,15 +32,17 @@ export async function reasonOf(r) {
 }
 
 /**
- * → `{ ok: true, audio: Buffer, mime }`
+ * The media path shared by every incoming type: lookup → download, both with the token.
+ * → `{ ok: true, bytes: Buffer, mime }`
  *   | `{ ok: false, kind: 'lookup'|'download'|'too-large', error }`
  * `kind: 'too-large'` is decided from `file_size` BEFORE the download starts (and
- * re-checked on the bytes, since Meta's number is only a claim).
+ * re-checked on the bytes, since Meta's number is only a claim). `mime` is the
+ * download's content-type when it matches `mimeRe`, else the lookup's `mime_type`.
  */
-export async function fetchAudio(mediaId, { env = process.env, fetch: f = globalThis.fetch, log = console.error } = {}) {
+export async function fetchMedia(mediaId, { what, limit, mimeRe, fallbackMime }, { env = process.env, fetch: f = globalThis.fetch, log = console.error } = {}) {
   const c = config(env)
   const auth = { Authorization: `Bearer ${c.accessToken}` }
-  const tooLarge = (n) => ({ ok: false, kind: 'too-large', error: `audio is ${n} bytes, limit ${c.maxAudioBytes}` })
+  const tooLarge = (n) => ({ ok: false, kind: 'too-large', error: `${what} is ${n} bytes, limit ${limit}` })
   let lookup
   try {
     const r = await f(`${GRAPH_BASE}/${encodeURIComponent(mediaId)}`, { headers: auth, signal: AbortSignal.timeout(c.mediaTimeoutMs) })
@@ -53,7 +56,7 @@ export async function fetchAudio(mediaId, { env = process.env, fetch: f = global
     log(`[whatsapp] media lookup failed: ${e?.message || e}`)
     return { ok: false, kind: 'lookup', error: String(e?.message || e) }
   }
-  if (Number(lookup?.file_size) > c.maxAudioBytes) return tooLarge(lookup.file_size)
+  if (Number(lookup?.file_size) > limit) return tooLarge(lookup.file_size)
   // The token is about to be sent to this URL — only over TLS.
   if (typeof lookup?.url !== 'string' || !lookup.url.startsWith('https://')) {
     log('[whatsapp] media lookup answered without an https url')
@@ -67,16 +70,23 @@ export async function fetchAudio(mediaId, { env = process.env, fetch: f = global
       return { ok: false, kind: 'download', error: `HTTP ${r.status}: ${error}` }
     }
     const declared = Number(r.headers?.get?.('content-length'))
-    if (declared > c.maxAudioBytes) return tooLarge(declared)
-    const audio = Buffer.from(await r.arrayBuffer())
-    if (audio.length > c.maxAudioBytes) return tooLarge(audio.length)
-    if (!audio.length) return { ok: false, kind: 'download', error: 'empty download' }
+    if (declared > limit) return tooLarge(declared)
+    const bytes = Buffer.from(await r.arrayBuffer())
+    if (bytes.length > limit) return tooLarge(bytes.length)
+    if (!bytes.length) return { ok: false, kind: 'download', error: 'empty download' }
     const type = r.headers?.get?.('content-type') || ''
-    return { ok: true, audio, mime: /^audio\//i.test(type) ? type : lookup.mime_type || 'audio/ogg' }
+    return { ok: true, bytes, mime: mimeRe.test(type) ? type : lookup.mime_type || fallbackMime }
   } catch (e) {
     log(`[whatsapp] media download failed: ${e?.message || e}`)
     return { ok: false, kind: 'download', error: String(e?.message || e) }
   }
+}
+
+/** A voice note: → `{ ok: true, audio: Buffer, mime }` | the failures of fetchMedia. */
+export async function fetchAudio(mediaId, opts = {}) {
+  const c = config(opts.env ?? process.env)
+  const r = await fetchMedia(mediaId, { what: 'audio', limit: c.maxAudioBytes, mimeRe: /^audio\//i, fallbackMime: 'audio/ogg' }, opts)
+  return r.ok ? { ok: true, audio: r.bytes, mime: r.mime } : r
 }
 
 /* addons/voice answers "the STT command produced no transcript" with a 503, the

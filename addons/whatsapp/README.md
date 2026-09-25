@@ -3,6 +3,8 @@
 Chat with the Atlas agent from **WhatsApp**: you write on your phone, a standing
 Atlas knowledge session on the `atlas` vault reads it, and answers in the same chat.
 Every allowed number gets its **own** session ([Several people](#several-people)).
+You can send it **text, voice notes, pictures, videos and documents**
+([Voice notes](#voice-notes), [Pictures, videos and documents](#pictures-videos-and-documents)).
 
 ```
 phone ──► Meta Cloud API ──► POST /api/whatsapp/webhook ──► (verify HMAC, dedupe, allowlist)
@@ -34,11 +36,15 @@ dashboard's agent list, where you can look and steer it.
 - **Box:** nothing on disk except one JSON file with the session id of each sender
   (`<AGENT_LOCAL_DIR>/whatsapp.json`, default `~/.atlas-kit/whatsapp.json`); a
   small in-memory dedupe set; no dependency, no cron.
+  Pictures, videos and documents you send are **kept on the box** for the agent to open — in
+  `<AGENT_LOCAL_DIR>/whatsapp-media/`, deleted after 14 days ([details](#pictures-videos-and-documents)).
   A voice reply also needs a short-lived temp dir (removed straight after) and costs one on-box TTS run
   per ~700 characters plus a few seconds of ffmpeg CPU — nothing when you never send `voice: true`.
 - **Privacy:** WhatsApp Cloud API messages pass through Meta's servers **unencrypted
   end to end** (Meta is the business-side endpoint). Do not put in it what you would
   not put in any Meta business account.
+  A picture, a video still or a document the agent **looks at** is read by the model like any file it opens
+  (your Claude subscription, Anthropic) — do not send what you would not show it.
   Voice replies add one more hop: **the text is handed to your `ATLAS_VOICE_TTS_CMD`** — if that is a
   cloud engine (an edge-tts wrapper talks to Microsoft) the spoken text leaves the box that way; a
   local engine (piper, kokoro) keeps it on the box.
@@ -56,10 +62,11 @@ dashboard's agent list, where you can look and steer it.
   console. Its access token from the API Setup page **expires after ~24 hours** —
   for anything lasting, make a System User token (step 3). You cannot use the test
   number to talk to the public, and it is not for production use.
-- **Text and voice notes in, text or a voice note out.** Images, documents, stickers, locations,
-  reactions… get one short "can't read that yet" back and never reach the agent
-  (voice notes: see below). Replies are text, or — with `voice: true` — a read-aloud voice note
-  (see [Voice replies](#voice-replies)); never images or files.
+- **Text, voice notes, pictures, videos and documents in; text or a voice note out.** Stickers, locations,
+  contacts, reactions… get one short "can't read that yet" back and never reach the agent. A video
+  is **not watched**: the agent gets a handful of stills and the transcript of its soundtrack — see below.
+  Replies are text, or — with `voice: true` — a read-aloud voice note (see [Voice replies](#voice-replies));
+  never images or files.
 - **The conversations are separate, the knowledge is not.** Every number in
   `WHATSAPP_ALLOWED_FROM` has its own session, but all of them work on the same `atlas`
   vault — someone you add can, by asking, get the agent to read whatever the agent can read.
@@ -195,6 +202,93 @@ changing `.env`.
 Cost: one on-box Whisper run per voice note (~290 MB RAM for the `base` model, only while it
 transcribes). No API call, no key.
 
+## Pictures, videos and documents
+
+The agent is a Claude Code process with file access — it can open a picture or a PDF **itself**. So nothing is
+described to it: the file is fetched from Meta, **saved on the box**, and its **path goes into the message**, marked
+the way a voice note is. That marker is the interface between this addon and the agent (`sessionBrief()` in
+`api/agent.mjs` explains it to a new session):
+
+| you send | what the agent reads |
+|---|---|
+| a photo | `[WhatsApp from 4915…] [Bild empfangen: /root/.atlas-kit/whatsapp-media/2026-09-25/wamid…/image.jpg] Was ist das für ein Pilz?` |
+| a PDF or other file | `[Dokument empfangen: /…/Rechnung_Mai_2026.pdf, 3 Seiten] Stimmt der Betrag?` — the name it was sent under (made safe), the page count for a PDF when it can be read |
+| a video | `[Video empfangen: /…/video.mp4, 12 s] Hört sich komisch an` ⏎ `Einzelbilder (6, gleichmäßig über die ganze Länge verteilt): /…/frame-01.jpg, /…/frame-02.jpg, …` ⏎ `Tonspur, transkribiert: "…"` |
+| a long video | `[Video empfangen: /…/video.mp4, 340 s — gekürzt: nur die ersten 120 s der Tonspur transkribiert] …` — the stills still cover the whole video |
+
+The text after the first `]` is the **caption** you wrote (there may be none). A video with no soundtrack, or a silent
+one, simply has no `Tonspur` line. The brief tells the agent: *the paths are local files — look at them with your
+normal tools before you answer; a video arrives as stills plus a transcript, not as a film.* Everything else
+(`sticker`, `location`, `contacts` …) is answered with the "can't read that" line as before. A photo sent **as a document**
+(uncompressed, from the attach menu) arrives as `[Dokument empfangen: …]` — the agent opens it the same way.
+
+⚠️ **The running session keeps the brief it was created with** — it has never heard of these markers. Until it is
+closed and the next message spawns a fresh one, it sees `[Bild empfangen: <path>]` as odd text (the per-message
+reminder does not explain it). Close the operator's session in the dashboard after the update.
+
+### How it works
+
+1. `GET graph.facebook.com/v21.0/<media-id>` → `url`, `mime_type`, `file_size`; `file_size` is checked **before
+   anything is downloaded**. Then `GET <url>` with the same bearer token — exactly the path voice notes take
+   (`fetchMedia()` in `api/audio.mjs`, shared).
+2. The bytes go to `<AGENT_LOCAL_DIR>/whatsapp-media/<YYYY-MM-DD>/<message id>/` (next to the state file, `0600`
+   files): `image.<ext>`, `video.<ext>`, or a document under its own name. The extension comes from the mime type.
+   A document's name is reduced to letters, digits, `.` `_` `-` and cannot leave its folder.
+3. **Video only** (`api/media.mjs`): `ffprobe` (duration, streams) → up to **6 stills** with `ffmpeg`, one from the
+   middle of each of six equal slices of the **whole** video — not "one per second", which would bury the agent in a
+   long clip (a 3 s clip gets 3, a 0.4 s one gets 1) — longest edge **1024 px**, JPEG (`frame-01.jpg` …) → if there is
+   a soundtrack, `ffmpeg` cuts at most `WHATSAPP_MAX_VIDEO_SECONDS` of it as 16 kHz mono WAV and it is POSTed to
+   `http://127.0.0.1:$API_PORT/api/voice/transcribe` — the same loopback route as a voice note, so it needs the same
+   `addons/voice` + `ATLAS_VOICE_STT_CMD`. The scratch WAV is deleted; only the video and the stills stay.
+4. The marked text goes through the normal forward path (to that sender's own session); the agent answers with
+   `/api/whatsapp/send` as always.
+
+It all happens after the webhook has answered `200`, in the same one-message-at-a-time queue as text. Dedupe, the
+sender allowlist, the signature check and the 24-hour window apply exactly as for text.
+
+### Limits, timeouts, clean-up
+
+| | default | env | why |
+|---|---|---|---|
+| file size | **25 MB** | `WHATSAPP_MAX_MEDIA_BYTES` | Meta's documented limits per media message are 5 MB (image), 16 MB (audio, video) and 100 MB (document) — check its page, they change. 25 MB lets every photo and every video WhatsApp itself lets a phone send through with headroom, and only turns away the huge end of the document range. The bytes are held in memory once while they are written, and a 100 MB PDF is slow for the agent to read anyway. Over the limit → a short hint, **no download**; Meta's `file_size` is a claim, so the real bytes are checked too |
+| video length | **120 s** | `WHATSAPP_MAX_VIDEO_SECONDS` | a longer video is still accepted: stills over its whole length, but only the first 120 s of sound are transcribed — and the marker says so. 120 s of 16 kHz WAV is ~3.8 MB, well under `addons/voice`'s `ATLAS_VOICE_MAX_AUDIO_BYTES` (12 MB ≈ 6 min: **do not set this above ~350** or the route answers `413`), and whisper.cpp needs several seconds per minute of audio, inside the voice route's 60 s engine limit |
+| stills per video | **6** | `WHATSAPP_VIDEO_FRAMES` | enough to follow a scene, few enough to read |
+| still size | **1024 px** | `WHATSAPP_VIDEO_FRAME_PX` | longest edge, never upscaled |
+| keep for | **14 days** | `WHATSAPP_MEDIA_KEEP_DAYS` | when a new medium arrives, every `<YYYY-MM-DD>` folder older than this is deleted — no cron. Only folders whose **name is a date** are ever touched; a folder or file of yours in that directory is safe. (A quiet stretch with no new media leaves old folders in place until the next one.) |
+| Meta requests | 30 s each | `WHATSAPP_MEDIA_TIMEOUT_MS` | lookup and download, as for voice notes |
+| ffprobe / ffmpeg | 60 s each | `WHATSAPP_FFMPEG_TIMEOUT_MS` | every single run: the probe, each still, the soundtrack |
+| transcription | 120 s | `WHATSAPP_TRANSCRIBE_TIMEOUT_MS` | as for voice notes |
+
+Nothing of this goes to the vault or the repo. The agent is told to copy a file into the vault only when you ask for it.
+
+### It never goes quiet
+
+Every failure is **one short, specific reply** to the sender, **nothing reaches the agent**, and a half-handled folder is removed:
+
+| what happened | what the sender gets | counter |
+|---|---|---|
+| file over the limit (`file_size` or the bytes) | "Die Datei ist zu groß für mich (mehr als 25 MB) …" | `mediaTooLarge` |
+| Graph lookup / download failed, no media id | "Ich konnte die Datei nicht laden …" | `mediaErrors` |
+| the folder cannot be written | "… nicht auf der Box ablegen …" | `mediaErrors` |
+| **video**, `ffmpeg` or `ffprobe` not installed | "Videos kann ich gerade nicht auswerten (ffmpeg fehlt auf der Box) …" — **pictures and documents keep working** | `mediaErrors` |
+| video unreadable (ffprobe fails, no picture stream, no duration, no still could be cut, the soundtrack could not be cut) | "Das Video konnte ich nicht auslesen …" | `mediaErrors` |
+| video has a soundtrack but transcription is off / broken (`503`/`404`, or another error) | "Die Tonspur des Videos konnte ich nicht auswerten: Spracherkennung ist auf der Box gerade nicht aktiv …" (or "… versuch es gleich noch mal") | `transcribeErrors` |
+
+A silent soundtrack (Whisper heard nothing) is **not** an error: the video goes on without a `Tonspur` line
+(`transcribeEmpty`). A soundtrack that fails to transcribe **is** one — a video whose sound you cannot hear should not be
+answered as if it had none. If you would rather have the stills anyway, that is a small change in `video()`.
+Every failure is logged with its status code and text.
+
+### Status, counters, tools
+
+`GET /api/addons` shows `media`: `ffmpeg` and `ffprobe` (found on `PATH`), `stored` (how many messages' media are
+on disk right now), `dir`, `keepDays`, `maxMediaBytes`, `maxVideoSeconds`, `videoFrames`. New counters:
+`imagesReceived`, `videosReceived`, `documentsReceived`, `framesExtracted`, `mediaTooLarge`, `mediaErrors`
+(`transcribed` / `transcribeEmpty` / `transcribeErrors` also count video soundtracks).
+`bash addons/whatsapp/install.sh --check` reports `ffmpeg` + `ffprobe` (**needed for videos only** — pictures and
+documents work without either), and how much is stored where. Nothing new to install: `ffmpeg` is the same one voice
+replies use, and the transcription needs the same `ATLAS_VOICE_STT_CMD` as voice notes.
+
 ## Voice replies
 
 The way back of the voice notes above: the agent can answer as a **spoken WhatsApp voice note**
@@ -306,6 +400,8 @@ knows text) — until it is closed and the next message spawns a fresh one, it w
 | who may talk to the agent | `WHATSAPP_ALLOWED_FROM` only. Anyone else is dropped **silently** (no reply, so no sign the number is live) and counted. An empty list accepts nobody. |
 | `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `to` must be in the allowlist, so a prompt-injected agent cannot message arbitrary numbers (voice or text alike). |
 
+| files you send | saved `0600` under a folder named by date and message id; a document's file name is reduced to letters, digits and `._-`, so it cannot climb out of that folder; only the allowlisted numbers get this far; the retention sweep deletes date-named folders only |
+
 Add to that: the webhook path is the **only** thing you expose publicly, its body is
 capped at 256 KB, and it answers `200` immediately and works afterwards (Meta retries
 anything slower).
@@ -407,6 +503,7 @@ missing (`inbound`/`outbound` list the unset variables) and the counters:
 | a person gets no answer, `Meta rejected a send` in the log | the number is in `WHATSAPP_ALLOWED_FROM` but not (yet) verified as a recipient in Meta's console — or its own 24-hour window is closed (`sessions[].windowOpen` in `GET /api/addons`) |
 | log: ``reply without `to` while N senders …`` | a session sent without `"to"` and the answer went to the first number — see [Several people](#several-people) |
 | `audioReceived` rising but `transcribed` not | see the voice-note table above: `transcribeErrors` → speech recognition (`addons/voice/install.sh --check`); `mediaErrors` → the log line has Meta's status and text (an expired `WHATSAPP_ACCESS_TOKEN` is the usual one) |
+| `imagesReceived` / `videosReceived` / `documentsReceived` rising but the agent never answers | `mediaErrors` → the log line has the reason (Meta status and text, `ffmpeg`/`ffprobe` missing, a folder that cannot be written); `mediaTooLarge` → over `WHATSAPP_MAX_MEDIA_BYTES`; otherwise the session is an **old one** that does not know the `[Bild empfangen: …]` markers — close it, the next message starts a fresh one ([above](#pictures-videos-and-documents)) |
 | `voiceFallbacks` rising | voice replies are being sent as text: `ttsErrors` → the TTS command (`addons/voice/install.sh --check`); `ffmpegErrors` → `ffmpeg` missing or without `libopus` (`addons/whatsapp/install.sh --check`); `uploadErrors` → Meta refused the upload or the voice note — the log line has its status and text; none of the three → the text was over `WHATSAPP_MAX_VOICE_CHARS` |
 | `forwardErrors` rising | the agent routes refused — the API log has the reason; the sender gets a "can't reach the agent" message |
 | all zero | Meta is not calling: webhook not subscribed to `messages`, wrong callback URL, or Access still blocking |
@@ -424,5 +521,5 @@ outlive the addon. The state file and the agent sessions can be deleted by hand.
 ## Tests
 
 `node --test addons/whatsapp/test/*.test.mjs` (also part of `cd api && npm test`). Meta, the
-transcription and speech routes, the agent routes and ffmpeg are all stubbed; nothing leaves the process,
+transcription and speech routes, the agent routes and ffmpeg/ffprobe are all stubbed; nothing leaves the process,
 no ffmpeg runs and no credential is real. (`install.sh --check` is exercised on a copy in a scratch tree.)

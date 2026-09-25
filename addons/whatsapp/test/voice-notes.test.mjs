@@ -245,19 +245,17 @@ test('an audio message with no media id → hint, no lookup', async () => {
 
 /* --- what did NOT change ------------------------------------------------------ */
 
-test('image / document / sticker / location are still UNSUPPORTED — no media call at all', async () => {
+test('sticker / location are still UNSUPPORTED — no media call at all (image / document / video: media.test.mjs)', async () => {
   const { world: w, inbound } = setup()
   const from = '4915112345678'
   await inbound.process(payload([
-    { id: 'i1', from, type: 'image', image: { id: 'M1' } },
-    { id: 'd1', from, type: 'document', document: { id: 'M1' } },
     { id: 's1', from, type: 'sticker', sticker: { id: 'M1' } },
     { id: 'l1', from, type: 'location', location: { latitude: 1, longitude: 2 } },
   ]))
-  assert.equal(w.sent.length, 4)
+  assert.equal(w.sent.length, 2)
   for (const r of replies(w)) assert.match(r, /noch nicht lesen/)
   assert.equal(w.calls.some((u) => u.includes('M1') || u.includes('lookaside')), false)
-  assert.equal(inbound.counters.unsupported, 4)
+  assert.equal(inbound.counters.unsupported, 2)
   assert.equal(inbound.counters.audioReceived, 0)
 })
 

@@ -29,13 +29,14 @@
 import { config, maskNumber, missing, normalizeNumber, stateFile } from './config.mjs'
 import { readState, senderSessions } from './agent.mjs'
 import { createSttProbe, createTtsProbe } from './audio.mjs'
+import { mediaStatus } from './media.mjs'
 import { createInbound } from './inbound.mjs'
 import { safeEqual, sendText, verifyHandshake, verifySignature } from './meta.mjs'
 import { createVoiceReplies, onPath, run } from './voice-reply.mjs'
 
 export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
   const routes = Router()
-  const inbound = createInbound({ env, fetch: f, log, file })
+  const inbound = createInbound({ env, fetch: f, log, file, exec })
   const stt = createSttProbe({ env, fetch: f })
   const tts = createTtsProbe({ env, fetch: f })
   const voice = createVoiceReplies({ env, fetch: f, log, exec })
@@ -132,7 +133,7 @@ export default function register(ctx) {
   const { routes, inbound, stt, tts, voice } = buildRoutes(ctx)
   return {
     description:
-      'WhatsApp Cloud API ↔ one standing Atlas agent session per sender: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
+      'WhatsApp Cloud API ↔ one standing Atlas agent session per sender: inbound webhook (HMAC-verified) into the agent — text, voice notes transcribed on the box via addons/voice, and pictures / videos / documents saved on the box for the agent to look at — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
     routes,
     status: () => {
       const inMiss = missing('inbound')
@@ -147,6 +148,7 @@ export default function register(ctx) {
         lastInboundAt: readState(stateFile(), c.allowedFrom).lastInboundAt || null, // from anyone
         voiceNotes: voiceNotesStatus(stt),
         voiceReplies: voiceRepliesStatus(tts),
+        media: mediaStatus(),
         counters: { ...inbound.counters, ...voice.counters },
         ...(inbound.counters.rawBodyMissing
           ? { warning: 'webhook bodies arrive already parsed — the Caddy webhook block is missing its Content-Type rewrite (README)' }
