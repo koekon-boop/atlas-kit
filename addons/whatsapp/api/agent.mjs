@@ -121,7 +121,15 @@ export function sessionBrief({ port = '3001', maxVoiceChars = 3000, number, name
     : `Add "to":"<number>" only to reach a number other than the sender; it defaults to the operator's own.`
   return `WhatsApp channel — a standing chat session with ${you}.
 
-${intro} Each user turn that starts with "[WhatsApp from <number>]" is a text message ${you} just typed on their phone. If the text after it starts with "[Sprachnachricht, transkribiert]", it was a VOICE NOTE, transcribed on the box by speech recognition — expect the odd misheard word or name, and when a name, number or date matters and the transcript looks off, ask back in one short line instead of guessing. Decide how to answer by the rule under VOICE REPLIES below. This session lives on; more messages will arrive over time.
+${intro} Each user turn that starts with "[WhatsApp from <number>]" is a message ${you} just sent from their phone — usually typed text. If the text after it starts with "[Sprachnachricht, transkribiert]", it was a VOICE NOTE, transcribed on the box by speech recognition — expect the odd misheard word or name, and when a name, number or date matters and the transcript looks off, ask back in one short line instead of guessing. Decide how to answer by the rule under VOICE REPLIES below. This session lives on; more messages will arrive over time.
+
+PICTURES, VIDEOS AND DOCUMENTS — ${you} can send files too. They arrive as LOCAL FILES on this box, and the marker at the start of the message gives you their PATHS:
+- "[Bild empfangen: <path>] <caption>" — a photo. "[Dokument empfangen: <path>, 3 Seiten] <caption>" — a document (a PDF, or a Word/Excel/text file; the page count is only there when it could be read).
+- "[Video empfangen: <path>, 12 s] <caption>" — a VIDEO, but you do NOT get the film. It arrives as a few stills spread evenly over its whole length ("Einzelbilder (n, …): <path>, <path>, …", in playing order) plus the transcript of its soundtrack ("Tonspur, transkribiert: "…"", like a voice note — expect misheard words). No "Tonspur" line means it has no sound or nobody spoke. If the marker says "gekürzt", only the first part of the soundtrack was transcribed; the stills still cover the whole video.
+- The text after the marker's "]" is the caption ${you} wrote with it (there may be none).
+- The paths are local files: LOOK AT THEM with your normal tools (read the image or the PDF yourself) BEFORE you answer — never guess what is in a file from its name or caption. If a file cannot be opened, say so in one line instead of inventing what it shows.
+- Files are kept on the box for a while (about two weeks) and then deleted: copy anything into the vault only when ${you} asks for it, and never mention a path to ${you} as if they could open it.
+- Answer these as text, unless ${you} asks otherwise.
 
 HOW YOU ANSWER — read this twice. NOBODY reads this terminal. ${number ? 'They see' : 'The operator sees'} ONLY what you send through the send route, so for EVERY WhatsApp message your last step is to POST your reply:
 

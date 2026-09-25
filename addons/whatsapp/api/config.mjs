@@ -77,7 +77,15 @@ export const config = (env = process.env) => ({
   maxSpokenChars: Math.max(50, posInt(env, 'WHATSAPP_MAX_SPOKEN_CHARS', 700)), // per /api/voice/speak call
   maxVoiceChars: posInt(env, 'WHATSAPP_MAX_VOICE_CHARS', 3000), // above this the reply goes out as text
   ttsTimeoutMs: posInt(env, 'WHATSAPP_TTS_TIMEOUT_MS', 30000), // per chunk
-  ffmpegTimeoutMs: posInt(env, 'WHATSAPP_FFMPEG_TIMEOUT_MS', 60000),
+  ffmpegTimeoutMs: posInt(env, 'WHATSAPP_FFMPEG_TIMEOUT_MS', 60000), // also each ffprobe / frame / soundtrack run of an incoming video
+  // Pictures, videos, documents in (README "Pictures, videos and documents"): the cap is checked
+  // against Meta's file_size BEFORE any download.
+  maxMediaBytes: posInt(env, 'WHATSAPP_MAX_MEDIA_BYTES', 25 * 1024 * 1024),
+  maxVideoSeconds: posInt(env, 'WHATSAPP_MAX_VIDEO_SECONDS', 120), // longer videos are accepted, but only this much soundtrack is transcribed
+  videoFrames: posInt(env, 'WHATSAPP_VIDEO_FRAMES', 6), // at most this many stills per video
+  videoFramePx: posInt(env, 'WHATSAPP_VIDEO_FRAME_PX', 1024), // longest edge of a still
+  mediaKeepDays: posInt(env, 'WHATSAPP_MEDIA_KEEP_DAYS', 14),
+  mediaDir: mediaDir(env),
 })
 
 export const GRAPH_BASE = 'https://graph.facebook.com/v21.0'
@@ -87,3 +95,7 @@ export const GRAPH_BASE = 'https://graph.facebook.com/v21.0'
  *  never the vault: it is bookkeeping (a session id per sender), not knowledge. */
 export const stateFile = (env = process.env) =>
   str(env, 'WHATSAPP_STATE_FILE', path.join(str(env, 'AGENT_LOCAL_DIR', path.join(os.homedir(), '.atlas-kit')), 'whatsapp.json'))
+
+/** Where incoming pictures / videos / documents are kept for the agent to look at: a
+ *  `whatsapp-media/` folder next to the state file. Operator-local, never the repo or the vault. */
+export const mediaDir = (env = process.env) => path.join(path.dirname(stateFile(env)), 'whatsapp-media')

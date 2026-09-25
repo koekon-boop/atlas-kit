@@ -7,8 +7,9 @@
 #   (no args) | --check
 #     exit 0 — installed: every env var set, addon enabled, Caddy block present,
 #              speech recognition for voice notes and speech synthesis + ffmpeg (with libopus)
-#              for voice replies configured (addons/voice)
-#              (it also lists each allowed sender's session — informational, never a gap)
+#              for voice replies configured (addons/voice), and ffmpeg + ffprobe for incoming videos
+#              (it also lists each allowed sender's session and what pictures/videos/documents are
+#              stored on the box — informational, never a gap)
 #     exit 2 — installable: something above is still to do (each gap is printed)
 #     exit 1 — cannot: node missing
 #
@@ -121,7 +122,7 @@ fi
 # 5. Voice replies re-encode with ffmpeg: WhatsApp shows a voice note (waveform) only for OGG/Opus, so
 #    it needs the libopus encoder. (Without it every voice: true reply falls back to text.)
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  gap "voice replies need ffmpeg (with libopus) on PATH — apt install ffmpeg; without it voice: true replies go out as text"
+  gap "voice replies need ffmpeg (with libopus) on PATH — apt install ffmpeg; without it voice: true replies go out as text. Incoming videos need it too (plus ffprobe): without them a video gets a 'can't process videos' answer; pictures and documents still work"
 else
   # captured first: 'ffmpeg | grep -q' would trip pipefail when grep exits early
   encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
@@ -130,6 +131,24 @@ else
   else
     gap "ffmpeg has no libopus encoder — voice replies need it for OGG/Opus (install a full ffmpeg build); voice: true replies go out as text meanwhile"
   fi
+  # 5b. Incoming videos: ffprobe (duration, streams) next to ffmpeg (stills, soundtrack). Pictures and documents need neither.
+  if command -v ffprobe >/dev/null 2>&1; then
+    echo "[whatsapp] incoming videos: ffmpeg and ffprobe found (pictures and documents need no tool)"
+  else
+    gap "incoming videos need ffprobe on PATH next to ffmpeg (same apt package) — until then a video gets a 'can't process videos' answer; pictures and documents work"
+  fi
+fi
+
+# 5c. What the incoming pictures / videos / documents left on the box (informational, never a gap):
+#     asks the addon's own code, so it reads the same folder and limits the running API does.
+MEDIA_MJS="$ROOT/addons/whatsapp/api/media.mjs"
+if [ -f "$MEDIA_MJS" ]; then
+  MEDIA_MJS="$MEDIA_MJS" node --input-type=module -e "
+import { pathToFileURL } from 'node:url'
+const { mediaStatus } = await import(pathToFileURL(process.env.MEDIA_MJS).href)
+const m = mediaStatus()
+console.log('[whatsapp] incoming media: ' + m.stored + ' message(s) stored in ' + m.dir + ' (deleted after ' + m.keepDays + ' days, at most ' + Math.round(m.maxMediaBytes / 1048576) + ' MB each; videos: ' + m.videoFrames + ' stills, soundtrack up to ' + m.maxVideoSeconds + ' s)')
+" 2>&1 || echo "[whatsapp] could not read the media status" >&2
 fi
 
 if [ "$gaps" -eq 0 ]; then

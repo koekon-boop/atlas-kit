@@ -227,7 +227,7 @@ test('statuses (delivered/read) are ignored', async () => {
 
 test('non-text messages get one short "can\'t read that" and never reach the agent', async () => {
   const s = await serve()
-  await post(s, payload([{ id: 'img1', from: '4915112345678', type: 'image', image: { id: 'media1' } }]))
+  await post(s, payload([{ id: 'st1', from: '4915112345678', type: 'sticker', sticker: { id: 'media1' } }]))
   await until(() => s.world.sent.length === 1)
   assert.equal(s.world.sent[0].body.to, '4915112345678')
   assert.match(s.world.sent[0].body.text.body, /noch nicht lesen/)

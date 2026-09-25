@@ -121,10 +121,12 @@ export async function synthesize(text, { env = process.env, fetch: f = globalThi
   }
 }
 
-/** Run a binary without a shell → `{ code, stderr, missing? }`. Never rejects. */
-export function run(bin, args, { timeoutMs }) {
+/** Run a binary without a shell → `{ code, stderr, stdout?, missing? }`. Never rejects.
+ *  `stdout` is only captured (and returned) with `captureStdout` — ffprobe's answer. */
+export function run(bin, args, { timeoutMs, captureStdout = false }) {
   return new Promise((resolve) => {
     let stderr = ''
+    let stdout = ''
     let done = false
     const finish = (r) => {
       if (done) return
@@ -134,7 +136,7 @@ export function run(bin, args, { timeoutMs }) {
     }
     let child
     try {
-      child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] })
+      child = spawn(bin, args, { stdio: ['ignore', captureStdout ? 'pipe' : 'ignore', 'pipe'] })
     } catch (e) {
       return resolve({ code: null, stderr: String(e?.message || e), missing: true })
     }
@@ -145,8 +147,11 @@ export function run(bin, args, { timeoutMs }) {
     child.stderr.on('data', (d) => {
       if (stderr.length < 4000) stderr += d
     })
+    child.stdout?.on('data', (d) => {
+      if (stdout.length < 64000) stdout += d
+    })
     child.on('error', (e) => finish({ code: null, stderr: String(e?.message || e), missing: e?.code === 'ENOENT' }))
-    child.on('close', (code) => finish({ code, stderr }))
+    child.on('close', (code) => finish({ code, stderr, ...(captureStdout ? { stdout } : {}) }))
   })
 }
 

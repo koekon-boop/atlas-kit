@@ -519,7 +519,8 @@ test('the brief for NEW sessions explains voice: true, mirroring, what not to sp
 
 /* --- install.sh --check ---------------------------------------------------------- */
 
-/** Run a COPY of install.sh in a scratch tree (no .env, PATH = only what we hand it). */
+/** Run a COPY of install.sh in a scratch tree (no .env, PATH = only what we hand it — plus a stub
+ *  ffprobe, which only the incoming-video check (media.test.mjs) cares about). */
 function check({ env = {}, tools = {} }) {
   const root = path.join(TMP, `root-${crypto.randomUUID()}`)
   const bin = path.join(root, 'bin')
@@ -531,7 +532,7 @@ function check({ env = {}, tools = {} }) {
     fs.symlinkSync(p, path.join(bin, t))
   }
   fs.symlinkSync(process.execPath, path.join(bin, 'node'))
-  for (const [name, body] of Object.entries(tools)) fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+  for (const [name, body] of Object.entries({ ffprobe: 'exit 0', ...tools })) fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
   const r = spawnSync(path.join(bin, 'bash'), [path.join(root, 'addons', 'whatsapp', 'install.sh'), '--check'], {
     encoding: 'utf-8',
     env: { PATH: bin, HOME: root, API_PORT: '1', ...env },

@@ -8,6 +8,8 @@
  *   messages[] type text                                  → forwarded to that sender's own agent session
  *   messages[] type audio (voice note or attached file)   → transcribed on the box, then
  *                                                            forwarded as marked text
+ *   messages[] type image / document / video              → saved on the box, the PATHS forwarded as marked
+ *                                                            text (video: stills + transcribed soundtrack)
  *   messages[] anything else                              → one short "can't read that"
  *
  * Messages are handled ONE AT A TIME through a promise chain: two messages
@@ -17,7 +19,9 @@
 import { config, normalizeNumber, stateFile } from './config.mjs'
 import { forwardToAgent, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
+import { createMedia, MEDIA_TYPES } from './media.mjs'
 import { sendText } from './meta.mjs'
+import { run } from './voice-reply.mjs'
 
 const UNSUPPORTED = 'Das kann ich noch nicht lesen — schreib mir bitte Text. / I can’t read that yet — text only, please.'
 const NO_STT = 'Spracherkennung ist auf der Box gerade nicht aktiv — schreib es mir bitte. / Speech recognition is not active on the box right now — please type it.'
@@ -54,11 +58,12 @@ export function extractMessages(payload) {
   return out
 }
 
-export function createInbound({ env = process.env, fetch: f = globalThis.fetch, log = console.error, file } = {}) {
+export function createInbound({ env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
   const dedupe = new LruSet(1000)
-  const counters = { received: 0, forwarded: 0, duplicates: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, mediaErrors: 0, badSignature: 0, rawBodyMissing: 0, forwardErrors: 0 }
+  const counters = { received: 0, forwarded: 0, duplicates: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, imagesReceived: 0, videosReceived: 0, documentsReceived: 0, framesExtracted: 0, mediaTooLarge: 0, mediaErrors: 0, badSignature: 0, rawBodyMissing: 0, forwardErrors: 0 }
   let chain = Promise.resolve()
   const deps = () => ({ env, fetch: f, file: file ?? stateFile(env) })
+  const media = createMedia({ env, fetch: f, log, exec, counters })
 
   /** Voice note or attached audio file → text for the agent, or a short reply
    *  to the sender saying why not. → the transcript, or null once it has answered. */
@@ -103,6 +108,13 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
       const spoken = await transcribeAudio(m, from)
       if (spoken === null) return
       text = `${VOICE_MARK} ${spoken}`
+    } else if (MEDIA_TYPES.includes(m.type)) {
+      const got = await media.receive(m, m.type)
+      if (!got.ok) {
+        await sendText({ to: from, text: got.reply }, { env, fetch: f, log })
+        return
+      }
+      text = got.text
     } else if (m.type !== 'text' || typeof m.text?.body !== 'string' || !m.text.body.trim()) {
       counters.unsupported++
       await sendText({ to: from, text: UNSUPPORTED }, { env, fetch: f, log })
