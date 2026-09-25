@@ -8,6 +8,7 @@
 #     exit 0 — installed: every env var set, addon enabled, Caddy block present,
 #              speech recognition for voice notes and speech synthesis + ffmpeg (with libopus)
 #              for voice replies configured (addons/voice)
+#              (it also lists each allowed sender's session — informational, never a gap)
 #     exit 2 — installable: something above is still to do (each gap is printed)
 #     exit 1 — cannot: node missing
 #
@@ -48,6 +49,23 @@ else
     || gap "infra/Caddyfile has no 'handle /api/whatsapp/webhook' block with the Content-Type rewrite — copy it from infra/Caddyfile.example (without it every webhook is refused), then scripts/serve.sh restart"
   grep -q 'handle /api/whatsapp/\*' "$CADDY" \
     || gap "infra/Caddyfile has no 'handle /api/whatsapp/*' bearer block — /send would 401 through the proxy"
+fi
+
+# 3b. Who is connected: one standing session per allowed number (numbers masked). Informational,
+#     never a gap — a number with no session just has not written yet. Asks the addon's own code so
+#     it reads the state file exactly as the running API does (including the old single-session shape).
+SESSIONS_MJS="$ROOT/addons/whatsapp/api/agent.mjs"
+if [ -f "$SESSIONS_MJS" ] && [ -n "${WHATSAPP_ALLOWED_FROM:-}" ]; then
+  SESSIONS_MJS="$SESSIONS_MJS" node --input-type=module -e "
+import { pathToFileURL } from 'node:url'
+const { senderSessions } = await import(pathToFileURL(process.env.SESSIONS_MJS).href)
+const { config } = await import(pathToFileURL(process.env.SESSIONS_MJS.replace('agent.mjs', 'config.mjs')).href)
+const c = config()
+const rows = senderSessions({ allowed: c.allowedFrom, names: c.senderNames })
+console.log('[whatsapp] ' + rows.length + ' allowed sender(s), one session each:')
+for (const r of rows) console.log('[whatsapp]   ' + r.number + (r.name ? ' (' + r.name + ')' : '') + ' — ' + r.session + (r.since ? ', since ' + r.since : '') + ', 24 h window ' + (r.windowOpen === null ? 'never opened' : r.windowOpen ? 'open' : 'closed'))
+if (rows.length > 1) console.log('[whatsapp]   (several senders: every reply must carry \"to\" — README \"Several people\"; Meta\'s test number knows at most 5 recipients)')
+" 2>&1 || echo "[whatsapp] could not read the sessions (state file unreadable?)" >&2
 fi
 
 # 4. Voice notes (in) and voice replies (out) need addons/voice with on-box engines: enabled, the

@@ -1,6 +1,6 @@
 /* ------------------------------------------------------------------ *
- * `addons/whatsapp` — a bridge between the WhatsApp Cloud API (Meta) and one
- * standing Atlas knowledge-agent session.
+ * `addons/whatsapp` — a bridge between the WhatsApp Cloud API (Meta) and standing
+ * Atlas knowledge-agent sessions, one per allowed number.
  *
  *   GET  /api/whatsapp/webhook   Meta's verification handshake
  *   POST /api/whatsapp/webhook   inbound messages (HMAC-signed by Meta)
@@ -26,14 +26,12 @@
  * not: Meta cannot hold that token, and its request is authenticated by the
  * HMAC signature instead.
  * ------------------------------------------------------------------ */
-import { config, missing, normalizeNumber, stateFile } from './config.mjs'
-import { readState } from './agent.mjs'
+import { config, maskNumber, missing, normalizeNumber, stateFile } from './config.mjs'
+import { readState, senderSessions } from './agent.mjs'
 import { createSttProbe, createTtsProbe } from './audio.mjs'
 import { createInbound } from './inbound.mjs'
 import { safeEqual, sendText, verifyHandshake, verifySignature } from './meta.mjs'
 import { createVoiceReplies, onPath, run } from './voice-reply.mjs'
-
-const DAY_MS = 24 * 60 * 60 * 1000
 
 export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
   const routes = Router()
@@ -94,6 +92,10 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
     const { to, text, voice: wantVoice } = req.body || {}
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ ok: false, error: 'missing "text"' })
     const target = to == null || to === '' ? c.allowedFrom[0] : normalizeNumber(to)
+    // The default is the FIRST number. With several people that is somebody else's chat
+    // whenever a session forgot its own `to` — the one mistake the brief exists to prevent.
+    if ((to == null || to === '') && c.allowedFrom.length > 1)
+      log(`[whatsapp] reply without \`to\` while ${c.allowedFrom.length} senders are configured — went to the default number (${maskNumber(target)}). A session must send "to":"<its own number>" with every reply.`)
     // A prompt-injected agent must not be able to message arbitrary numbers.
     if (!c.allowedFrom.includes(target)) return res.status(400).json({ ok: false, error: '"to" is not in WHATSAPP_ALLOWED_FROM' })
     if (wantVoice != null && typeof wantVoice !== 'boolean') return res.status(400).json({ ok: false, error: '"voice" must be true or false' })
@@ -130,20 +132,19 @@ export default function register(ctx) {
   const { routes, inbound, stt, tts, voice } = buildRoutes(ctx)
   return {
     description:
-      'WhatsApp Cloud API ↔ one standing Atlas agent session: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
+      'WhatsApp Cloud API ↔ one standing Atlas agent session per sender: inbound webhook (HMAC-verified) into the agent — text, and voice notes transcribed on the box via addons/voice — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
     routes,
     status: () => {
       const inMiss = missing('inbound')
       const outMiss = missing('outbound')
-      const st = readState(stateFile())
-      const last = st.lastInboundAt ? Date.parse(st.lastInboundAt) : NaN
+      const c = config()
       return {
         inbound: inMiss.length ? `NOT READY — set ${inMiss.join(', ')}` : 'ready',
         outbound: outMiss.length ? `NOT READY — set ${outMiss.join(', ')}` : 'ready',
-        allowedSenders: config().allowedFrom.length,
-        session: st.sessionId || 'none yet (created on the first message)',
-        lastInboundAt: st.lastInboundAt || null,
-        windowOpen: Number.isFinite(last) ? Date.now() - last < DAY_MS : null,
+        allowedSenders: c.allowedFrom.length,
+        // One row per allowed number: Meta's 24 h window is per user, and so is the session.
+        sessions: senderSessions({ allowed: c.allowedFrom, names: c.senderNames, file: stateFile() }),
+        lastInboundAt: readState(stateFile(), c.allowedFrom).lastInboundAt || null, // from anyone
         voiceNotes: voiceNotesStatus(stt),
         voiceReplies: voiceRepliesStatus(tts),
         counters: { ...inbound.counters, ...voice.counters },

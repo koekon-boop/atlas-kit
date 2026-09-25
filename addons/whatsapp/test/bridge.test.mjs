@@ -242,7 +242,7 @@ test('first message spawns, the id is remembered in the state file, the next reu
   const s = await serve({ world: w })
   await post(s, payload([text('a1', 'erste')]))
   await until(() => s.inbound.counters.forwarded === 1)
-  assert.equal(JSON.parse(fs.readFileSync(s.file, 'utf-8')).sessionId, 'kb-atlas-1')
+  assert.equal(JSON.parse(fs.readFileSync(s.file, 'utf-8')).senders['4915112345678'].sessionId, 'kb-atlas-1')
   w.sessions = [{ id: 'kb-atlas-1', kind: 'knowledge', vault: 'atlas', status: 'idle' }]
   await post(s, payload([text('a2', 'zweite')]))
   await until(() => s.inbound.counters.forwarded === 2)
@@ -279,7 +279,7 @@ test('a session that is gone or finished is replaced by a fresh spawn', async ()
     await post(s, payload([text('g1', 'hi')]))
     await until(() => s.inbound.counters.forwarded === 1)
     assert.equal(w.spawned, 1)
-    assert.equal(JSON.parse(fs.readFileSync(s.file, 'utf-8')).sessionId, 'kb-atlas-1')
+    assert.equal(JSON.parse(fs.readFileSync(s.file, 'utf-8')).senders['4915112345678'].sessionId, 'kb-atlas-1')
   }
 })
 
@@ -396,8 +396,8 @@ test('with NO env set the addon loads cleanly and status() reports it honestly',
     assert.match(st.inbound, /NOT READY — set .*WHATSAPP_VERIFY_TOKEN.*WHATSAPP_APP_SECRET/)
     assert.match(st.outbound, /NOT READY — set .*WHATSAPP_ACCESS_TOKEN.*WHATSAPP_PHONE_NUMBER_ID/)
     assert.equal(st.allowedSenders, 0)
-    assert.equal(st.windowOpen, null)
-    assert.match(st.session, /none yet/)
+    assert.deepEqual(st.sessions, [])
+    assert.equal(st.lastInboundAt, null)
     assert.equal(JSON.stringify(st).includes('secret'), false)
   } finally {
     globalThis.fetch = realFetch
@@ -411,18 +411,19 @@ test('status() with everything set says ready, tracks the 24 h window, and leaks
   globalThis.fetch = async () => { throw new Error('offline') }
   const keep = { ...process.env }
   Object.assign(process.env, ENV, { WHATSAPP_STATE_FILE: path.join(TMP, 'ready.json') })
+  // the OLD single-session shape: status() reads it as the first allowed number's
   fs.writeFileSync(process.env.WHATSAPP_STATE_FILE, JSON.stringify({ sessionId: 'kb-atlas-3', lastInboundAt: new Date().toISOString() }))
   try {
     const st = registerAddon(ctx).status()
     assert.equal(st.inbound, 'ready')
     assert.equal(st.outbound, 'ready')
     assert.equal(st.allowedSenders, 2)
-    assert.equal(st.session, 'kb-atlas-3')
-    assert.equal(st.windowOpen, true)
+    assert.equal(st.sessions[0].session, 'kb-atlas-3')
+    assert.equal(st.sessions[0].windowOpen, true)
     const dump = JSON.stringify(st)
     for (const v of [ENV.WHATSAPP_APP_SECRET, ENV.WHATSAPP_ACCESS_TOKEN, ENV.DASHBOARD_BEARER_TOKEN, ENV.WHATSAPP_VERIFY_TOKEN]) assert.equal(dump.includes(v), false)
     fs.writeFileSync(process.env.WHATSAPP_STATE_FILE, JSON.stringify({ lastInboundAt: new Date(Date.now() - 25 * 3600e3).toISOString() }))
-    assert.equal(registerAddon(ctx).status().windowOpen, false)
+    assert.equal(registerAddon(ctx).status().sessions[0].windowOpen, false)
   } finally {
     globalThis.fetch = realFetch
     for (const k of Object.keys(process.env)) if (!(k in keep)) delete process.env[k]

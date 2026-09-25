@@ -5,7 +5,7 @@
  *   statuses[]            (sent/delivered/read receipts)  → ignored
  *   messages[] seen id    (Meta delivers the same event repeatedly) → dropped
  *   messages[] not allowed sender                         → dropped, counted
- *   messages[] type text                                  → forwarded to the agent
+ *   messages[] type text                                  → forwarded to that sender's own agent session
  *   messages[] type audio (voice note or attached file)   → transcribed on the box, then
  *                                                            forwarded as marked text
  *   messages[] anything else                              → one short "can't read that"
@@ -15,7 +15,7 @@
  * Nothing here throws into the request — the caller has already answered.
  * ------------------------------------------------------------------ */
 import { config, normalizeNumber, stateFile } from './config.mjs'
-import { forwardToAgent, readState, saveState } from './agent.mjs'
+import { forwardToAgent, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
 import { sendText } from './meta.mjs'
 
@@ -97,8 +97,7 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
       return
     }
     counters.received++
-    const st = readState(deps().file)
-    saveState({ ...st, lastInboundAt: new Date().toISOString() }, deps().file) // opens the 24 h window
+    markInbound(from, { file: deps().file, allowed: config(env).allowedFrom }) // opens THIS sender's 24 h window
     let text
     if (m.type === 'audio') {
       const spoken = await transcribeAudio(m, from)
