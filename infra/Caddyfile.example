@@ -123,6 +123,15 @@
 		}
 	}
 
+	# telegram: inbound is a long-polling getUpdates consumer (the box has no
+	# public webhook target for Telegram to push to), so there is no webhook
+	# path to expose here at all — only the normal bearer-gated send route.
+	handle /api/telegram/* {
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+		}
+	}
+
 	# --- Read routes (open; Cloudflare Access gates them at the edge) ---
 	handle /api/* {
 		reverse_proxy localhost:3001
