@@ -11,7 +11,9 @@
  *   · a getUpdates failure is a result, not a throw, and does not move the offset;
  *   · createPoller claims the lock once, loses to an already-held one, and backs
  *     off (doubling, capped) between failed polls — driven deterministically via
- *     `_maxIterations` and a fake `sleep`, never a real timer or a hanging fetch.
+ *     `_maxIterations` and a fake `sleep`, never a real timer or a hanging fetch;
+ *   · onTick runs after every iteration (hit or miss) and a throw from it never
+ *     stops the loop — the periodic hook register.mjs wires to a chat route's retry.
  * Run: node --test addons/telegram/test/poller.test.mjs
  * ------------------------------------------------------------------ */
 import { test, after } from 'node:test'
@@ -216,6 +218,29 @@ test('createPoller: a successful poll resets the backoff to the base on the next
   const p = createPoller({ env: ENV, fetch: f, log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, sleep: (ms) => (sleeps.push(ms), Promise.resolve()), _maxIterations: 3 })
   await p.ready
   assert.deepEqual(sleeps, [1000, 1000], 'the ok poll (#2) reset backoff to base before failure #3')
+})
+
+test('createPoller: onTick runs after EVERY pollOnce (hit or miss), and a throwing one is caught, logged, and never stops the loop', async () => {
+  const lockFile = lock()
+  const offsetFile = off()
+  let ticks = 0
+  const logs = []
+  const p = createPoller({
+    env: ENV, fetch: async () => ({ ok: true, json: async () => ({ ok: true, result: [] }) }), log: (m) => logs.push(m),
+    offsetFile, lockFile, onUpdate: async () => {}, onTick: () => { ticks++; throw new Error('route flush boom') }, _maxIterations: 3,
+  })
+  await p.ready
+  assert.equal(ticks, 3, 'once per iteration, including the ones with nothing to update')
+  assert.equal(p.status().pollCount, 3, 'the throw never stopped the poll loop')
+  assert.match(logs.join('\n'), /route flush boom/)
+})
+
+test('createPoller: without onTick, nothing is called — it is fully optional', async () => {
+  const lockFile = lock()
+  const offsetFile = off()
+  const p = createPoller({ env: ENV, fetch: async () => ({ ok: true, json: async () => ({ ok: true, result: [] }) }), log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, _maxIterations: 2 })
+  await assert.doesNotReject(p.ready)
+  assert.equal(p.status().pollCount, 2)
 })
 
 test('createPoller: TELEGRAM_BOT_TOKEN missing means register.mjs never starts one — covered by register.test via buildRoutes; here just confirm createPoller itself does not care (it is register()\'s job to gate on the token)', async () => {

@@ -383,7 +383,10 @@ const EXTENDED_CONTEXT = !/^(0|false|no|off)$/i.test(process.env.AGENT_EXTENDED_
 const CTX = EXTENDED_CONTEXT ? '[1m]' : ''
 const AGENT_MODELS = {
   fable: `claude-fable-5${CTX}`,
-  opus: `claude-opus-5${CTX}`,
+  // Opus 5.5 since 2026-09-30 (operator's request). Both `claude-opus-5-5` and
+  // the `[1m]` variant were checked against the installed CLI (2.1.286) before
+  // the switch — the long-context suffix works here, unlike for Haiku below.
+  opus: `claude-opus-5-5${CTX}`,
   sonnet: `claude-sonnet-5${CTX}`,
   // No ${CTX}: the CLI rejects the long-context beta header for Haiku under
   // subscription auth ("This authentication style is incompatible with the

@@ -20,10 +20,15 @@
  *
  * 🔴 THE SEND ROUTE GATES ITSELF, like every addon write (docs/ADDONS.md), with
  * the constant-time DASHBOARD_BEARER_TOKEN check core uses.
+ *
+ * TELEGRAM_CHAT_ROUTES (optional, see config.mjs + README "Routing per chat") pins
+ * one or more chat ids to an EXISTING dashboard session instead of the standing
+ * one above — every routed chat id is folded into the allowlist automatically, for
+ * both inbound (config.mjs' allowedChatIds) and this very send route.
  * ------------------------------------------------------------------ */
 import crypto from 'node:crypto'
 import { config, maskChatId, missing, offsetFile, stateFile } from './config.mjs'
-import { sessionInfo } from './agent.mjs'
+import { routeInfo, sessionInfo } from './agent.mjs'
 import { createSttProbe, createTtsProbe } from './audio.mjs'
 import { mediaStatus } from './media.mjs'
 import { createInbound } from './inbound.mjs'
@@ -47,7 +52,7 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
   const stt = createSttProbe({ env, fetch: f })
   const tts = createTtsProbe({ env, fetch: f })
   const voice = createVoiceReplies({ env, fetch: f, log, exec })
-  const poller = startPoller && config(env).botToken ? createPoller({ env, fetch: f, log, onUpdate: (u) => inbound.handleOne(u) }) : null
+  const poller = startPoller && config(env).botToken ? createPoller({ env, fetch: f, log, onUpdate: (u) => inbound.handleOne(u), onTick: () => inbound.flushRoutes() }) : null
 
   function bearerAuth(req, res, next) {
     const token = config(env).bearer
@@ -101,7 +106,7 @@ export default function register(ctx) {
   const { routes, inbound, stt, tts, voice, poller } = buildRoutes(ctx)
   return {
     description:
-      'Telegram Bot API ↔ ONE standing Atlas agent session: a long-polling getUpdates consumer (singleton-guarded, this box has no public webhook target) into the agent — text, voice notes transcribed on the box via addons/voice, and pictures / videos / documents saved on the box for the agent to look at — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
+      'Telegram Bot API ↔ ONE standing Atlas agent session (or, per TELEGRAM_CHAT_ROUTES, a specific chat routed into an existing dashboard session instead): a long-polling getUpdates consumer (singleton-guarded, this box has no public webhook target) into the agent — text, voice notes transcribed on the box via addons/voice, and pictures / videos / documents saved on the box for the agent to look at — and a bearer-gated send route the agent answers through, as text or as a read-aloud voice note.',
     routes,
     status: () => {
       const inMiss = missing('inbound')
@@ -113,6 +118,7 @@ export default function register(ctx) {
         homeChat: c.homeChatId ? maskChatId(c.homeChatId) : null,
         allowedChats: c.allowedChatIds.length,
         session: sessionInfo({ file: stateFile() }),
+        chatRoutes: routeInfo({ routes: c.chatRoutes, file: stateFile() }),
         poller: poller ? poller.status() : { owner: false, reason: !c.botToken ? 'TELEGRAM_BOT_TOKEN is not set' : 'not started in this process' },
         offset: readOffset(offsetFile()),
         voiceNotes: voiceNotesStatus(stt),

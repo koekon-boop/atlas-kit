@@ -10,13 +10,17 @@
  *   anything else                         → one short "can't read that"
  *   an unallowed chat_id                  → dropped, silently, counted
  *
+ * A chat id in TELEGRAM_CHAT_ROUTES (config.mjs' chatRoutes) is dispatched to
+ * `forwardToRoute` instead of `forwardToAgent` at the very last step — everything
+ * above it (allowlist, voice, media) is identical for a routed chat.
+ *
  * Updates are handled ONE AT A TIME (poller.mjs already awaits onUpdate per
  * update, in order — there is no separate queue here, unlike the webhook-driven
  * addons/whatsapp, because getUpdates itself delivers one batch at a time and
  * the poller does not fetch the next batch until this one is done).
  * ------------------------------------------------------------------ */
 import { config } from './config.mjs'
-import { forwardToAgent, markInbound } from './agent.mjs'
+import { flushAllRoutes, forwardToAgent, forwardToRoute, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
 import { createMedia, MEDIA_TYPES } from './media.mjs'
 import { sendChatAction, sendMessage } from './telegram.mjs'
@@ -29,6 +33,7 @@ const TOO_BIG = 'Die Sprachnachricht ist zu lang für mich — schick sie kürze
 const MEDIA_FAIL = 'Ich konnte die Sprachnachricht nicht laden — versuch es gleich noch mal oder schreib es mir. / I couldn’t fetch that voice note — please try again or type it.'
 const STT_FAIL = 'Die Sprachnachricht konnte ich nicht auswerten — versuch es gleich noch mal oder schreib es mir. / I couldn’t process that voice note — please try again or type it.'
 const AGENT_DOWN = 'Ich erreiche den Agenten gerade nicht — versuch es gleich noch mal. / I can’t reach the agent right now — please try again shortly.'
+const BASE_UNREACHABLE = 'Die Basis ist gerade nicht erreichbar — deine Nachricht ist gespeichert und wird zugestellt, sobald sie wieder läuft. / The base is not reachable right now — your message is stored and will be delivered once it is back.'
 
 /** What the agent reads in front of a transcribed voice note. */
 export const VOICE_MARK = '[Sprachnachricht, transkribiert]'
@@ -103,15 +108,24 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
       await sendMessage({ chatId, text: UNSUPPORTED }, { env, fetch: f, log })
       return
     } else text = m.text
-    const r = await forwardToAgent({ chatId, text }, { env, fetch: f, file })
+    const route = config(env).chatRoutes[chatId]
+    const r = route ? await forwardToRoute({ chatId, text }, route, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
     if (r.ok) {
       counters.forwarded++
       return
     }
     counters.forwardErrors++
-    log(`[telegram] could not hand the message to the agent: ${r.error}`)
-    await sendMessage({ chatId, text: AGENT_DOWN }, { env, fetch: f, log })
+    log(`[telegram] could not hand the message to the ${route ? 'routed session' : 'agent'}: ${r.error}`)
+    await sendMessage({ chatId, text: route ? BASE_UNREACHABLE : AGENT_DOWN }, { env, fetch: f, log })
   }
 
-  return { counters, handleOne }
+  /** The poller-tick hook (register.mjs wires this into poller.mjs's onTick):
+   *  retry every configured route's pending backlog, so a stored message still
+   *  gets through even when the sender never writes again. */
+  async function flushRoutes() {
+    const routes = config(env).chatRoutes
+    if (Object.keys(routes).length) await flushAllRoutes(routes, { env, fetch: f, file })
+  }
+
+  return { counters, handleOne, flushRoutes }
 }

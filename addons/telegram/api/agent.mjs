@@ -13,10 +13,27 @@
  * transcript. The session is told, in `sessionBrief()`, to answer by POSTing to
  * `/api/telegram/send`. That instruction is the heart of the bridge: a session
  * that answers in the terminal is a message nobody ever sees.
+ *
+ * ROUTING PER CHAT (TELEGRAM_CHAT_ROUTES, see config.mjs and the README): a chat
+ * id can instead be pinned to an EXISTING dashboard session that is not this
+ * bridge's own — e.g. Jessi's chat always feeding her `kb-shop-setup` knowledge
+ * session, as if Telegram were just another channel into that one base. This
+ * addon never spawns a session for a route and never redirects one elsewhere:
+ *   target idle/running  → /prompt or /queue, exactly like the standing session
+ *   target dormant       → POST /api/agents/revive, then deliver
+ *   target closed/unknown → there is NO core route that recreates a purged session
+ *                           id resumed from a Claude session uuid (checked — see
+ *                           the README), so the message is STORED (state.routes.
+ *                           <chat id>.pending) and the sender is told plainly;
+ *                           it is retried — in order, nothing skipped — on the
+ *                           next message from that chat AND on every poller tick
+ *                           (register.mjs wires inbound.flushRoutes() into
+ *                           poller.mjs's onTick), so it reaches the base even if
+ *                           the sender never writes again.
  * ------------------------------------------------------------------ */
 import fs from 'node:fs'
 import path from 'node:path'
-import { config, stateFile } from './config.mjs'
+import { config, maskChatId, stateFile } from './config.mjs'
 
 /** The state, in memory only. Never throws: an absent or unreadable file is the first-run state. */
 export function readState(file = stateFile()) {
@@ -56,6 +73,35 @@ export function sessionInfo({ file = stateFile() } = {}) {
     since: st.createdAt || null,
     lastInboundAt: st.lastInboundAt || null,
   }
+}
+
+/** One route's bookkeeping — never the session id (that is config, from
+ *  TELEGRAM_CHAT_ROUTES, not state): how many messages made it through, when the
+ *  last one did, and what is still waiting because the target was unreachable. */
+function routeState(state, chatId) {
+  return (state.routes && state.routes[chatId]) || { forwarded: 0, lastDeliveredAt: null, pending: [] }
+}
+
+/** `state` with one route's bookkeeping replaced — pure, so the caller decides when to persist. */
+function withRoute(state, chatId, patch) {
+  return { ...state, routes: { ...(state.routes || {}), [chatId]: { ...routeState(state, chatId), ...patch } } }
+}
+
+/** What status() shows per configured route: masked chat id, its target session,
+ *  how many messages got through, the last delivery, and how many are still queued. */
+export function routeInfo({ routes, file = stateFile() } = {}) {
+  const state = readState(file)
+  return Object.entries(routes).map(([chatId, route]) => {
+    const rs = routeState(state, chatId)
+    return {
+      chat: maskChatId(chatId),
+      session: route.sessionId,
+      ...(route.claudeSessionId ? { claudeSession: route.claudeSessionId } : {}),
+      forwarded: rs.forwarded,
+      lastDeliveredAt: rs.lastDeliveredAt,
+      pending: rs.pending.length,
+    }
+  })
 }
 
 /** What the session is told when it is created (the same rule rides along, in
@@ -107,6 +153,13 @@ If a message needs no answer ("ok", "thanks"), a very short acknowledgement is e
 /** One line per forwarded message: who wrote, what, and the reply rule again — a
  *  long chat compacts the brief away; this line stays. */
 export const framed = (chatId, text) => `[Telegram from ${chatId}] ${text}\n\n(Reply with a POST to /api/telegram/send — the terminal is not read.)`
+
+/** The equivalent line for a ROUTED chat (see "Routing per chat" below): the target
+ *  session is somebody else's existing chat (e.g. a shop-setup knowledge session),
+ *  not a Telegram-native session, so it does not already know the reply contract —
+ *  this is appended to EVERY message that comes through a route, not just the first. */
+export const framedForRoute = (chatId, text, port = '3001') =>
+  `[Telegram from ${chatId}] ${text}\n\n(Antwort an diese Person NUR per POST http://127.0.0.1:${port}/api/telegram/send mit {"chat_id":"${chatId}","text":"…"} und Bearer $DASHBOARD_BEARER_TOKEN — das Terminal liest sie nicht. Der Bearer-Token steht in /workspace/.env. Sprachnachricht raus → "voice":true. Kurz, Klartext.)`
 
 async function core(method, route, body, { env, fetch: f }) {
   const c = config(env)
@@ -162,5 +215,108 @@ export async function forwardToAgent({ chatId, text }, deps = {}) {
     return { ok: false, error: `queue → ${q.status} ${q.body?.error || ''}`.trim() }
   } catch (e) {
     return { ok: false, error: String(e?.message || e) }
+  }
+}
+
+/**
+ * One already-framed message → a ROUTE's target session. Never spawns, never
+ * redirects elsewhere:
+ *   not in GET /api/agents, or status 'done'/'error' → `{ ok: false }`, "closed or unknown"
+ *   status 'dormant'                                 → POST /api/agents/revive, then /prompt
+ *   otherwise                                         → /prompt (idle) or /queue (running),
+ *                                                        exactly the standing session's rule
+ * → `{ ok: true, via }` | `{ ok: false, error }`. Never throws (the caller catches).
+ */
+async function tryDeliverOne(sessionId, message, d) {
+  const list = await core('GET', '/api/agents', null, d)
+  if (!list.ok) return { ok: false, error: `GET /api/agents → ${list.status}` }
+  const live = (list.body.sessions || []).find((s) => s.id === sessionId) || null
+  if (!live) return { ok: false, error: 'the target session is closed or unknown' }
+  if (live.status === 'done' || live.status === 'error') return { ok: false, error: `the target session is ${live.status}` }
+  let status = live.status
+  if (status === 'dormant') {
+    const r = await core('POST', '/api/agents/revive', { id: sessionId }, d)
+    if (!r.ok) return { ok: false, error: `revive → ${r.status} ${r.body?.error || ''}`.trim() }
+    status = 'idle' // just launched — take a /prompt like a fresh turn, not a /queue
+  }
+  if (status !== 'running') {
+    const p = await core('POST', '/api/agents/prompt', message, d)
+    if (p.ok) return { ok: true, via: 'prompt' }
+    // e.g. 409 while a choice menu is open, or the resume menu not settled yet — queueing still gets it there.
+  }
+  const q = await core('POST', '/api/agents/queue', message, d)
+  if (q.ok) return { ok: true, via: 'queue' }
+  return { ok: false, error: `queue → ${q.status} ${q.body?.error || ''}`.trim() }
+}
+
+/**
+ * Deliver everything a route has waiting — its PENDING backlog, oldest first, in
+ * order, nothing skipped — and stop at the first failure (the remainder stays
+ * queued for the next try, never reordered, never dropped). Called both right
+ * after a new message is queued (forwardToRoute) and, with nothing new to add,
+ * from the poller tick (flushAllRoutes) so a stored message still gets through
+ * even if the sender never writes again.
+ * → `{ delivered, remaining }`. Never throws.
+ */
+async function flushPending(chatId, route, d) {
+  const file = d.file ?? stateFile(d.env)
+  const state = readState(file)
+  const rs = routeState(state, chatId)
+  let delivered = 0
+  if (rs.pending.length) {
+    const port = config(d.env).apiPort
+    for (const item of rs.pending) {
+      const message = { id: route.sessionId, text: framedForRoute(chatId, item.text, port) }
+      const r = await tryDeliverOne(route.sessionId, message, d)
+      if (!r.ok) break
+      delivered++
+    }
+  }
+  const pending = rs.pending.slice(delivered)
+  const patch = { forwarded: rs.forwarded + delivered, pending }
+  if (delivered) patch.lastDeliveredAt = new Date().toISOString()
+  saveState(withRoute(state, chatId, patch), file)
+  return { delivered, remaining: pending.length }
+}
+
+/**
+ * Hand one message to a ROUTE's target — not the standing session. The message is
+ * appended to the route's pending backlog first (so nothing is ever lost between
+ * "queued" and "delivered"), then `flushPending` tries to clear the whole backlog
+ * in order; if the target is unreachable the message simply stays queued.
+ * → `{ ok: true }` when the backlog is now empty, else `{ ok: false, error, queued }`
+ * (the caller tells the sender their message is stored, not lost). Never throws.
+ */
+export async function forwardToRoute({ chatId, text }, route, deps = {}) {
+  const d = { env: process.env, fetch: globalThis.fetch, file: undefined, ...deps }
+  if (!config(d.env).bearer) return { ok: false, error: 'DASHBOARD_BEARER_TOKEN is not set — cannot call the agent routes' }
+  const file = d.file ?? stateFile(d.env)
+  try {
+    const state = readState(file)
+    const rs = routeState(state, chatId)
+    saveState(withRoute(state, chatId, { pending: [...rs.pending, { text, at: new Date().toISOString() }] }), file)
+    const { remaining } = await flushPending(chatId, route, { ...d, file })
+    if (remaining === 0) return { ok: true }
+    return { ok: false, error: 'the target session is not reachable right now — message stored, will deliver once it is', queued: remaining }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) }
+  }
+}
+
+/**
+ * The poller-tick retry: for every CONFIGURED route (not just ones that just wrote),
+ * try to clear whatever is still pending. A route with nothing queued costs no
+ * network call. One route's failure never stops the others. Never throws.
+ */
+export async function flushAllRoutes(routes, deps = {}) {
+  const d = { env: process.env, fetch: globalThis.fetch, file: undefined, ...deps }
+  const file = d.file ?? stateFile(d.env)
+  for (const [chatId, route] of Object.entries(routes)) {
+    if (!routeState(readState(file), chatId).pending.length) continue
+    try {
+      await flushPending(chatId, route, { ...d, file })
+    } catch (e) {
+      console.error(`[telegram] flushing the route for ${maskChatId(chatId)} failed: ${e?.message || e}`)
+    }
   }
 }

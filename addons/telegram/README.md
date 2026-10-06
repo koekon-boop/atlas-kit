@@ -4,7 +4,9 @@ Chat with the Atlas agent from **Telegram**: you write on your phone, ONE standi
 Atlas knowledge session on the `atlas` vault reads it, and answers in the same chat.
 Unlike [`addons/whatsapp`](../whatsapp/README.md) (one session per sender), this is
 the operator's single standing chat — the pattern it mirrors, minus the
-per-sender bookkeeping, because there is only one conversation. You can send it
+per-sender bookkeeping, because there is only one conversation — EXCEPT for a chat
+id named in `TELEGRAM_CHAT_ROUTES`, which is pinned to an existing dashboard session
+of its own instead ([Routing per chat](#routing-per-chat-optional)). You can send it
 **text, voice notes, pictures, videos and documents**
 ([Voice notes](#voice-notes), [Pictures, videos and documents](#pictures-videos-and-documents)).
 
@@ -99,11 +101,15 @@ update that was in flight, never the whole batch.
   the agent gets a handful of stills and the transcript of its soundtrack — see
   below. Replies are text, or — with `voice: true` — a read-aloud voice note
   ([Voice replies](#voice-replies)); never images or files.
-- **One shared conversation.** Every chat id in `TELEGRAM_ALLOWED_CHAT_IDS` (plus the
-  home chat) can write to the SAME standing session — unlike `addons/whatsapp`,
+- **One shared conversation, unless routed.** Every chat id in `TELEGRAM_ALLOWED_CHAT_IDS`
+  (plus the home chat) can write to the SAME standing session — unlike `addons/whatsapp`,
   which gives each sender their own. Put a second chat id in only for someone you
   would let read and steer the same conversation as the operator; there is no
-  separation between them the way WhatsApp's per-sender sessions provide.
+  separation between them the way WhatsApp's per-sender sessions provide. A chat id
+  in `TELEGRAM_CHAT_ROUTES` is the one exception — see
+  [Routing per chat](#routing-per-chat-optional) — but it is pinned to a specific
+  EXISTING session someone else already owns, not a fresh one-per-sender session
+  the way WhatsApp spawns.
 - A session **remembers across messages** until it is closed or its tmux dies; then
   the next message creates a fresh one (the old context is not carried over).
 - **At most one getUpdates consumer on this box** — see [above](#long-polling-not-a-webhook).
@@ -400,12 +406,79 @@ own chat id (`[Telegram from <id>]`); the session brief tells the agent that a
 reply defaults to the home chat and only needs `"chat_id"` in the body to answer
 someone else.
 
+## Routing per chat (optional)
+
+`TELEGRAM_CHAT_ROUTES` pins ONE chat id to an EXISTING dashboard session instead
+of the standing session above — as if Telegram were just another channel into a
+chat that already exists for another reason. The case this was built for: Jessi
+writes to the SAME bot Ko does, but her messages must land in her own `kb-shop-setup`
+knowledge session (her shop-setup base), not in Ko's Telegram chat.
+
+```bash
+TELEGRAM_CHAT_ROUTES=6076694713=kb-shop-setup
+# several routes: TELEGRAM_CHAT_ROUTES=111=kb-one,222=kb-two:5a306058-da69-4177-8e61-cef1cd9ec0e8
+```
+
+Format: `<chat id>=<session id>[:<claude session uuid>]`, comma-separated for more
+than one. The optional `:<uuid>` is a **human-readable note only** — a pointer to
+the Claude session the target id was last resumed from, for whoever reads the env
+later. This addon never acts on it: there is no core route that lets an addon
+recreate a closed session under a chosen id from a bare Claude session uuid (checked
+against `api/src/agent-local.mjs`/`agent-routes.mjs` while building this — `resumeId()`
+and `revive()` both require the dashboard registry entry to already exist;
+`POST /api/agents/spawn` always starts a brand-new Claude session, with no
+`resume`/`sessionId` body field). Every chat id named here is automatically
+allowed to write, on top of whatever `TELEGRAM_ALLOWED_CHAT_IDS`/the home chat
+already says — Jessi does not also need to be added there.
+
+**What happens to a routed message** — text, a transcribed voice note, or a
+picture/video/document path, exactly the markers described above:
+
+| the target session is… | what happens |
+|---|---|
+| idle | `POST /api/agents/prompt` — same rule as the standing session |
+| running | `POST /api/agents/queue`, delivered at its next boundary |
+| **dormant** (parked by a tmux death) | `POST /api/agents/revive` first, then delivered |
+| **closed, or gone from `GET /api/agents` entirely** | **never recreated, never redirected anywhere else.** The message is stored (in the state file, per chat id) and the sender gets one plain reply saying so. It is retried, in order, nothing skipped, on the next message from that chat **and** on every long-poll tick (`poller.mjs`'s `onTick`, wired in `register.mjs`) — so it still reaches the base even if the sender never writes again |
+| a `/prompt`/`/revive`/`/queue` call fails for any other reason | same as above — stored, never dropped |
+
+This is deliberately conservative: a routed chat's base is meant to be a **durable**
+thing (Jessi's shop-setup chat, not a throwaway), so a route is never silently
+pointed at a freshly spawned replacement — that would be a different conversation
+with no memory of the old one, under the same name. If the target needs to come
+back after being fully closed, that is an operator action (resume it by hand from
+its Claude session id, the way the dashboard's own "Resume" / `claude --resume`
+path does), not something this addon can do through its own routes.
+
+**Recommendation, not yet built:** core has no way to PROTECT a routed target
+session from being closed/cleaned up by an operator action elsewhere (checked —
+no pin/lock/keepAlive concept exists on a session anywhere in `agent-local.mjs`/
+`agent-routes.mjs`/the dashboard card). Until one exists, closing a routed
+session's dashboard chat by hand puts it into the "closed" row above — stored,
+never lost, but not flowing again until it is manually resumed and the route
+still points at the same id.
+
+**Every message through a route carries its own footer** (unlike the standing
+session's one-time brief) — the target was not created by this addon and does
+not already know the reply contract:
+
+```
+(Antwort an diese Person NUR per POST http://127.0.0.1:3001/api/telegram/send mit
+{"chat_id":"6076694713","text":"…"} und Bearer $DASHBOARD_BEARER_TOKEN — das
+Terminal liest sie nicht. Der Bearer-Token steht in /workspace/.env. Sprachnachricht
+raus → "voice":true. Kurz, Klartext.)
+```
+
+`GET /api/addons` shows `telegram.status.chatRoutes`: one row per configured route
+— the masked chat id, its target session id, how many messages made it through,
+the last delivery time, and how many are still waiting.
+
 ## Security model
 
 | what | how it is protected |
 |---|---|
-| who may talk to the agent | `TELEGRAM_ALLOWED_CHAT_IDS` (or, when unset, just the home chat). Anyone else is dropped **silently** (no reply, so no sign the bridge exists) and counted (`dropped`). Telegram bots are publicly discoverable by username — without an allowlist, anyone who found the bot could inject prompts into a session with full vault access; this is the trust boundary that prevents that. |
-| `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `chat_id` must be in the allowlist, so a prompt-injected agent cannot message arbitrary chats (voice or text alike). |
+| who may talk to the agent | `TELEGRAM_ALLOWED_CHAT_IDS` (or, when unset, just the home chat) **plus every chat id named in `TELEGRAM_CHAT_ROUTES`**, folded in automatically. Anyone else is dropped **silently** (no reply, so no sign the bridge exists) and counted (`dropped`). Telegram bots are publicly discoverable by username — without an allowlist, anyone who found the bot could inject prompts into a session with full vault access; this is the trust boundary that prevents that. |
+| `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `chat_id` must be in the allowlist (routed chat ids included), so a prompt-injected agent cannot message arbitrary chats (voice or text alike). |
 | the bot token | lives in every Bot API URL (Telegram's design, not a header) — every function that builds one is careful never to pass that URL to a log line. |
 | getUpdates | only ONE process on this box holds the poll — see [Long-polling, not a webhook](#long-polling-not-a-webhook). |
 

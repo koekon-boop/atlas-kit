@@ -19,12 +19,48 @@ export const normalizeChatId = (s) => String(s ?? '').trim()
 
 /** The allowlist: an explicit comma list, else just the home chat (so the
  *  minimal single-operator setup needs only TELEGRAM_HOME_CHAT_ID). Empty
- *  when neither is set — nobody is accepted. */
+ *  when neither is set — nobody is accepted. Every chat id named in
+ *  TELEGRAM_CHAT_ROUTES is folded in too: a routed chat is allowed to write
+ *  without also being named in TELEGRAM_ALLOWED_CHAT_IDS. */
 export function allowedChatIds(env = process.env) {
   const raw = str(env, 'TELEGRAM_ALLOWED_CHAT_IDS')
-  if (raw) return [...new Set(raw.split(',').map(normalizeChatId).filter(Boolean))]
-  const home = normalizeChatId(str(env, 'TELEGRAM_HOME_CHAT_ID'))
-  return home ? [home] : []
+  const base = raw
+    ? raw.split(',').map(normalizeChatId).filter(Boolean)
+    : (() => {
+        const home = normalizeChatId(str(env, 'TELEGRAM_HOME_CHAT_ID'))
+        return home ? [home] : []
+      })()
+  return [...new Set([...base, ...Object.keys(chatRoutes(env))])]
+}
+
+/**
+ * Per-chat routing to an EXISTING dashboard session, instead of the one standing
+ * session: "<chat id>=<session id>[:<claude session uuid>][,<chat id>=<session id>…]",
+ * e.g. "6076694713=kb-shop-setup". The optional ":<uuid>" is a human-readable pointer
+ * to the Claude session the target id was last resumed from — a note for whoever
+ * reads the env, not something this addon acts on: there is no core route that lets
+ * an addon recreate a closed session under a chosen id from a bare uuid (see README
+ * "Routing per chat"), so a route whose target is gone is never recreated — the
+ * message is stored and delivered once the target is reachable again.
+ * Robust on purpose: spaces, empty entries, an entry without "=" or with an empty
+ * side are skipped; only the FIRST "=" and FIRST ":" split.
+ * → { "<chat id>": { sessionId, claudeSessionId? } }
+ */
+export function chatRoutes(env = process.env) {
+  const out = {}
+  for (const entry of str(env, 'TELEGRAM_CHAT_ROUTES').split(',')) {
+    const i = entry.indexOf('=')
+    if (i < 0) continue
+    const chatId = normalizeChatId(entry.slice(0, i))
+    const rhs = entry.slice(i + 1).trim()
+    if (!chatId || !rhs) continue
+    const j = rhs.indexOf(':')
+    const sessionId = (j < 0 ? rhs : rhs.slice(0, j)).trim()
+    const claudeSessionId = j < 0 ? '' : rhs.slice(j + 1).trim()
+    if (!sessionId) continue
+    out[chatId] = claudeSessionId ? { sessionId, claudeSessionId } : { sessionId }
+  }
+  return out
 }
 
 /** "-1001234567890" → "…7890": enough to tell two chats apart in a log line. */
@@ -51,6 +87,7 @@ export const config = (env = process.env) => ({
   botToken: str(env, 'TELEGRAM_BOT_TOKEN'),
   homeChatId: normalizeChatId(str(env, 'TELEGRAM_HOME_CHAT_ID')),
   allowedChatIds: allowedChatIds(env),
+  chatRoutes: chatRoutes(env),
   bearer: str(env, 'DASHBOARD_BEARER_TOKEN'),
   apiBase: `http://127.0.0.1:${str(env, 'API_PORT', '3001')}`,
   apiPort: str(env, 'API_PORT', '3001'),
