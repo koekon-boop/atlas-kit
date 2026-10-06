@@ -144,11 +144,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  * The production loop: claims the singleton, then calls pollOnce() forever,
  * backing off on error. If another process already owns the lock, this
  * returns immediately with `owner: false` in status() — no loop, no retry.
+ * `onTick` (optional), when given, runs after EVERY pollOnce() call — whether it
+ * found updates or not — so a caller can piggyback a periodic retry on this
+ * already-running loop (register.mjs wires it to inbound.flushRoutes(), the only
+ * way a chat-route's stored message gets a second try without the sender writing
+ * again). A throwing `onTick` is caught and logged; it never stops the poll.
  * `_maxIterations` is test-only: it stops the loop after that many pollOnce()
  * calls instead of running until `.stop()`, so tests never need a hanging
  * fetch or a real timer to end deterministically.
  */
-export function createPoller({ env = process.env, fetch: f = globalThis.fetch, log = console.error, onUpdate, offsetFile = defaultOffsetFile(env), lockFile = defaultLockFile(env), sleep: sleepFn = sleep, _maxIterations = Infinity } = {}) {
+export function createPoller({ env = process.env, fetch: f = globalThis.fetch, log = console.error, onUpdate, onTick, offsetFile = defaultOffsetFile(env), lockFile = defaultLockFile(env), sleep: sleepFn = sleep, _maxIterations = Infinity } = {}) {
   const owner = claimSingleton(lockFile)
   let stopped = !owner
   let backoff = 0
@@ -173,6 +178,11 @@ export function createPoller({ env = process.env, fetch: f = globalThis.fetch, l
         await sleepFn(backoff)
       }
       lastPollAt = new Date().toISOString()
+      try {
+        await onTick?.()
+      } catch (e) {
+        log(`[telegram] onTick failed: ${e?.message || e}`)
+      }
     }
   })()
 
