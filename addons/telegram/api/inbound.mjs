@@ -14,6 +14,11 @@
  * `forwardToRoute` instead of `forwardToAgent` at the very last step — everything
  * above it (allowlist, voice, media) is identical for a routed chat.
  *
+ * A plain TEXT message that looks like a `claude auth login` OAuth code is
+ * checked against addons/claude-login FIRST (claude-login-bridge.mjs) — only
+ * while a renewal there is actually open; otherwise it falls through to the
+ * ordinary agent forward below, unchanged.
+ *
  * Updates are handled ONE AT A TIME (poller.mjs already awaits onUpdate per
  * update, in order — there is no separate queue here, unlike the webhook-driven
  * addons/whatsapp, because getUpdates itself delivers one batch at a time and
@@ -22,6 +27,7 @@
 import { config } from './config.mjs'
 import { flushAllRoutes, forwardToAgent, forwardToRoute, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
+import { tryInterceptClaudeLoginCode } from './claude-login-bridge.mjs'
 import { createMedia, MEDIA_TYPES } from './media.mjs'
 import { sendChatAction, sendMessage } from './telegram.mjs'
 import { run } from './voice-reply.mjs'
@@ -44,7 +50,7 @@ export const VOICE_MARK = '[Sprachnachricht, transkribiert]'
 const AUDIO_TYPES = { voice: 'audio/ogg', audio: '' }
 
 export function createInbound({ env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
-  const counters = { received: 0, forwarded: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, imagesReceived: 0, videosReceived: 0, documentsReceived: 0, framesExtracted: 0, mediaTooLarge: 0, mediaErrors: 0, forwardErrors: 0 }
+  const counters = { received: 0, forwarded: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, imagesReceived: 0, videosReceived: 0, documentsReceived: 0, framesExtracted: 0, mediaTooLarge: 0, mediaErrors: 0, forwardErrors: 0, claudeLoginCodes: 0 }
   const media = createMedia({ env, fetch: f, log, exec, counters })
 
   /** Voice note or attached audio → text for the agent, or a short reply to the
@@ -108,6 +114,14 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
       await sendMessage({ chatId, text: UNSUPPORTED }, { env, fetch: f, log })
       return
     } else text = m.text
+    if (type === 'text') {
+      const code = await tryInterceptClaudeLoginCode(text, { env, fetch: f, log })
+      if (code.handled) {
+        counters.claudeLoginCodes++
+        await sendMessage({ chatId, text: code.reply }, { env, fetch: f, log })
+        return
+      }
+    }
     const route = config(env).chatRoutes[chatId]
     const r = route ? await forwardToRoute({ chatId, text }, route, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
     if (r.ok) {
