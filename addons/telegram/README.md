@@ -473,6 +473,22 @@ raus → "voice":true. Kurz, Klartext.)
 — the masked chat id, its target session id, how many messages made it through,
 the last delivery time, and how many are still waiting.
 
+## Claude-login code interception (with addons/claude-login)
+
+If `addons/claude-login` is also enabled, a plain text message shaped like a
+`claude auth login` OAuth code (`<state>#<code>`) is checked against it
+**first**, via `GET /api/claude-login/awaiting` — a cheap, open, loopback
+call — and intercepted (never forwarded to the agent) **only while a renewal
+there is actually open**. The code is then submitted through
+`POST /api/claude-login/code` with the bearer this server already holds, and
+the sender gets a short reply with the real outcome ("renewed — valid until
+…", or how many tries are left). Outside an open renewal, a code-shaped
+message is just an ordinary message to the agent, exactly as before — this
+addon never imports `addons/claude-login`, it only calls its routes
+(`claude-login-bridge.mjs`), the same pattern used for `addons/voice` above.
+Counted in `telegram.status.counters.claudeLoginCodes`. See
+[`addons/claude-login/README.md`](../claude-login/README.md).
+
 ## Security model
 
 | what | how it is protected |

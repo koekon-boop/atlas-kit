@@ -1,6 +1,7 @@
 import { useEffect } from 'preact/hooks'
 import { motion, type Transition, type Variants } from 'framer-motion'
 import { Hero } from './cards/Hero'
+import { ClaudeLogin } from './cards/ClaudeLogin'
 import { SearchBar } from './SearchBar'
 import { Scorecard } from './cards/Scorecard'
 import { KnowledgeAgents } from './cards/KnowledgeAgents'
@@ -47,6 +48,9 @@ function CommandCenterInner() {
         className="cc-grid grid grid-cols-12 gap-4 px-4 pb-12 sm:px-6"
       >
         <Hero />
+        {/* Runtime-gated (docs/ADDONS.md), and even then renders nothing unless
+            a renewal is actually waiting on a human — see addons/claude-login. */}
+        <ClaudeLogin className="col-span-12" />
         <SearchBar onOpenWiki={openPath} vault={VAULT} />
         <Scorecard className="col-span-12" />
         {/* The Atlas Agent — the orchestrator chat ("steer Atlas for everything")

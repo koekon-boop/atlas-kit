@@ -998,6 +998,38 @@ export function fetchNews(limit = 12): Promise<NewsView | null> {
   return getJson<NewsView>(`${API_BASE}/news?limit=${limit}`)
 }
 
+/* --- claude-login (optional addon) ---------------------------------------- *
+ * The self-renewing Claude Code login (addons/claude-login). GET /awaiting is
+ * an open read — the banner polls it; the ClaudeLogin card gates on GET
+ * /api/addons so a kit without the addon never calls either. */
+export interface ClaudeLoginAwaiting {
+  awaiting: boolean
+  via?: 'telegram' | 'dashboard'
+  url?: string
+  startedAt?: string
+  expiresAt?: number
+}
+
+export function fetchClaudeLoginAwaiting(): Promise<ClaudeLoginAwaiting | null> {
+  return getJson<ClaudeLoginAwaiting>(`${API_BASE}/claude-login/awaiting`)
+}
+
+/** Submit the OAuth code shown after tapping the link. */
+export async function submitClaudeLoginCode(code: string): Promise<{ ok: boolean; error?: string; attemptsLeft?: number; expiresAt?: number }> {
+  try {
+    const res = await fetch(`${API_BASE}/claude-login/code`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code, source: 'dashboard' }),
+    })
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; attemptsLeft?: number; expiresAt?: number }
+    if (!res.ok && data.ok == null) return { ok: false, error: data.error || `HTTP ${res.status}` }
+    return { ok: data.ok === true, error: data.error, attemptsLeft: data.attemptsLeft, expiresAt: data.expiresAt }
+  } catch (e) {
+    return { ok: false, error: String(e) }
+  }
+}
+
 /** Fire the server-side GitHub data refresh (cooldown-guarded server-side). */
 export async function refreshGithub(): Promise<void> {
   try {

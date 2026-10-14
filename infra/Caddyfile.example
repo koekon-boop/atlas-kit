@@ -132,6 +132,15 @@
 		}
 	}
 
+	# claude-login: POST /api/claude-login/code (the dashboard banner's submit
+	# button). GET /api/claude-login/awaiting is an open read and matches this
+	# same handler — the token is harmless on it.
+	handle /api/claude-login/* {
+		reverse_proxy localhost:3001 {
+			header_up Authorization "Bearer {env.DASHBOARD_BEARER_TOKEN}"
+		}
+	}
+
 	# --- Read routes (open; Cloudflare Access gates them at the edge) ---
 	handle /api/* {
 		reverse_proxy localhost:3001
