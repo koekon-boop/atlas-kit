@@ -95,7 +95,7 @@ update that was in flight, never the whole batch.
 
 ## What it cannot do — read this before you count on it
 
-- **Text, voice notes, pictures, videos and documents in; text or a voice note out.**
+- **Text, voice notes, pictures, videos, documents and button taps in; text or a voice note out.**
   Stickers, locations, contacts, polls, round "video messages"… get one short
   "can't read that yet" back and never reach the agent. A video is **not watched**:
   the agent gets a handful of stills and the transcript of its soundtrack — see
@@ -489,6 +489,36 @@ addon never imports `addons/claude-login`, it only calls its routes
 Counted in `telegram.status.counters.claudeLoginCodes`. See
 [`addons/claude-login/README.md`](../claude-login/README.md).
 
+## Buttons (optional)
+
+The agent side can send messages with **inline buttons** (Bot API `reply_markup` with an
+`inline_keyboard`, sent straight to the Bot API by a script on the box). A tap on such a
+button arrives as a `callback_query`. The poller subscribes to it next to `message`.
+
+What happens to one tap:
+1. **Allowlist:** the chat the button sits in must be allowed, exactly as for messages.
+   A tap from anywhere else is dropped silently and counted (`dropped`).
+2. **It counts as the operator answering:** `lastInboundAt` is bumped, just like a message.
+3. **The hook runs:** `TELEGRAM_CALLBACK_HOOK` is executed without a shell. It gets one JSON
+   argument, `{ "data", "chatId", "messageId", "fromId" }`, where `data` is the button's own
+   `callback_data` (at most 64 bytes, chosen by whoever sent the button).
+4. **It may print one JSON object:**
+   - `toast`: the short notice the phone shows (up to 200 chars);
+   - `alert: true`: shows that notice as a popup instead;
+   - `forward`: a line handed to the agent session, marked `[Knopf]`.
+
+   Taps that need no follow-up should not wake the agent.
+5. **The spinner always closes:** with the hook's toast, or with a short notice when the hook
+   is not set up, exits non-zero, prints no JSON or times out (`TELEGRAM_CALLBACK_TIMEOUT_MS`,
+   default 20 s).
+
+The hook does its own Bot API work, such as editing the message so a ticked item shows as
+ticked. This addon only routes the tap.
+
+```bash
+TELEGRAM_CALLBACK_HOOK=/root/.atlas-kit/bin/todo-knopf.py   # optional; unset = taps are acknowledged and dropped
+```
+
 ## Security model
 
 | what | how it is protected |
@@ -496,6 +526,7 @@ Counted in `telegram.status.counters.claudeLoginCodes`. See
 | who may talk to the agent | `TELEGRAM_ALLOWED_CHAT_IDS` (or, when unset, just the home chat) **plus every chat id named in `TELEGRAM_CHAT_ROUTES`**, folded in automatically. Anyone else is dropped **silently** (no reply, so no sign the bridge exists) and counted (`dropped`). Telegram bots are publicly discoverable by username — without an allowlist, anyone who found the bot could inject prompts into a session with full vault access; this is the trust boundary that prevents that. |
 | `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `chat_id` must be in the allowlist (routed chat ids included), so a prompt-injected agent cannot message arbitrary chats (voice or text alike). |
 | the bot token | lives in every Bot API URL (Telegram's design, not a header) — every function that builds one is careful never to pass that URL to a log line. |
+| button taps | same allowlist as messages; the hook runs without a shell and gets the tap as ONE JSON argument; `callback_data` comes from the bot's own messages (64 bytes max) and is data for the hook, never a command line |
 | getUpdates | only ONE process on this box holds the poll — see [Long-polling, not a webhook](#long-polling-not-a-webhook). |
 
 | files you receive | saved `0600` under a folder named by date and update id; a document's file name is reduced to letters, digits and `._-`, so it cannot climb out of that folder; only allowlisted chats get this far; the retention sweep deletes date-named folders only |
