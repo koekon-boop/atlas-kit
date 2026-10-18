@@ -8,6 +8,9 @@
  *                                            marked text (video: stills + transcribed
  *                                            soundtrack)
  *   anything else                         → one short "can't read that"
+ *   callback_query (a tap on a button     → handed to TELEGRAM_CALLBACK_HOOK; its answer
+ *     the bot sent)                          becomes the tap's toast and, if it says so,
+ *                                            a marked line for the agent (README "Buttons")
  *   an unallowed chat_id                  → dropped, silently, counted
  *
  * A chat id in TELEGRAM_CHAT_ROUTES (config.mjs' chatRoutes) is dispatched to
@@ -29,7 +32,7 @@ import { flushAllRoutes, forwardToAgent, forwardToRoute, markInbound } from './a
 import { fetchAudio, transcribe } from './audio.mjs'
 import { tryInterceptClaudeLoginCode } from './claude-login-bridge.mjs'
 import { createMedia, MEDIA_TYPES } from './media.mjs'
-import { sendChatAction, sendMessage } from './telegram.mjs'
+import { answerCallbackQuery, sendChatAction, sendMessage } from './telegram.mjs'
 import { run } from './voice-reply.mjs'
 
 const UNSUPPORTED = 'Das kann ich noch nicht lesen — schreib mir bitte Text. / I can’t read that yet — text only, please.'
@@ -44,13 +47,19 @@ const BASE_UNREACHABLE = 'Die Basis ist gerade nicht erreichbar — deine Nachri
 /** What the agent reads in front of a transcribed voice note. */
 export const VOICE_MARK = '[Sprachnachricht, transkribiert]'
 
+/** What the agent reads in front of a line the button hook asked to pass on. */
+export const BUTTON_MARK = '[Knopf]'
+
+const NO_HOOK = 'Knöpfe sind auf der Box nicht eingerichtet. / Buttons are not set up on the box.'
+const HOOK_FAIL = 'Das hat nicht geklappt — versuch es gleich noch mal. / That did not work — please try again.'
+
 /** Telegram message types this bridge reads as spoken audio: a real voice note
  *  (`voice`) and an audio file attached from the gallery (`audio`) — same as
  *  WhatsApp treating `voice: false` audio the same way. */
 const AUDIO_TYPES = { voice: 'audio/ogg', audio: '' }
 
 export function createInbound({ env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run } = {}) {
-  const counters = { received: 0, forwarded: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, imagesReceived: 0, videosReceived: 0, documentsReceived: 0, framesExtracted: 0, mediaTooLarge: 0, mediaErrors: 0, forwardErrors: 0, claudeLoginCodes: 0 }
+  const counters = { buttonTaps: 0, buttonErrors: 0, received: 0, forwarded: 0, dropped: 0, unsupported: 0, audioReceived: 0, transcribed: 0, transcribeErrors: 0, transcribeEmpty: 0, audioTooLarge: 0, imagesReceived: 0, videosReceived: 0, documentsReceived: 0, framesExtracted: 0, mediaTooLarge: 0, mediaErrors: 0, forwardErrors: 0, claudeLoginCodes: 0 }
   const media = createMedia({ env, fetch: f, log, exec, counters })
 
   /** Voice note or attached audio → text for the agent, or a short reply to the
@@ -83,8 +92,60 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
     return null
   }
 
+  /** Hand an agent-bound text to the routed session or the standing one; tell the
+   *  sender when neither takes it. Shared by messages and button taps. */
+  async function deliver(chatId, text) {
+    const route = config(env).chatRoutes[chatId]
+    const r = route ? await forwardToRoute({ chatId, text }, route, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
+    if (r.ok) {
+      counters.forwarded++
+      return
+    }
+    counters.forwardErrors++
+    log(`[telegram] could not hand the message to the ${route ? 'routed session' : 'agent'}: ${r.error}`)
+    await sendMessage({ chatId, text: route ? BASE_UNREACHABLE : AGENT_DOWN }, { env, fetch: f, log })
+  }
+
+  /**
+   * A tap on an inline button the bot sent. The allowlist applies exactly as for
+   * messages (the chat the button sits in). The hook — an executable on the box,
+   * never a shell — gets one JSON argument `{ data, chatId, messageId, fromId }`
+   * and may print one JSON object: `{ toast?, alert?, forward? }`. `toast` becomes
+   * the little notice on the phone (`alert: true` makes it a popup), `forward` is
+   * passed on to the agent as a `[Knopf]` line. The spinner is always closed, also
+   * when the hook is missing or fails.
+   */
+  async function handleCallback(q) {
+    const chatId = String(q.message?.chat?.id ?? '')
+    if (!chatId || !config(env).allowedChatIds.includes(chatId)) {
+      counters.dropped++
+      return
+    }
+    counters.buttonTaps++
+    markInbound(file)
+    const c = config(env)
+    const answer = (text, showAlert = false) => answerCallbackQuery({ id: q.id, text, showAlert }, { env, fetch: f, log })
+    if (!c.callbackHook) return answer(NO_HOOK)
+    const payload = { data: String(q.data ?? ''), chatId, messageId: q.message?.message_id ?? null, fromId: q.from?.id ?? null }
+    const r = await exec(c.callbackHook, [JSON.stringify(payload)], { timeoutMs: c.callbackTimeoutMs, captureStdout: true })
+    let out = null
+    if (r.code === 0) {
+      try {
+        out = JSON.parse(String(r.stdout || '').trim() || '{}')
+      } catch {}
+    }
+    if (!out || typeof out !== 'object') {
+      counters.buttonErrors++
+      log(`[telegram] the button hook failed (exit ${r.code ?? 'none'}): ${String(r.stderr || '').trim().slice(0, 300)}`)
+      return answer(HOOK_FAIL)
+    }
+    await answer(typeof out.toast === 'string' ? out.toast : '', out.alert === true)
+    if (typeof out.forward === 'string' && out.forward.trim()) await deliver(chatId, `${BUTTON_MARK} ${out.forward.trim()}`)
+  }
+
   /** Handle one update. Never throws — poller.mjs already catches, this is a second belt. */
   async function handleOne(u) {
+    if (u?.callback_query) return handleCallback(u.callback_query)
     const m = u?.message
     if (!m) return // edited_message, channel_post, … — never subscribed to (allowed_updates), but be safe
     const chatId = String(m.chat?.id ?? '')
@@ -122,15 +183,7 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
         return
       }
     }
-    const route = config(env).chatRoutes[chatId]
-    const r = route ? await forwardToRoute({ chatId, text }, route, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
-    if (r.ok) {
-      counters.forwarded++
-      return
-    }
-    counters.forwardErrors++
-    log(`[telegram] could not hand the message to the ${route ? 'routed session' : 'agent'}: ${r.error}`)
-    await sendMessage({ chatId, text: route ? BASE_UNREACHABLE : AGENT_DOWN }, { env, fetch: f, log })
+    await deliver(chatId, text)
   }
 
   /** The poller-tick hook (register.mjs wires this into poller.mjs's onTick):

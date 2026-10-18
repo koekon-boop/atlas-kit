@@ -123,3 +123,19 @@ export async function sendVoice({ chatId, bytes, filename = 'reply.ogg' }, { env
     return { ok: false, error: String(e?.message || e) }
   }
 }
+
+/**
+ * Close the loading spinner on a tapped inline button, optionally with a short
+ * toast (`text`, Telegram caps it at 200 chars) or, with `showAlert`, a modal
+ * popup. Telegram expects this within seconds of every tap, even an empty one.
+ * → `{ ok: true }` | `{ ok: false, error }`. Never throws.
+ */
+export async function answerCallbackQuery({ id, text = '', showAlert = false }, { env = process.env, fetch: f = globalThis.fetch, log = console.error } = {}) {
+  const c = config(env)
+  const body = { callback_query_id: id }
+  if (text) body.text = String(text).slice(0, 200)
+  if (showAlert) body.show_alert = true
+  const r = await api('answerCallbackQuery', c.botToken, body, { fetch: f, timeoutMs: 10000 })
+  if (!r.ok) return { ok: false, ...failure(r, 'a button answer', log) }
+  return { ok: true }
+}

@@ -31,6 +31,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { apiUrl, config, offsetFile as defaultOffsetFile, lockFile as defaultLockFile } from './config.mjs'
 
+/** The update kinds this bridge subscribes to: messages, and taps on the inline
+ *  buttons the bot itself sent (README "Buttons"). Everything else is never delivered. */
+export const ALLOWED_UPDATES = encodeURIComponent(JSON.stringify(['message', 'callback_query']))
+
 const isAlive = (pid) => {
   try {
     process.kill(pid, 0)
@@ -116,7 +120,7 @@ export async function pollOnce({ env = process.env, fetch: f = globalThis.fetch,
   let offset = readOffset(offsetFile)
   let updates
   try {
-    const url = `${apiUrl(c.botToken, 'getUpdates')}?timeout=${c.pollTimeoutS}&offset=${offset}&allowed_updates=%5B%22message%22%5D`
+    const url = `${apiUrl(c.botToken, 'getUpdates')}?timeout=${c.pollTimeoutS}&offset=${offset}&allowed_updates=${ALLOWED_UPDATES}`
     const r = await f(url, { signal: AbortSignal.timeout((c.pollTimeoutS + 10) * 1000) })
     const j = await r.json().catch(() => null)
     if (!r.ok || !j?.ok) throw new Error(j?.description || `HTTP ${r.status}`)

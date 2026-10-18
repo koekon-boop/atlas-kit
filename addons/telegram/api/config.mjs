@@ -115,6 +115,10 @@ export const config = (env = process.env) => ({
   pollTimeoutS: posInt(env, 'TELEGRAM_POLL_TIMEOUT_S', 50), // getUpdates' own "timeout" param — how long Telegram holds the request open with nothing new
   pollErrorBackoffMs: posInt(env, 'TELEGRAM_POLL_ERROR_BACKOFF_MS', 1000), // first retry delay after a failed getUpdates
   pollErrorBackoffMaxMs: posInt(env, 'TELEGRAM_POLL_ERROR_BACKOFF_MAX_MS', 30000), // the backoff doubles up to this cap
+  // Buttons (README "Buttons"): an executable on the box that gets every tap on an
+  // inline-keyboard button the bot sent. Unset = taps are acknowledged and dropped.
+  callbackHook: str(env, 'TELEGRAM_CALLBACK_HOOK'),
+  callbackTimeoutMs: posInt(env, 'TELEGRAM_CALLBACK_TIMEOUT_MS', 20000),
 })
 
 /** Telegram's Bot API is one base URL PER METHOD, token embedded in the path —
