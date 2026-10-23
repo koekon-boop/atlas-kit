@@ -33,7 +33,9 @@ import { apiUrl, config, offsetFile as defaultOffsetFile, lockFile as defaultLoc
 
 /** The update kinds this bridge subscribes to: messages, and taps on the inline
  *  buttons the bot itself sent (README "Buttons"). Everything else is never delivered. */
-export const ALLOWED_UPDATES = encodeURIComponent(JSON.stringify(['message', 'callback_query']))
+// edited_message: a LIVE location arrives as one message, then as edits of it (README "Location");
+// inbound.mjs reads only the location out of an edit and ignores every other edit.
+export const ALLOWED_UPDATES = encodeURIComponent(JSON.stringify(['message', 'edited_message', 'callback_query']))
 
 const isAlive = (pid) => {
   try {

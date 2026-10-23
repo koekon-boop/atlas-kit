@@ -119,6 +119,11 @@ export const config = (env = process.env) => ({
   // inline-keyboard button the bot sent. Unset = taps are acknowledged and dropped.
   callbackHook: str(env, 'TELEGRAM_CALLBACK_HOOK'),
   callbackTimeoutMs: posInt(env, 'TELEGRAM_CALLBACK_TIMEOUT_MS', 20000),
+  // Location (README "Location"): an executable on the box that gets every location the
+  // operator shares, including the updates of a live location. Unset = a shared location
+  // gets the usual "can't read that", live updates are dropped.
+  locationHook: str(env, 'TELEGRAM_LOCATION_HOOK'),
+  locationTimeoutMs: posInt(env, 'TELEGRAM_LOCATION_TIMEOUT_MS', 10000),
 })
 
 /** Telegram's Bot API is one base URL PER METHOD, token embedded in the path —
