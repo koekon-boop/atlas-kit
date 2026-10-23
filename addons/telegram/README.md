@@ -7,8 +7,8 @@ the operator's single standing chat — the pattern it mirrors, minus the
 per-sender bookkeeping, because there is only one conversation — EXCEPT for a chat
 id named in `TELEGRAM_CHAT_ROUTES`, which is pinned to an existing dashboard session
 of its own instead ([Routing per chat](#routing-per-chat-optional)). You can send it
-**text, voice notes, pictures, videos and documents**
-([Voice notes](#voice-notes), [Pictures, videos and documents](#pictures-videos-and-documents)).
+**text, voice notes, pictures, videos and documents**, and your **location**
+([Voice notes](#voice-notes), [Pictures, videos and documents](#pictures-videos-and-documents), [Location](#location-optional)).
 
 ```
 phone ──► Telegram Bot API ──► getUpdates (long-poll, this addon PULLS — no public webhook)
@@ -519,6 +519,36 @@ ticked. This addon only routes the tap.
 TELEGRAM_CALLBACK_HOOK=/root/.atlas-kit/bin/todo-knopf.py   # optional; unset = taps are acknowledged and dropped
 ```
 
+## Location (optional)
+
+The operator can share a **location** in the chat, once or as a **live location** (📎 → Location →
+"Share live location", up to "until I turn it off"). A live location arrives as one message and then
+as **edits** of it every few minutes. That is why the poller also subscribes to `edited_message`.
+Only the location is read out of an edit; every other edit is ignored as before.
+
+What happens to one location:
+1. **Allowlist:** exactly as for messages. Anything else is dropped silently and counted.
+2. **The hook runs:** `TELEGRAM_LOCATION_HOOK` is executed without a shell. It gets one JSON
+   argument, `{ "lat", "lon", "accuracy", "heading", "livePeriod", "live", "update", "date", "chatId", "messageId" }`.
+   `update: true` marks a live update, and `date` is then the time of that update.
+   Coordinates outside ±90/±180 never reach the hook.
+3. **It may print one JSON object:**
+   - `reply`: sent to the chat, only for a freshly shared location, never for live updates;
+   - `forward`: a line handed to the agent session, marked `[Standort]`.
+
+   The usual answer is neither: store the position on the box, and let the agent look it up
+   when it needs it. A live location that woke the agent every few minutes would be expensive.
+4. **Only a freshly shared location counts as the operator answering.** Live updates come on
+   their own, so they do not bump `lastInboundAt`. Anything that waits for the operator to react,
+   such as a reminder that escalates after 30 minutes of silence, still works.
+5. **Without a hook,** a freshly shared location gets the usual "can't read that", and live
+   updates are dropped silently. That is the behaviour from before this section existed.
+
+```bash
+TELEGRAM_LOCATION_HOOK=/root/.atlas-kit/iphone-hook/telegram-standort.py   # optional
+TELEGRAM_LOCATION_TIMEOUT_MS=10000                                        # optional, default 10 s
+```
+
 ## Security model
 
 | what | how it is protected |
@@ -527,6 +557,7 @@ TELEGRAM_CALLBACK_HOOK=/root/.atlas-kit/bin/todo-knopf.py   # optional; unset = 
 | `POST …/send` | `DASHBOARD_BEARER_TOKEN`, constant-time — and `chat_id` must be in the allowlist (routed chat ids included), so a prompt-injected agent cannot message arbitrary chats (voice or text alike). |
 | the bot token | lives in every Bot API URL (Telegram's design, not a header) — every function that builds one is careful never to pass that URL to a log line. |
 | button taps | same allowlist as messages; the hook runs without a shell and gets the tap as ONE JSON argument; `callback_data` comes from the bot's own messages (64 bytes max) and is data for the hook, never a command line |
+| locations | same allowlist as messages; the hook runs without a shell and gets ONE JSON argument with numbers only (coordinates range-checked); live updates never reply and never count as the operator answering |
 | getUpdates | only ONE process on this box holds the poll — see [Long-polling, not a webhook](#long-polling-not-a-webhook). |
 
 | files you receive | saved `0600` under a folder named by date and update id; a document's file name is reduced to letters, digits and `._-`, so it cannot climb out of that folder; only allowlisted chats get this far; the retention sweep deletes date-named folders only |

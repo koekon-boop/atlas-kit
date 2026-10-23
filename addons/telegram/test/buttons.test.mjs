@@ -57,8 +57,8 @@ const hookSaying = (calls, out, code = 0) => async (bin, args, opts) => {
   return { code, stderr: code ? 'kaputt' : '', stdout: typeof out === 'string' ? out : JSON.stringify(out) }
 }
 
-test('getUpdates asks for button taps as well as messages', () => {
-  assert.deepEqual(JSON.parse(decodeURIComponent(ALLOWED_UPDATES)), ['message', 'callback_query'])
+test('getUpdates asks for button taps as well as messages (and edits, for live locations)', () => {
+  assert.deepEqual(JSON.parse(decodeURIComponent(ALLOWED_UPDATES)), ['message', 'edited_message', 'callback_query'])
 })
 
 test('a tap runs the hook with one JSON argument and shows its toast', async () => {
