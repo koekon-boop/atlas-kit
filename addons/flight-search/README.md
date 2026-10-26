@@ -1,4 +1,4 @@
-# `flight-search` — a flight search agent as one MCP tool
+# `flight-search` — a flight search agent as two MCP tools
 
 A portal shows you a list. This **composes a trip**.
 
@@ -20,9 +20,11 @@ search_flights({
 })
 ```
 
-> 🔴 **It books nothing and holds nothing.** Every option is a lead to verify with
-> the airline. Prices, availability and baggage rules change between a search and
-> a booking, and offers expire in minutes.
+> 🔴 **`search_flights` books nothing and holds nothing.** Every option is a lead
+> to verify with the airline. Prices, availability and baggage rules change
+> between a search and a booking, and offers expire in minutes. A second tool,
+> `book_flight` (see "Buchen" below), books one of these options — behind its
+> own `confirm: true` and, for a live token, two further explicit locks.
 
 ---
 
@@ -82,6 +84,60 @@ estimate is labelled as one everywhere it appears.
 
 ---
 
+## Buchen
+
+A second MCP tool, `book_flight`, books one option `search_flights` already
+found — the offer id(s) from its answer's `booking.tickets[].offerId` (one for
+a single ticket, two for a self-transfer split), plus every traveller's
+passport details.
+
+```
+book_flight({
+  offerIds: ["off_0000AoneTicketTK"],
+  passengers: [{ givenName: "Erika", familyName: "Musterfrau", bornOn: "1990-05-01",
+                 gender: "f", title: "mrs", email: "erika@example.com", phone: "+491701234567" }],
+})
+// → a PREVIEW: current price, expiry, refund/change conditions, test/live mode.
+//   Nothing is booked yet.
+
+book_flight({ ...same, confirm: true })
+// → places the real order(s). PNR, order id, amount, live_mode back — never
+//   the birth date, email or phone that went in.
+```
+
+> 🔴 **Without `confirm: true` this never books.** Every call first re-fetches
+> each offer fresh from Duffel — price, expiry and fare conditions change
+> between a search and a booking — and answers with a preview of what
+> confirming would do. Only `confirm: true` places a real order.
+
+**A split is two orders, not one transaction.** Two `offerIds` are booked as
+two separate Duffel orders, one after the other, never in parallel. If the
+second fails after the first succeeded, nothing is rolled back automatically —
+the answer says plainly what is booked and what is not, and leaves what to do
+about a half-booked trip to whoever asked for it.
+
+**Two independent locks stand between a live token and a real purchase:**
+
+| lock | what it takes to pass |
+|---|---|
+| live-booking lock | `ATLAS_FLIGHTS_ALLOW_LIVE_BOOKING=1` in `.env` **and** `confirm: true` on the call — either alone refuses |
+| price ceiling | the total must be at or under `ATLAS_FLIGHTS_MAX_BOOKING_EUR` (default 1500 EUR); only enforced when the total is actually priced in EUR |
+
+A **test** token (`duffel_test_…`) never needs the live lock — a test booking
+is free, against Duffel's own fake balance, and never reaches a real airline.
+Proven end-to-end by hand on 2026-08-27: `POST /air/orders` against Duffel's
+test environment returned a real `booking_reference` with `live_mode: false`
+and no payment integration of any kind, because `payments: [{type: "balance"}]`
+draws on that fake balance. This addon integrates no card payment flow — a
+live booking relies on the same `balance` rail against the operator's own
+topped-up Duffel account.
+
+**Passenger data is passed straight through to Duffel and never logged or
+written to disk.** The tool's answer reports only names and the booking
+reference, never a birth date, email or phone number back.
+
+---
+
 ## What it cannot do
 
 Read this part before enabling it.
@@ -91,11 +147,14 @@ Read this part before enabling it.
   are simply **absent from the results** — not "not found", *never looked at*. On
   the routes where a ULCC is the real answer, this tool will confidently show you
   the third-cheapest option. Cross-check the big European short-hauls by hand.
-- **It cannot book.** Duffel offers are ordered through its API (`POST /air/orders`),
-  not on a web page, so there is no booking deep link to hand you. Each option
-  carries its Duffel offer id, its expiry, and a Google Flights **search** URL to
-  verify the itinerary with a human eye. Booking is your job, at the airline or
-  through a Duffel order you write yourself.
+- **`search_flights` books nothing by itself.** Each option carries its Duffel
+  offer id, its expiry, and a Google Flights **search** URL to verify the
+  itinerary with a human eye first. `book_flight` (see "Buchen" above) is a
+  separate, explicit call — nothing a search ever does on its own.
+- **Booking has no card payment flow.** `book_flight` books against Duffel's
+  `balance` rail — a test token's fake balance, or a live account's own
+  topped-up balance. There is no Stripe/PayPal/card integration here; a
+  caller who needs one writes it against the Duffel order this addon creates.
 - **Split tickets are your own risk, entirely.** If the first flight is late, the
   second airline owes you nothing: not a rebooking, not a refund, not a hotel.
   You buy the next ticket yourself. The floors above are a margin, not a
@@ -212,6 +271,8 @@ edit needs a restart only because the process re-reads `.env` at boot.
 | `ATLAS_FLIGHTS_REQUEST_TIMEOUT_MS` | `40000` | how long we wait on Duffel |
 | `ATLAS_FLIGHTS_DUFFEL_VERSION` | `v2` | the pinned `Duffel-Version` header |
 | `ATLAS_FLIGHTS_DUFFEL_BASE` | `https://api.duffel.com` | overridable for a proxy or a replay fixture |
+| `ATLAS_FLIGHTS_ALLOW_LIVE_BOOKING` | unset | the live-booking lock — set to `1` to let `book_flight` book at all against a `duffel_live_…` token (also needs `confirm: true` on the call). A test token never needs this |
+| `ATLAS_FLIGHTS_MAX_BOOKING_EUR` | `1500` | the price ceiling `book_flight` refuses a confirm over, when the total is priced in EUR |
 
 Per-request overrides (`maxAdapterCalls`, `minConnectionMinutes`, `weights`, …)
 are arguments to the tool; see its description for the full list.
@@ -254,4 +315,8 @@ No network, no token, no fixtures recorded from a live call. CI runs them in the
 same job as `api/test`. The cases worth knowing about: connection maths across
 timezones and the date line, a DST fall-back layover, split-ticket feasibility,
 each hard filter, Pareto domination, and the whole pipeline with no
-`DUFFEL_API_TOKEN` set.
+`DUFFEL_API_TOKEN` set — plus, for booking: a preview never calls `createOrder`,
+an expired or re-verify-failed offer refuses to book, a live token is refused
+without the env lock, a total over the EUR ceiling is refused, a split's second
+order failing after the first succeeded is reported honestly rather than
+rolled back, and no passenger field reaches the tool's JSON answer.

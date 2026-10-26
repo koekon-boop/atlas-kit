@@ -41,3 +41,9 @@ export const configuredAdapters = (adapters) =>
       return false
     }
   })
+
+/** Configured adapters that also know how to BOOK (`getOffer` + `createOrder`).
+ *  A future search-only source stays searchable but invisible to `book_flight`
+ *  — the same "configured but cannot do this" shape `adapterStatus` already
+ *  uses for "no credentials", not a reason to drop it from the list. */
+export const bookableAdapters = (adapters) => configuredAdapters(adapters).filter((a) => typeof a.getOffer === 'function' && typeof a.createOrder === 'function')

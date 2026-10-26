@@ -65,8 +65,13 @@ export function segment({ from, to, depart, arrive, carrier = 'TK', number = '10
   }
 }
 
-/** One Duffel offer: `slices` is a list of segment lists, one per direction. */
-export function offer({ id, amount, currency = 'EUR', slices, owner = 'TK', emissions = null, refundable = false, changeable = true, partial = false }) {
+/** One Duffel offer: `slices` is a list of segment lists, one per direction.
+ *  `passengers` are the offer's OWN passenger ids — what `GET /air/offers/{id}`
+ *  carries and `book_flight` zips the caller's passenger details onto; default
+ *  matches `segment()`'s hardcoded `passenger_id: 'pas_1'`. `expiresAt` is
+ *  overridable so a booking test can hand back an offer that has already
+ *  expired without waiting for one to. */
+export function offer({ id, amount, currency = 'EUR', slices, owner = 'TK', emissions = null, refundable = false, changeable = true, partial = false, passengers = [{ id: 'pas_1' }], expiresAt = '2026-08-18T10:00:00.000Z' }) {
   return {
     id,
     partial,
@@ -75,8 +80,9 @@ export function offer({ id, amount, currency = 'EUR', slices, owner = 'TK', emis
     base_amount: String(Math.round(amount * 0.8 * 100) / 100),
     tax_amount: String(Math.round(amount * 0.2 * 100) / 100),
     total_emissions_kg: emissions == null ? null : String(emissions),
-    expires_at: '2026-08-18T10:00:00.000Z',
+    expires_at: expiresAt,
     owner: { iata_code: owner, name: owner },
+    passengers,
     conditions: {
       change_before_departure: { allowed: changeable, penalty_amount: '80.00', penalty_currency: currency },
       refund_before_departure: { allowed: refundable, penalty_amount: null, penalty_currency: null },
@@ -90,6 +96,14 @@ export function offer({ id, amount, currency = 'EUR', slices, owner = 'TK', emis
 }
 
 export const offersResponse = (offers) => ({ data: { id: 'orq_stub', offers } })
+
+/** The shape `GET /air/offers/{id}` answers with — ONE offer, not a list. */
+export const offerResponse = (off) => ({ data: off })
+
+/** The shape `POST /air/orders` answers with on success. */
+export const orderResponse = ({ id = 'ord_stub', reference = 'ABC123', liveMode = false, amount = '0.00', currency = 'EUR' } = {}) => ({
+  data: { id, booking_reference: reference, live_mode: liveMode, total_amount: amount, total_currency: currency },
+})
 
 /**
  * A `fetchImpl` for the real Duffel adapter that answers from a routing table
@@ -129,6 +143,38 @@ export function stubAdapter(routes, { name = 'stub', configured = true } = {}) {
       const answer = routes[key]
       if (typeof answer === 'function') return answer(spec)
       return { ok: true, tickets: answer || [] }
+    },
+  }
+}
+
+/**
+ * A whole BOOKING-CAPABLE adapter stub for book.mjs's pipeline tests —
+ * `getOffer` and `createOrder` answer from tables keyed by offer id, with no
+ * wire format in sight (duffel.test.mjs already covers that layer). `orders`
+ * records every `createOrder` call, in order, so a test can assert exactly
+ * what was and was not booked.
+ */
+export function stubBookingAdapter({ offers = {}, book = {}, name = 'stub', configured = true, mode = 'test' } = {}) {
+  const orders = []
+  return {
+    name,
+    label: `${name} (stub)`,
+    orders,
+    status: () => (configured ? { configured: true, mode } : { configured: false, reason: 'no token in the stub' }),
+    async search() {
+      return { ok: true, tickets: [] }
+    },
+    async getOffer(id) {
+      const answer = offers[id]
+      if (answer === undefined) return { ok: false, error: `no such offer: ${id}` }
+      return typeof answer === 'function' ? answer() : answer
+    },
+    async createOrder(args) {
+      orders.push(args)
+      const answer = book[args.offerId]
+      if (typeof answer === 'function') return answer(args)
+      if (answer) return answer
+      return { ok: true, orderId: `ord_${args.offerId}`, bookingReference: `PNR${String(args.offerId).slice(-4).toUpperCase()}`, liveMode: mode === 'live', amount: args.amount, currency: args.currency }
     },
   }
 }

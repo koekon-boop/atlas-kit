@@ -48,6 +48,9 @@ test('register() does not throw, and costs nothing, without a token', () => {
   assert.deepEqual(s.sources, [{ name: 'duffel', label: 'Duffel (api.duffel.com)', configured: false, reason: 'DUFFEL_API_TOKEN is not set' }])
   assert.match(s.howToEnable, /DUFFEL_API_TOKEN=duffel_test_/)
   assert.equal(s.tool, 'search_flights')
+  assert.equal(s.bookingTool, 'book_flight')
+  assert.equal(s.liveBookingAllowed, false)
+  assert.equal(s.maxBookingEur, 1500)
   // Registering twice is what a second MCP surface in the same process does.
   assert.doesNotThrow(() => register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }))
 })
@@ -65,7 +68,7 @@ test('status() reports readiness without ever printing the token', () => {
   }
 })
 
-test('the tool answers rather than throwing when there is nothing to search with', async () => {
+test('the search tool answers rather than throwing when there is nothing to search with', async () => {
   const [tool] = register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools
   assert.equal(tool.name, 'search_flights')
   const r = await tool.handler({ origin: 'BER', destination: 'HND', departureDate: '2026-10-15' })
@@ -77,12 +80,27 @@ test('the tool answers rather than throwing when there is nothing to search with
   assert.equal((await tool.handler()).ok, false)
 })
 
-test('the tool description tells a model what it costs and what it will not do', () => {
-  const [tool] = register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools
-  assert.match(tool.description, /PARETO FRONT/)
-  assert.match(tool.description, /maxAdapterCalls/)
-  assert.match(tool.description, /does NOT book/i)
-  assert.match(tool.description, /expand a Star Alliance preference/)
+test('the book tool answers rather than throwing when there is nothing to book with, and never books without confirm', async () => {
+  const [, tool] = register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools
+  assert.equal(tool.name, 'book_flight')
+  const r = await tool.handler({ offerIds: ['off_x'], passengers: [{ givenName: 'A', familyName: 'B', bornOn: '1990-01-01', gender: 'f', title: 'ms', email: 'a@b.com', phone: '+491701234567' }] })
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /no flight source is configured for booking/)
+  // Even a request that is nonsense comes back as an answer, not an exception.
+  assert.equal((await tool.handler({})).ok, false)
+  assert.equal((await tool.handler()).ok, false)
+})
+
+test('the tool descriptions tell a model what each costs and what it will not do', () => {
+  const [search, book] = register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools
+  assert.match(search.description, /PARETO FRONT/)
+  assert.match(search.description, /maxAdapterCalls/)
+  assert.match(search.description, /does NOT book/i)
+  assert.match(search.description, /expand a Star Alliance preference/)
+  assert.match(book.description, /WITHOUT confirm: true THIS NEVER BOOKS/)
+  assert.match(book.description, /ATLAS_FLIGHTS_ALLOW_LIVE_BOOKING/)
+  assert.match(book.description, /ATLAS_FLIGHTS_MAX_BOOKING_EUR/)
+  assert.match(book.description, /never logged/)
 })
 
 test('THE SCHEMA IS ONE A REAL McpServer ACCEPTS — a bad one is skipped silently at boot', async () => {
@@ -96,15 +114,16 @@ test('THE SCHEMA IS ONE A REAL McpServer ACCEPTS — a bad one is skipped silent
     assert.fail('the MCP SDK is not installed in api/node_modules — run `npm ci` in api/ (CI does)')
   }
   const server = new McpServer({ name: 'test', version: '0' })
-  const [tool] = register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools
-  assert.doesNotThrow(() => server.registerTool(tool.name, { description: tool.description, inputSchema: tool.inputSchema }, async () => ({ content: [] })))
+  for (const tool of register({ name: 'flight-search', dir: ADDON_DIR, repoRoot: REPO_ROOT }).mcpTools)
+    assert.doesNotThrow(() => server.registerTool(tool.name, { description: tool.description, inputSchema: tool.inputSchema }, async () => ({ content: [] })), `${tool.name}'s schema was rejected`)
 })
 
-test('BOX-LOCAL: the tool is not in core\'s remote knowledge surface', () => {
+test('BOX-LOCAL: neither tool is in core\'s remote knowledge surface', () => {
   const tools = fs.readFileSync(path.join(REPO_ROOT, 'api', 'src', 'mcp', 'tools.mjs'), 'utf-8')
   const knowledge = /KNOWLEDGE_TOOLS = new Set\(\[([^\]]*)\]/.exec(tools)
   assert.ok(knowledge, 'KNOWLEDGE_TOOLS could not be found in api/src/mcp/tools.mjs')
   assert.ok(!knowledge[1].includes('search_flights'), 'search_flights was added to the audited remote surface — that is a deliberate change, not an addon side effect')
+  assert.ok(!knowledge[1].includes('book_flight'), 'book_flight was added to the audited remote surface — a tool that can SPEND MONEY must never reach it as a side effect of an addon')
 })
 
 test('the addon adds no npm dependency of its own', () => {

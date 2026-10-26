@@ -100,6 +100,26 @@ export const connectionRules = () => ({
  */
 export const bagFeeEstimate = () => num('ATLAS_FLIGHTS_CHECKED_BAG_FEE', 55)
 
+/**
+ * The two locks on `book_flight` actually spending money, independent of
+ * `confirm: true`:
+ *
+ *   · a LIVE token only books when the operator has turned this on here — a
+ *     live credential and a caller's `confirm: true` are each necessary and
+ *     together still not sufficient
+ *   · a total over the EUR ceiling is refused outright — the backstop against
+ *     a currency mixup or a mis-typed passenger count turning into real spend
+ *
+ * Neither is implied by enabling the addon or by having a live token: both
+ * have to be unlatched by a human editing `.env`.
+ */
+export const liveBookingAllowed = (env = process.env) => (env.ATLAS_FLIGHTS_ALLOW_LIVE_BOOKING || '').trim() === '1'
+
+/** Only enforced when the booking is actually priced in EUR — there is no FX
+ *  table here, so a different currency is reported as unverified, not waved
+ *  through silently (see book.mjs). */
+export const maxBookingEur = () => num('ATLAS_FLIGHTS_MAX_BOOKING_EUR', 1500)
+
 /** Where the tool points an operator with no token. Kept in one place so the
  *  status block, the empty answer and the README cannot drift apart. */
 export const SETUP_HINT =

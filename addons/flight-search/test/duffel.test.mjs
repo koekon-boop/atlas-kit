@@ -16,9 +16,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { duffelAdapter, duffelPassengers, normalizeAirport, normalizeOffer, offerRequestBody } = await import('../api/adapters/duffel.mjs')
-const { adapterStatus, configuredAdapters, loadAdapters } = await import('../api/adapters/index.mjs')
-const { offersResponse, rawOfferRequest, stubFetch } = await import('./fixtures/duffel.mjs')
+const { duffelAdapter, duffelPassengers, normalizeAirport, normalizeOffer, offerRequestBody, orderRequestBody } = await import('../api/adapters/duffel.mjs')
+const { adapterStatus, bookableAdapters, configuredAdapters, loadAdapters } = await import('../api/adapters/index.mjs')
+const { offer, offerResponse, offersResponse, orderResponse, rawOfferRequest, segment, stubFetch } = await import('./fixtures/duffel.mjs')
 
 const TOKEN = { DUFFEL_API_TOKEN: 'duffel_test_notARealToken' }
 const offers = () => rawOfferRequest().data.offers
@@ -190,4 +190,115 @@ test('a source whose status() throws is reported, not propagated', () => {
 test('offersResponse is the shape the adapter reads, so the fixture cannot drift from it', async () => {
   const a = duffelAdapter({ env: TOKEN, fetchImpl: async () => new Response(JSON.stringify(offersResponse([])), { status: 200 }) })
   assert.equal((await a.search({ slices: [{ origin: 'A', destination: 'B' }] })).ok, true)
+})
+
+/* --- getOffer: the re-verify step book_flight runs before ever booking ---- */
+
+test('getOffer re-fetches ONE offer by id, with the offer\'s own passenger ids', async () => {
+  const off = offer({ id: 'off_recheck', amount: 500, passengers: [{ id: 'pas_a' }, { id: 'pas_b' }], slices: [[segment({ from: 'BER', to: 'HND', depart: '2026-10-15T11:00:00', arrive: '2026-10-16T05:45:00', minutes: 705 })]] })
+  const fetchImpl = async (url, init) => {
+    assert.equal(init.method, 'GET')
+    assert.match(url, /^https:\/\/api\.duffel\.com\/air\/offers\/off_recheck$/)
+    assert.equal(init.headers.Authorization, 'Bearer duffel_test_notARealToken')
+    assert.equal(init.headers['Duffel-Version'], 'v2')
+    return new Response(JSON.stringify(offerResponse(off)), { status: 200 })
+  }
+  const a = duffelAdapter({ env: TOKEN, fetchImpl })
+  const r = await a.getOffer('off_recheck')
+  assert.equal(r.ok, true)
+  assert.equal(r.ticket.id, 'off_recheck')
+  assert.equal(r.ticket.price.total, 500)
+  assert.deepEqual(r.passengerIds, ['pas_a', 'pas_b'])
+})
+
+test('getOffer on a PARTIAL or withdrawn offer answers "not bookable", never a half ticket', async () => {
+  const off = offer({ id: 'off_gone', amount: 1, partial: true, slices: [[segment({ from: 'BER', to: 'HND' })]] })
+  const a = duffelAdapter({ env: TOKEN, fetchImpl: async () => new Response(JSON.stringify(offerResponse(off)), { status: 200 }) })
+  const r = await a.getOffer('off_gone')
+  assert.equal(r.ok, false)
+  assert.match(r.error, /no longer bookable/)
+})
+
+test('getOffer: no token refuses before any network call', async () => {
+  let called = false
+  const a = duffelAdapter({ env: {}, fetchImpl: () => { called = true } })
+  assert.deepEqual(await a.getOffer('off_x'), { ok: false, error: 'DUFFEL_API_TOKEN is not set' })
+  assert.equal(called, false)
+})
+
+test('getOffer: every failure is an answer with a reason, never a throw', async () => {
+  const cases = [
+    [async () => new Response(JSON.stringify({ errors: [{ title: 'Not Found', message: 'The offer does not exist' }] }), { status: 404 }), /Duffel HTTP 404: Not Found — The offer does not exist/],
+    [async () => new Response('<html>', { status: 500 }), /body that is not JSON/],
+    [() => { throw Object.assign(new Error('aborted'), { name: 'TimeoutError' }) }, /no answer within \d+ ms/],
+  ]
+  for (const [fetchImpl, re] of cases) {
+    const a = duffelAdapter({ env: TOKEN, fetchImpl })
+    const r = await a.getOffer('off_x')
+    assert.equal(r.ok, false)
+    assert.match(r.error, re)
+  }
+})
+
+/* --- createOrder: the one call that actually spends money ----------------- */
+
+test('createOrder sends the Duffel order body and returns the booking reference', async () => {
+  const passengers = [{ offerPassengerId: 'pas_a', title: 'mrs', gender: 'f', givenName: 'Erika', familyName: 'Musterfrau', bornOn: '1990-05-01', email: 'erika@example.com', phone: '+491701234567' }]
+  const fetchImpl = async (url, init) => {
+    assert.equal(url, 'https://api.duffel.com/air/orders')
+    assert.equal(init.method, 'POST')
+    const body = JSON.parse(init.body)
+    assert.equal(body.data.type, 'instant')
+    assert.deepEqual(body.data.selected_offers, ['off_book'])
+    assert.deepEqual(body.data.passengers, [{ id: 'pas_a', title: 'mrs', gender: 'f', given_name: 'Erika', family_name: 'Musterfrau', born_on: '1990-05-01', email: 'erika@example.com', phone_number: '+491701234567' }])
+    assert.deepEqual(body.data.payments, [{ type: 'balance', currency: 'EUR', amount: '420.89' }])
+    return new Response(JSON.stringify(orderResponse({ id: 'ord_1', reference: 'K6773F', liveMode: false, amount: '420.89', currency: 'EUR' })), { status: 201 })
+  }
+  const a = duffelAdapter({ env: TOKEN, fetchImpl })
+  const r = await a.createOrder({ offerId: 'off_book', amount: 420.89, currency: 'EUR', passengers })
+  assert.deepEqual(r, { ok: true, orderId: 'ord_1', bookingReference: 'K6773F', liveMode: false, amount: 420.89, currency: 'EUR' })
+})
+
+test('createOrder: no token refuses before any network call', async () => {
+  let called = false
+  const a = duffelAdapter({ env: {}, fetchImpl: () => { called = true } })
+  assert.deepEqual(await a.createOrder({ offerId: 'x', amount: 1, currency: 'EUR', passengers: [] }), { ok: false, error: 'DUFFEL_API_TOKEN is not set' })
+  assert.equal(called, false)
+})
+
+test('createOrder: every failure is an answer with a reason, never a throw', async () => {
+  const cases = [
+    [async () => new Response(JSON.stringify({ errors: [{ title: 'Insufficient balance' }] }), { status: 422 }), /Duffel HTTP 422: Insufficient balance/],
+    [async () => new Response('gateway error', { status: 502 }), /body that is not JSON/],
+    [() => { throw new Error('fetch failed') }, /Duffel order failed: fetch failed/],
+  ]
+  for (const [fetchImpl, re] of cases) {
+    const a = duffelAdapter({ env: TOKEN, fetchImpl })
+    const r = await a.createOrder({ offerId: 'x', amount: 1, currency: 'EUR', passengers: [] })
+    assert.equal(r.ok, false)
+    assert.match(r.error, re)
+  }
+})
+
+test('orderRequestBody is the mapping Duffel documents — a passenger\'s wire keys, and a balance payment', () => {
+  const body = orderRequestBody({
+    offerId: 'off_1',
+    amount: 99.5,
+    currency: 'EUR',
+    passengers: [{ offerPassengerId: 'pas_1', title: 'mr', gender: 'm', givenName: 'Max', familyName: 'Mustermann', bornOn: '1985-01-01', email: 'max@example.com', phone: '+491701234567' }],
+  })
+  assert.deepEqual(body.data, {
+    type: 'instant',
+    selected_offers: ['off_1'],
+    passengers: [{ id: 'pas_1', title: 'mr', gender: 'm', given_name: 'Max', family_name: 'Mustermann', born_on: '1985-01-01', email: 'max@example.com', phone_number: '+491701234567' }],
+    payments: [{ type: 'balance', currency: 'EUR', amount: '99.5' }],
+  })
+})
+
+test('bookableAdapters keeps only CONFIGURED sources that actually support getOffer + createOrder', () => {
+  const full = loadAdapters({ env: TOKEN })
+  assert.equal(bookableAdapters(full).length, 1)
+  assert.equal(bookableAdapters(loadAdapters({ env: {} })).length, 0) // configured, but no token
+  const searchOnly = { name: 'other', label: 'other', status: () => ({ configured: true }), search: async () => ({ ok: true, tickets: [] }) }
+  assert.equal(bookableAdapters([searchOnly]).length, 0)
 })
