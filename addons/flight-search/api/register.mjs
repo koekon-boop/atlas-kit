@@ -1,21 +1,23 @@
 /* ------------------------------------------------------------------ *
  * `addons/flight-search` — the addon's whole registration surface.
  *
- * ONE hook and a status block: an `mcpTools` entry called `search_flights`, and
- * `status()` so `GET /api/addons` can say whether a source is configured. No
- * routes, no cron, no search leg, no evidence leg, no scorecard tiles — this
- * addon adds a way to ASK a question from a chat and touches no read path core
- * already had. Disable it and the kit is byte-identical to one that never had it
- * (docs/ADDONS.md). No routes also means no write route, so no bearer gate and
- * no Caddyfile block: there is nothing here for the browser to reach.
+ * ONE hook and a status block: two `mcpTools` entries, `search_flights` and
+ * `book_flight`, and `status()` so `GET /api/addons` can say whether a source
+ * is configured and whether live booking is unlocked. No routes, no cron, no
+ * search leg, no evidence leg, no scorecard tiles — this addon adds a way to
+ * ASK a question (and, now, act on one) from a chat and touches no read path
+ * core already had. Disable it and the kit is byte-identical to one that never
+ * had it (docs/ADDONS.md). No routes also means no write route, so no bearer
+ * gate and no Caddyfile block: there is nothing here for the browser to reach.
  *
  * ⚠️ BOX-LOCAL ON PURPOSE. Addon tools are registered on the local MCP surfaces
  * (dev/worker/control) and are deliberately NOT part of `KNOWLEDGE_TOOLS`, the
- * fixed audited set the remote HTTP connector serves. This one spends a supplier
- * budget against the operator's own Duffel account on input a caller controls —
- * exactly the kind of tool that surface exists to keep out. Putting it there
- * would be a separate, argued change to `api/src/mcp/tools.mjs`, not a side
- * effect of enabling an addon.
+ * fixed audited set the remote HTTP connector serves. These spend a supplier
+ * budget — and `book_flight` spends real money, test-mode or live — against the
+ * operator's own Duffel account on input a caller controls — exactly the kind
+ * of tool that surface exists to keep out. Putting either there would be a
+ * separate, argued change to `api/src/mcp/tools.mjs`, not a side effect of
+ * enabling an addon.
  *
  * 🔴 REGISTER() MUST NOT THROW, AND MUST COST NOTHING WHEN UNCONFIGURED. There is
  * no token on most boxes and that is the expected state: nothing here reads the
@@ -25,7 +27,8 @@
  * ------------------------------------------------------------------ */
 import { createRequire } from 'node:module'
 import { adapterStatus, loadAdapters } from './adapters/index.mjs'
-import { bagFeeEstimate, connectionRules, limits, SETUP_HINT } from './config.mjs'
+import { bagFeeEstimate, connectionRules, limits, liveBookingAllowed, maxBookingEur, SETUP_HINT } from './config.mjs'
+import { bookFlight } from './book.mjs'
 import { searchFlights } from './search.mjs'
 
 /* `zod` is what the MCP SDK builds a tool's input schema from, and a bare import
@@ -70,6 +73,26 @@ IATA codes, so expand a Star Alliance preference into its carriers before callin
 If no source is configured the answer says so and tells the operator exactly what to do; that is not \
 an error and does not need a retry.`
 
+const BOOK_DESCRIPTION = `Book ONE option that search_flights already produced. Pass the offer id(s) from its \
+answer's booking.tickets[].offerId — one for a single ticket, two for a self-transfer split — plus every \
+traveller's details exactly as in their passport.
+
+WITHOUT confirm: true THIS NEVER BOOKS. It re-verifies each offer against Duffel (current price, expiry, \
+refund/change conditions) and answers with a PREVIEW of what confirming would do. Only confirm: true places \
+a real order. Offers expire within minutes of being found, so re-run search_flights first if much time passed.
+
+A split (two offerIds) is booked as TWO SEPARATE Duffel orders, one after the other, never in parallel. If \
+the second fails after the first succeeded, NOTHING is rolled back automatically — the answer says plainly \
+what is booked and what is not, and leaves what to do about a half-booked trip to a human.
+
+Runs in Duffel's TEST mode by default (a test booking is free, against Duffel's own fake balance, and never \
+touches a real airline). A LIVE token only books when the operator has set ATLAS_FLIGHTS_ALLOW_LIVE_BOOKING=1 \
+on the box AND confirm: true is passed — a live booking that total ATLAS_FLIGHTS_MAX_BOOKING_EUR (default \
+1500 EUR) or more is refused either way. Neither lock is implied by anything a caller passes.
+
+Passenger data goes straight through to Duffel and is never logged or written to disk; the answer itself \
+reports only names and the booking reference back, never a birth date, email or phone number.`
+
 export default function register() {
   const z = loadZod()
   const adapters = loadAdapters()
@@ -109,8 +132,24 @@ export default function register() {
     maxAdapterCalls: z.number().optional().describe('the search budget: supplier calls for this whole request (default 12, max 60). Every one costs the operator money'),
   }
 
+  const PASSENGER_SCHEMA = z && z.object({
+    givenName: z.string().describe('as in the passport'),
+    familyName: z.string().describe('as in the passport'),
+    bornOn: z.string().describe('YYYY-MM-DD'),
+    gender: z.enum(['m', 'f']),
+    title: z.enum(['mr', 'mrs', 'ms', 'miss', 'dr']),
+    email: z.string(),
+    phone: z.string().describe('E.164, e.g. "+491701234567"'),
+  })
+
+  const bookInputSchema = z && {
+    offerIds: z.array(z.string()).min(1).max(2).describe('the Duffel offer id(s) from one search_flights option — booking.tickets[].offerId. One for a single ticket, two for a self-transfer split (book the tight connection first)'),
+    passengers: z.array(PASSENGER_SCHEMA).min(1).describe('in the SAME order for every offerId — these are the same travellers on every ticket of a split'),
+    confirm: z.boolean().optional().describe('default false. Without it the tool only re-verifies price, expiry and conditions and returns a PREVIEW — it never books. Set true to actually place the order(s)'),
+  }
+
   return {
-    description: 'A flight search agent as an MCP tool: fans one trip request out over dates, nearby airports and split-ticket combinations, checks every connection for feasibility, and answers with a Pareto front of 3–5 options instead of a cheapest-first list. Needs a Duffel API token; inert without one.',
+    description: 'A flight search agent as an MCP tool: fans one trip request out over dates, nearby airports and split-ticket combinations, checks every connection for feasibility, and answers with a Pareto front of 3–5 options instead of a cheapest-first list. A second tool, book_flight, books an option it found — preview by default, real orders only with confirm: true. Needs a Duffel API token; inert without one.',
 
     mcpTools: inputSchema
       ? [
@@ -123,6 +162,12 @@ export default function register() {
             // reason — but the MCP wrapper catches anyway, as core's does.
             handler: (args) => searchFlights(args, { adapters }),
           },
+          {
+            name: 'book_flight',
+            description: BOOK_DESCRIPTION,
+            inputSchema: bookInputSchema,
+            handler: (args) => bookFlight(args, { adapters }),
+          },
         ]
       : undefined,
 
@@ -133,6 +178,7 @@ export default function register() {
       const ready = sources.some((s) => s.configured)
       return {
         tool: inputSchema ? 'search_flights' : 'NOT REGISTERED — zod could not be resolved from core; run npm ci in api/',
+        bookingTool: inputSchema ? 'book_flight' : 'NOT REGISTERED — zod could not be resolved from core; run npm ci in api/',
         sources,
         ready,
         ...(ready ? {} : { howToEnable: SETUP_HINT }),
@@ -140,6 +186,8 @@ export default function register() {
         maxResults: limits().results,
         connectionFloorsMinutes: connectionRules(),
         checkedBagFeeEstimate: bagFeeEstimate(),
+        liveBookingAllowed: liveBookingAllowed(),
+        maxBookingEur: maxBookingEur(),
       }
     },
   }
