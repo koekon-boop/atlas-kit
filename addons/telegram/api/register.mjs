@@ -16,7 +16,8 @@
  * therefore called far more than once per box. Starting the poll loop
  * unconditionally would start one getUpdates consumer per session, and
  * Telegram allows exactly one; `createPoller()` claims a pidfile lock and
- * every process that loses the race simply does not poll.
+ * every process that loses the race does not poll (it only re-tries the claim,
+ * to take over when the owner dies).
  *
  * 🔴 THE SEND ROUTE GATES ITSELF, like every addon write (docs/ADDONS.md), with
  * the constant-time DASHBOARD_BEARER_TOKEN check core uses.

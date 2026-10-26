@@ -56,12 +56,31 @@ things follow:
    `api/src/mcp/*.mcp.json`). If `register()` started the poll loop unconditionally,
    every concurrent session would start its own consumer. Instead `api/poller.mjs`
    claims a small pidfile lock (`<AGENT_LOCAL_DIR>/telegram-poller.lock`) before
-   polling; a process that loses the race — a stale lock is reclaimed by checking
-   whether its pid is still alive — simply does not poll. `GET /api/addons` shows
+   polling; a process that loses the race does not poll. `GET /api/addons` shows
    `telegram.status.poller.owner`: `true` in the process that actually consumes
    updates, `false` (with a reason) in every other one. This is an implementation
    detail of this addon, not a documented core seam — it exists because this
    specific repo starts many short-lived processes that all load addons.
+
+   How the lock stays race-free when ~10 processes start within the same second
+   (a `scripts/serve.sh restart`) — each rule closes a hole that let two processes
+   poll at once on 2026-10-26:
+   - **Created complete or not at all**: written to a temp file, then hard-linked
+     into place (`link()` fails atomically if the lock exists). A competing claimant
+     can never read an empty or half-written lock.
+   - **Unreadable means held**: a lock that does not parse counts as held until it
+     has been unreadable for 10 s. It is never deleted just because it failed to parse.
+   - **Reclaim under a mutex**: a stale lock (dead pid) is deleted only by the
+     claimant holding `telegram-poller.lock.reclaim`, after checking again that it
+     is still stale. Two claimants that saw the same dead lock can no longer both
+     delete it (the second delete used to hit the first one's fresh lock).
+   - **Failover**: a process that lost re-tries the claim every 30 s, so when the
+     owner dies (e.g. the stdio MCP server of a closed agent session), another
+     process takes over without a restart.
+   - **Yield on conflict**: an owner whose `getUpdates` gets `409 Conflict` checks
+     the lock again. If it names another live process, this one stops polling
+     instead of fighting. If the lock is still its own, the conflict comes from
+     outside this box (see point 1), and it just backs off.
 
 The offset (which updates Telegram may discard as already-delivered) is persisted
 to `<AGENT_LOCAL_DIR>/telegram-offset.json` **after every individual update is
@@ -113,8 +132,9 @@ update that was in flight, never the whole batch.
 - A session **remembers across messages** until it is closed or its tmux dies; then
   the next message creates a fresh one (the old context is not carried over).
 - **At most one getUpdates consumer on this box** — see [above](#long-polling-not-a-webhook).
-  A restart briefly holds the old lock until it is detected as stale (its pid is
-  dead) on the next attempt; there is no gap where two processes poll at once.
+  A restart's old lock is detected as stale (its pid is dead) and exactly one new
+  process reclaims it. If the owner dies later, another process takes over within
+  about 30 s; messages sent in that gap wait at Telegram and are not lost.
 - Redelivery on a crash is possible but narrow: at most the ONE update that was
   mid-flight when the process died, never a whole batch (offset is persisted after
   each update, not once per poll).
@@ -603,7 +623,8 @@ variables) and the counters:
 
 | signal | meaning |
 |---|---|
-| `status.poller.owner` is `false` everywhere | the API process never won the singleton lock — check `<AGENT_LOCAL_DIR>/telegram-poller.lock` for a stale pid from a process that is actually gone, or that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
+| `status.poller.owner` is `false` everywhere | the API process does not hold the singleton lock. That is normal if another process on the box (an MCP server) does: check the pid in `<AGENT_LOCAL_DIR>/telegram-poller.lock`. A dead pid is taken over within ~30 s. Also check that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
+| `getUpdates failed: Conflict: terminated by other getUpdates request` in the log | a second consumer on the same token. If the lock names another live process, this process yields after the first conflict (log line `yielding the poll`). If it keeps repeating, the other consumer is outside this box's lock: another bot process or another machine using the same token |
 | `status.poller.lastError` set, rising `pollCount` with no messages arriving | `getUpdates` itself is failing — a bad token answers `401`; `install.sh --check`'s `getMe` probe catches that early |
 | `dropped` rising | the sender's chat id is not in `TELEGRAM_ALLOWED_CHAT_IDS` (or the home chat) |
 | `audioReceived` rising but `transcribed` not | see the voice-note table above: `transcribeErrors` → speech recognition (`addons/voice/install.sh --check`); `mediaErrors` → the log line has the reason (an expired setup or a network hiccup) |
