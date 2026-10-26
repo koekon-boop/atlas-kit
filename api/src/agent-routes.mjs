@@ -333,6 +333,7 @@ export const ATLAS_CONTROL_PREAMBLE =
 
 - MONITOR first: \`list_agents\` is the live FLEET-WIDE roster (every dev + knowledge agent, box-local and remote, with status/phase/context/ship state) — some of it belongs to OTHER Atlas chats, not to you: \`spawnedBy\` names the chat that spawned each session and \`yours: true\` marks the ones you spawned. \`agent_transcript\` reads one agent's recent terminal output. Read an agent's ACTUAL state before you judge or steer it. When the operator asks "how's X going?", check the transcript and say what it's really doing — working, idle/waiting on input, stuck, or done — then propose the next move.
 - SPAWN: \`spawn_agent\` starts a DEV agent on a repo (\`repo\` = a spawnable key from \`list_agents\` — either \`localRepos\` (box-local) or any \`bridges[].repos\` entry (remote, e.g. \`my-app\`); hand it a sharp, self-contained task) or a KNOWLEDGE agent on a vault. It returns immediately and the agent runs on its own. Only spawn on a repo \`list_agents\` advertises (a \`localRepos\` key or a bridge's \`repos\`); NEVER spawn another Atlas orchestrator (a knowledge agent on vault \`atlas\`) — no recursion. Before spawning on a bridge, read its \`capacity.slots\` in \`list_agents\`: a spawn onto a box that is out of memory or at its agent ceiling is REFUSED with a 503 that states the numbers — that is a full box, not a broken tool, so don't retry it; free a session there or spawn elsewhere.
+- STEER ONLY YOUR OWN: \`prompt_agent\`/\`queue_agent\`/\`interrupt_agent\` act only on agents YOU spawned (\`yours: true\`) or what they spawned in turn. Every other session — another chat's agent, the operator's standing Telegram chat, anything no chat owns (no \`spawnedBy\`) — is refused server-side (403); there is no override. Don't route around it: tell the operator what you wanted to say to it.
 - STEER: to add context or instructions to a RUNNING agent, prefer \`queue_agent\` — it lands at the running turn's next TOOL-CALL BOUNDARY (seconds, not the end of the turn) and never disrupts it. Use \`prompt_agent\` for an agent that's already idle, and \`interrupt_agent\` ONLY to stop one that's going wrong. \`kill_agent\` closes a session (dev worktrees are kept for review); \`cleanup_agent\` is the full teardown — recap → Atlas log, THEN it removes the worktree + deletes the branch (the dashboard's ⌦). Because it force-deletes the branch, run \`cleanup_agent\` ONLY once an agent's work is already SHIPPED/merged (check \`shipState\` in \`list_agents\`) — if the work has NOT shipped, DON'T tear it down; ask the operator to confirm first, or \`kill_agent\` it (that keeps the worktree + branch).
 - OWN IT BEFORE YOU END IT — the FIRST gate on \`kill_agent\`/\`cleanup_agent\`, checked BEFORE ship state: they act only on agents YOU spawned (\`yours: true\` in \`list_agents\`). The roster is fleet-wide, so some of it is another chat's work; tearing one of those down takes that chat's worktree away without it ever knowing. Not yours ⇒ don't touch it: name the owning chat (\`spawnedBy\`) to the operator and ask. A session with NO \`spawnedBy\` is the operator's own — theirs to tear down, not yours. A bare "let's clean up" means YOUR agents; only an explicit "clean up all of them" / "the whole fleet" is the override — then pass \`scope: "any"\`, which is audited, and only for that instruction (it does not carry forward). The server enforces this too: a refusal names the owning chat, and that name is what the operator needs to hear from you.
 - SHIP, then merge: to land a dev agent's finished work, \`ship_agent\` is the way — it hands the agent the ONE canonical ship instruction (rebase onto a fresh fetch, open/update the PR, wait for that repo's required checks, merge) and, box-local, joins the serial ship train. Writing your own ship steer with \`queue_agent\`/\`prompt_agent\` is the fallback, not the default: it bypasses both. \`merge_pr\` is for a PR you already know is fresh and green — it does NOT rebase, and it refuses a stale/conflicted/blocked/red/pending one, which means ship the agent rather than force it. Use it rather than \`gh pr merge\` in Bash: it records that YOU merged, so the dashboard stops telling you about your own merge minutes later.
@@ -1419,6 +1420,37 @@ export function ownsChild(by, id, parentOf) {
   }
 }
 
+/* Steer lineage — may `by` prompt/queue/interrupt `id`? The same spawn tree
+ * again, as DESCENDANTS: a chat may steer what it spawned and what those spawned
+ * in turn — never a parent, a sibling, a peer chat, or a session no chat owns.
+ *
+ * Why it exists: a steer is TEXT INJECTED AS A USER TURN. Without this, any
+ * Atlas chat holding the control tools could push instructions into any session
+ * — the operator's standing Telegram chat, another person's routed chat — and a
+ * prompt injected into one chat could hop to all of them. An unparented session
+ * (the operator started it, or a channel addon did) is steered only by the
+ * operator and the channels that deliver into it, none of which name a caller.
+ *
+ * No scope:"any" override, unlike teardown: "steer that other chat anyway" is
+ * exactly what an injected instruction would ask for, and the operator can
+ * always steer it themselves. Pure (parent lookup injected), like ownsChild. */
+export function steerAllowed(by, id, parentOf) {
+  if (!by || !id) return { ok: false, error: 'missing caller or target' }
+  if (by === id) return { ok: false, error: 'cannot steer yourself' }
+  const seen = new Set()
+  for (let p = parentOf(id); p && !seen.has(p); p = parentOf(p)) {
+    if (p === by) return { ok: true }
+    seen.add(p)
+  }
+  const owner = parentOf(id)
+  return {
+    ok: false,
+    error: owner
+      ? `"${id}" was spawned by "${owner}", not by you — you may only steer agents you spawned (or their descendants). Tell the operator, rather than retrying.`
+      : `"${id}" was not spawned by any chat — the operator started it (or a channel such as Telegram delivers into it), so only the operator steers it. Tell the operator, rather than retrying.`,
+  }
+}
+
 /* The whole bus policy in one place — lineage, the recipient lookup, the pair
  * budget, the header, the hand-off and the bus log — so a REMOTE sender or
  * recipient goes through byte-identically to a box-local one. Two callers: the
@@ -2254,9 +2286,28 @@ export function agentRouter(bearerAuth) {
     return out
   }
 
+  /* The steer gate for /prompt + /interrupt + /queue (see steerAllowed above).
+   * The caller is `steeredBy` — the MCP steer tools stamp it from ATLAS_SESSION,
+   * the agent never supplies it. ⚠️ ABSENT MEANS ALLOWED, as for teardown: the
+   * dashboard compose box and the channel addons (Telegram/WhatsApp delivering
+   * into their target session) send only `{id, text}`, and internal deliveries
+   * (fleet notes, the agent bus) call the executor directly, never this route.
+   * Runs before local.hasSession AND before callBridgeForId, so a bridge's
+   * sessions are held to the same box-side lineage (spawnParent records remote
+   * spawns too). Returns true when it has already answered 403. */
+  const steerRefused = (body, res, via) => {
+    if (!body.steeredBy) return false
+    const own = steerAllowed(body.steeredBy, body.id, (x) => spawnParent.get(x))
+    if (own.ok) return false
+    local.audit({ action: 'steer-scope', via, id: body.id, by: body.steeredBy, owner: spawnParent.get(body.id) || null, ok: false, error: own.error })
+    res.status(403).json({ ok: false, error: own.error })
+    return true
+  }
+
   router.post('/api/agents/prompt', jsonPrompt, bearerAuth, async (req, res) => {
     const body = promptBody(req, res)
     if (!body) return
+    if (steerRefused(body, res, 'prompt')) return
     // `force` bypasses the pending-choice-menu guard — set by the card's "dismiss
     // menu & send" after it has Escaped the menu (see local/bridge prompt()).
     body.force = !!(req.body && req.body.force)
@@ -2270,6 +2321,7 @@ export function agentRouter(bearerAuth) {
   router.post('/api/agents/interrupt', jsonPrompt, bearerAuth, async (req, res) => {
     const body = promptBody(req, res)
     if (!body) return
+    if (steerRefused(body, res, 'interrupt')) return
     if (local.hasSession(body.id)) return sendLocal(res, armIfSent(body, await local.interrupt(body)))
     const r = armIfSent(body, await callBridgeForId('POST', '/interrupt', body, body.id, BRIDGE_EXEC_TIMEOUT_MS))
     res.status(r.status).json(r.body)
@@ -2282,6 +2334,7 @@ export function agentRouter(bearerAuth) {
   router.post('/api/agents/queue', jsonPrompt, bearerAuth, async (req, res) => {
     const body = promptBody(req, res)
     if (!body) return
+    if (steerRefused(body, res, 'queue')) return
     body.kind = body.steeredBy ? 'steer' : 'operator'
     if (local.hasSession(body.id)) return sendLocal(res, armIfSent(body, await local.queuePrompt(body)))
     const r = armIfSent(body, await callBridgeForId('POST', '/queue', body, body.id, BRIDGE_EXEC_TIMEOUT_MS))

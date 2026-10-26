@@ -86,6 +86,9 @@ is the Atlas-agent pattern, including its **MCP control surface**: `list_agents`
 `agent_transcript`, `spawn_agent`, `prompt_agent`, `queue_agent`, `interrupt_agent`,
 `kill_agent`, `cleanup_agent`, plus `query_vault` (fuzzy full-text), `query_atlas`
 (exact relational/temporal queries over the typed layer) and `propose_task`.
+A chat steers (`prompt`/`queue`/`interrupt`) and tears down only the agents it spawned —
+enforced server-side, the operator's own dashboard and channels unscoped
+(`docs/PROTOCOLS.md` §1, §3).
 
 Agents can also talk to **each other**: `agent-msg <id> "<text>"` is async peer mail,
 bounded by the spawn lineage (parent / child / sibling) and a per-pair send budget, landing

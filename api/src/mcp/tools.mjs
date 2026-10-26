@@ -682,11 +682,17 @@ function registerAgentControl(server) {
   // operator's own input — it lands in the transcript as an ordinary user turn and
   // is otherwise indistinguishable. Same ATLAS_SESSION the spawn lineage
   // uses; absent (→ untagged) for anything but the orchestrator's MCP child.
+  // It is also the CALLER the server scopes the steer by: only this chat's own
+  // descendants are accepted (steerAllowed in agent-routes.mjs), anything else is
+  // a 403.
   const steerBody = (id, text) => {
     const body = { id, text }
     if (process.env.ATLAS_SESSION) body.steeredBy = process.env.ATLAS_SESSION
     return body
   }
+
+  const STEER_SCOPE =
+    "ONLY for agents YOU spawned (`yours: true` in list_agents) or what they spawned in turn: any other session — another chat's agent, the operator's standing Telegram chat, one no chat owns — is refused server-side (403, no override). Tell the operator instead of retrying."
 
   // This orchestrator's own session id, when it has one — the same stamp the
   // spawn lineage and the steers use. Used to mark which sessions (including a
@@ -832,7 +838,7 @@ function registerAgentControl(server) {
     'prompt_agent',
     {
       description:
-        'Send a message to an IDLE agent (its next turn) — give it more work, or answer its question once it has finished its current turn. For an agent that is mid-run, use queue_agent (delivered at its next idle) or interrupt_agent (stops it now).',
+        'Send a message to an IDLE agent (its next turn) — give it more work, or answer its question once it has finished its current turn. For an agent that is mid-run, use queue_agent (delivered at its next idle) or interrupt_agent (stops it now). ' + STEER_SCOPE,
       inputSchema: { id: z.string(), text: z.string().describe('the message to deliver') },
     },
     tool(({ id, text }) => apiPost('/api/agents/prompt', steerBody(id, text))),
@@ -842,7 +848,7 @@ function registerAgentControl(server) {
     'queue_agent',
     {
       description:
-        "Park a message for an agent; the dashboard delivers it automatically at the agent's next idle (never mid-turn). The GENTLE way to add context or instructions to a busy agent without disrupting its current turn — prefer this over interrupt_agent.",
+        "Park a message for an agent; the dashboard delivers it automatically at the agent's next idle (never mid-turn). The GENTLE way to add context or instructions to a busy agent without disrupting its current turn — prefer this over interrupt_agent. " + STEER_SCOPE,
       inputSchema: { id: z.string(), text: z.string() },
     },
     tool(({ id, text }) => apiPost('/api/agents/queue', steerBody(id, text))),
@@ -852,7 +858,7 @@ function registerAgentControl(server) {
     'interrupt_agent',
     {
       description:
-        "Stop an agent's in-flight turn (Escape) and immediately steer it with new instructions — disruptive; use ONLY when the agent is going wrong or must change course now. To add context without interrupting, use queue_agent.",
+        "Stop an agent's in-flight turn (Escape) and immediately steer it with new instructions — disruptive; use ONLY when the agent is going wrong or must change course now. To add context without interrupting, use queue_agent. " + STEER_SCOPE,
       inputSchema: { id: z.string(), text: z.string() },
     },
     tool(({ id, text }) => apiPost('/api/agents/interrupt', steerBody(id, text))),

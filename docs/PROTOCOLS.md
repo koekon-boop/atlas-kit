@@ -34,6 +34,33 @@ Five operations act on a live session, each with a different disruption profile:
 | **merge** | `mergePr()` — `agent-local.mjs` | Pre-flights the PR server-side (`merge-preflight.mjs`) and **refuses a stale / conflicted / blocked / red / checks-pending one with the state named**; on pass, runs `gh pr merge --merge` in the session's repo checkout and records who merged. Box-local only. `force: true` skips the pre-flight, audited as such. Neither `kill` nor `cleanup` ever merges anything. | You already know the PR is fresh and green. Otherwise **ship** the agent — merging does not rebase. |
 | **cleanup** | `cleanup()` — `agent-local.mjs` | Same graceful recap/ingest path as `kill`, but sets `s.lc.cleanupOnClose = true` so the final `REAP` act (`ACTS[ACT.REAP]`) **also** calls `removeAgentArtifacts()` (line 2910) — `git worktree remove --force` + `git branch -D`. Irreversible from inside the runtime. | Only once the work is actually merged/abandoned — see [§3](#3-cleanup-gating). |
 
+**Who may steer — own descendants only.** A steer is text injected as a user turn, so
+`POST /api/agents/{prompt,queue,interrupt}` scope it by the caller: `steeredBy`, the
+calling chat's session id, stamped by the MCP `prompt_agent`/`queue_agent`/`interrupt_agent`
+tools from `ATLAS_SESSION` (the model never supplies it). A caller may steer only
+sessions it spawned, or what those spawned in turn — `steerAllowed()` in
+`agent-routes.mjs`, walking the same spawn tree as [§3](#3-cleanup-gating)'s teardown gate.
+Everything else — a peer chat's agent, a parent, the operator's standing Telegram chat,
+any session with no spawn parent — is a **403** naming the owner (or saying no chat owns
+it), and the refusal is a `steer-scope` line in `audit.log`. There is **no** `scope:"any"`
+override: "steer that other chat anyway" is exactly what an injected instruction would
+ask for, and the operator can always steer it directly.
+
+- **`steeredBy` absent means allowed**, exactly as before: the dashboard's compose box, the
+  Telegram/WhatsApp bridges delivering into their target session and Hermes'
+  `/api/agents/revive` name no caller. Fleet notes and agent↔agent mail
+  ([§7](#7-the-agentagent-message-bus)) call the executor directly, and `claude-login`
+  notifies through `/api/telegram/send` — none of them goes through these routes.
+- **Bridges are covered by the box.** The gate runs before `callBridgeForId`, and
+  `spawnParent` records remote spawns too, so a bridge session is held to the same
+  lineage before anything is forwarded. A bridge's own `/prompt|/queue|/interrupt` take
+  only the bridge bearer, which no agent holds.
+- **What it does not bind:** a session that reads `DASHBOARD_BEARER_TOKEN` off disk and
+  calls the route itself without `steeredBy`. That is the teardown gate's limit too —
+  closing it means agents no longer sharing the operator's bearer.
+
+Pinned by `api/test/agent-steer-scope.test.mjs`.
+
 `abortClose()` (`agent-local.mjs:2972`) undoes a wrong kill/cleanup press — but **only**
 while the session is still in `ingesting` (re-interrupts the recap/ingest turn and
 restores the live lifecycle state). Once `ingested`/`reaping` have started (the Atlas
