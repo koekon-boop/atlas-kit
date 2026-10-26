@@ -4,7 +4,11 @@
  *
  * What this pins:
  *   · claimSingleton: exclusive create, a stale lock (dead pid) is reclaimed, a
- *     live one is respected — never throws;
+ *     live one is respected — never throws; an EMPTY or PARTIAL lock is HELD (never
+ *     deleted for failing to parse) until it is old; and under real concurrency —
+ *     separate processes released at the same instant, on no lock / a dead-pid lock
+ *     / an old empty or partial lock — exactly ONE claimant wins (the 2026-10-26
+ *     incident: two processes both polled after a mass restart);
  *   · pollOnce drives ONE getUpdates call at the persisted offset, calls
  *     onUpdate per result IN ORDER, and persists the offset after EACH one (not
  *     once per batch);
@@ -12,17 +16,21 @@
  *   · createPoller claims the lock once, loses to an already-held one, and backs
  *     off (doubling, capped) between failed polls — driven deterministically via
  *     `_maxIterations` and a fake `sleep`, never a real timer or a hanging fetch;
+ *   · failover: a non-owner keeps re-trying the claim and takes over once the
+ *     owner's pid is dead; a 409 Conflict while the lock names another live pid
+ *     makes the poller yield instead of fighting;
  *   · onTick runs after every iteration (hit or miss) and a throw from it never
  *     stops the loop — the periodic hook register.mjs wires to a chat route's retry.
  * Run: node --test addons/telegram/test/poller.test.mjs
  * ------------------------------------------------------------------ */
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { claimSingleton, createPoller, nextBackoff, pollOnce, readOffset, releaseSingleton, saveOffset } from '../api/poller.mjs'
+import { CLAIM_RETRY_MS, claimSingleton, createPoller, nextBackoff, pollOnce, readOffset, releaseSingleton, saveOffset } from '../api/poller.mjs'
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'telegram-poller-test-'))
 after(() => fs.rmSync(TMP, { recursive: true, force: true }))
@@ -30,6 +38,9 @@ after(() => fs.rmSync(TMP, { recursive: true, force: true }))
 const ENV = { TELEGRAM_BOT_TOKEN: 'bot-token', TELEGRAM_HOME_CHAT_ID: '111', TELEGRAM_POLL_TIMEOUT_S: '1' }
 const lock = () => path.join(TMP, `lock-${crypto.randomUUID()}`)
 const off = () => path.join(TMP, `offset-${crypto.randomUUID()}.json`)
+/** A pid that certainly WAS a process and is now dead. */
+const deadPid = () => spawnSync(process.execPath, ['-e', '']).pid
+const age = (f, s = 60) => fs.utimesSync(f, new Date(Date.now() - s * 1000), new Date(Date.now() - s * 1000))
 
 /* --- claimSingleton --------------------------------------------------------- */
 
@@ -59,6 +70,95 @@ test('claimSingleton: an unwritable directory fails closed (false, never a throw
   fs.writeFileSync(path.join(TMP, 'not-a-real-file-as-a-dir'), 'x') // a FILE where the lock's parent dir should be
   assert.equal(claimSingleton(bogus, 1), false)
 })
+
+test('claimSingleton: an EMPTY or PARTIAL lock (a writer mid-write) is HELD — refused, and never deleted for failing to parse', () => {
+  // The incident path, deterministically: a claimant got EEXIST, read the owner's
+  // lock before its content was written, failed to parse it, deleted it as
+  // "stale", and claimed it too — two owners. Now a young unreadable lock is held.
+  for (const content of ['', '{"pid":', 'garbage']) {
+    const f = lock()
+    fs.writeFileSync(f, content)
+    assert.equal(claimSingleton(f, process.pid), false, `${JSON.stringify(content)} is held while young`)
+    assert.equal(fs.readFileSync(f, 'utf-8'), content, 'left exactly as it was')
+  }
+})
+
+test('claimSingleton: an unreadable lock that has been unreadable for a while (old mtime) is stale and reclaimed', () => {
+  const f = lock()
+  fs.writeFileSync(f, '')
+  age(f)
+  assert.equal(claimSingleton(f, process.pid), true)
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf-8')).pid, process.pid)
+})
+
+test('claimSingleton: the lock file is never visible empty — created complete (temp file + link), no temp or mutex left behind', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'atomic-'))
+  const f = path.join(dir, 'telegram-poller.lock')
+  assert.equal(claimSingleton(f, process.pid), true)
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf-8')).pid, process.pid)
+  fs.writeFileSync(f, JSON.stringify({ pid: deadPid() }))
+  assert.equal(claimSingleton(f, process.pid), true, 'stale → reclaimed')
+  assert.deepEqual(fs.readdirSync(dir), ['telegram-poller.lock'])
+})
+
+test('claimSingleton: a reclaim mutex left by a crashed reclaimer only blocks while young, then is broken', () => {
+  const f = lock()
+  fs.writeFileSync(f, JSON.stringify({ pid: deadPid() }))
+  fs.writeFileSync(`${f}.reclaim`, '1')
+  assert.equal(claimSingleton(f, process.pid), false, 'someone is reclaiming right now — let them')
+  age(`${f}.reclaim`)
+  assert.equal(claimSingleton(f, process.pid), false, 'this attempt breaks the abandoned mutex…')
+  assert.equal(fs.existsSync(`${f}.reclaim`), false)
+  assert.equal(claimSingleton(f, process.pid), true, '…and the next retry reclaims the lock')
+})
+
+/* --- claimSingleton under real concurrency ------------------------------------ *
+ * N separate node processes, each released at the same wall-clock instant, each
+ * calling claimSingleton() once on the SAME lock and then staying ALIVE (a dead
+ * winner would just be a stale lock) until every one has answered.            */
+
+const POLLER_URL = new URL('../api/poller.mjs', import.meta.url).href
+const CLAIMANT = `
+  import { claimSingleton } from ${JSON.stringify(POLLER_URL)}
+  const at = Number(process.env.START_AT)
+  while (Date.now() < at) {}
+  process.stdout.write(claimSingleton(process.env.LOCK) ? 'owner' : 'not')
+  process.stdin.resume()
+  process.stdin.on('end', () => process.exit(0))
+`
+
+async function race(lockFile, n = 8) {
+  const START_AT = String(Date.now() + 700)
+  const kids = Array.from({ length: n }, () => spawn(process.execPath, ['--input-type=module', '-e', CLAIMANT], { env: { ...process.env, LOCK: lockFile, START_AT } }))
+  const answers = await Promise.all(kids.map((k) => new Promise((resolve, reject) => {
+    let out = ''
+    k.stdout.on('data', (d) => { out += d; if (out === 'owner' || out === 'not') resolve({ pid: k.pid, out }) })
+    k.on('exit', (code) => reject(new Error(`claimant exited (${code}) before answering: ${out}`)))
+  })))
+  const owners = answers.filter((a) => a.out === 'owner')
+  const holder = JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid
+  await Promise.all(kids.map((k) => new Promise((r) => { k.on('exit', r); k.stdin.end() })))
+  return { owners, holder }
+}
+
+for (const [name, seed] of [
+  ['no lock at all', () => {}],
+  ['a dead-pid lock (the restart case: every claimant sees it stale at once)', (f) => fs.writeFileSync(f, JSON.stringify({ pid: deadPid(), startedAt: new Date().toISOString() }))],
+  ['an old EMPTY lock', (f) => { fs.writeFileSync(f, ''); age(f) }],
+  ['an old PARTIAL lock', (f) => { fs.writeFileSync(f, '{"pid":'); age(f) }],
+]) {
+  test(`claimSingleton race: ${name} + 8 concurrent claimants → exactly ONE owner, and the lock names it (5 rounds)`, async () => {
+    for (let round = 0; round < 5; round++) {
+      const dir = fs.mkdtempSync(path.join(TMP, 'race-'))
+      const f = path.join(dir, 'telegram-poller.lock')
+      seed(f)
+      const { owners, holder } = await race(f)
+      assert.equal(owners.length, 1, `round ${round}: ${owners.length} owners`)
+      assert.equal(holder, owners[0].pid, 'the lock names the one owner')
+      assert.deepEqual(fs.readdirSync(dir), ['telegram-poller.lock'], 'no temp file or reclaim mutex left behind')
+    }
+  })
+}
 
 test('releaseSingleton: removes only a lock this pid still owns', () => {
   const f = lock()
@@ -169,10 +269,12 @@ test('createPoller: not the owner (lock already held by a live, FOREIGN pid) →
   // process.ppid is a real, live, but foreign pid from this test's point of view.
   fs.writeFileSync(lockFile, JSON.stringify({ pid: process.ppid, startedAt: new Date().toISOString() }))
   const calls = []
-  const p = createPoller({ env: ENV, fetch: async (u) => (calls.push(u), { ok: true, json: async () => ({ ok: true, result: [] }) }), log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, _maxIterations: 3 })
+  const sleeps = []
+  const p = createPoller({ env: ENV, fetch: async (u) => (calls.push(u), { ok: true, json: async () => ({ ok: true, result: [] }) }), log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, sleep: (ms) => (sleeps.push(ms), Promise.resolve()), _maxIterations: 3 })
   await p.ready
   assert.equal(p.status().owner, false)
   assert.equal(calls.length, 0, 'never even calls getUpdates when it lost the race')
+  assert.deepEqual(sleeps, [CLAIM_RETRY_MS, CLAIM_RETRY_MS, CLAIM_RETRY_MS], 'it only waits and re-tries the claim, the owner being alive')
   assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid, process.ppid, 'the foreign lock is left untouched')
 })
 
@@ -249,4 +351,68 @@ test('createPoller: TELEGRAM_BOT_TOKEN missing means register.mjs never starts o
   const p = createPoller({ env: { ...ENV, TELEGRAM_BOT_TOKEN: '' }, fetch: async () => ({ ok: true, json: async () => ({ ok: true, result: [] }) }), log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, _maxIterations: 1 })
   await p.ready
   assert.equal(p.status().owner, true, 'createPoller itself still polls if asked to — the token gate lives in register.mjs')
+})
+
+/* --- failover and yield ----------------------------------------------------------- */
+
+test('createPoller failover: a non-owner re-tries the claim and takes over polling once the owner\'s pid is dead', async () => {
+  const lockFile = lock()
+  const offsetFile = off()
+  const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']) // a live, foreign owner
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: owner.pid, startedAt: new Date().toISOString() }))
+  const calls = []
+  const logs = []
+  const sleeps = []
+  const p = createPoller({
+    env: ENV, fetch: async (u) => (calls.push(u), { ok: true, json: async () => ({ ok: true, result: [] }) }), log: (m) => logs.push(m),
+    offsetFile, lockFile, onUpdate: async () => {}, claimRetryMs: 45,
+    // the owner dies during this process' SECOND claim-retry wait
+    sleep: async (ms) => { sleeps.push(ms); if (sleeps.length === 2) await new Promise((r) => { owner.on('exit', r); owner.kill() }) },
+    _maxIterations: 4,
+  })
+  assert.equal(p.status().owner, false, 'lost at start — the owner is alive')
+  await p.ready
+  assert.deepEqual(sleeps, [45, 45], 'one retry while the owner lived, the second found it dead')
+  assert.equal(p.status().owner, true)
+  assert.equal(calls.length, 2, 'the two remaining turns polled')
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid, process.pid)
+  assert.match(logs.join('\n'), /takes over/)
+  p.stop()
+})
+
+const conflict = async () => ({ ok: false, status: 409, json: async () => ({ ok: false, error_code: 409, description: 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running' }) })
+
+test('createPoller yield: a 409 Conflict while the lock names another LIVE pid stops polling here (no fight), and the foreign lock is left alone', async () => {
+  const lockFile = lock()
+  const offsetFile = off()
+  let n = 0
+  const sleeps = []
+  const logs = []
+  const p = createPoller({
+    env: ENV,
+    // the first poll succeeds; then another live process (ppid) holds the lock and polls too → 409
+    fetch: async (u) => { if (++n === 1) return { ok: true, json: async () => ({ ok: true, result: [] }) }; fs.writeFileSync(lockFile, JSON.stringify({ pid: process.ppid })); return conflict() },
+    log: (m) => logs.push(m), offsetFile, lockFile, onUpdate: async () => {}, sleep: (ms) => (sleeps.push(ms), Promise.resolve()), _maxIterations: 5,
+  })
+  assert.equal(p.status().owner, true)
+  await p.ready
+  assert.equal(n, 2, 'polled until the first Conflict, never again')
+  assert.equal(p.status().owner, false)
+  assert.deepEqual(sleeps, [CLAIM_RETRY_MS, CLAIM_RETRY_MS, CLAIM_RETRY_MS], 'no error backoff — straight to re-trying the claim')
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid, process.ppid, 'the other owner\'s lock untouched')
+  assert.match(logs.join('\n'), /yielding/)
+})
+
+test('createPoller: a 409 Conflict while the lock is still OURS (a consumer outside this box) → keep the lock, back off, keep polling', async () => {
+  const lockFile = lock()
+  const offsetFile = off()
+  let n = 0
+  const sleeps = []
+  const p = createPoller({ env: ENV, fetch: async () => (n++, conflict()), log: () => {}, offsetFile, lockFile, onUpdate: async () => {}, sleep: (ms) => (sleeps.push(ms), Promise.resolve()), _maxIterations: 3 })
+  await p.ready
+  assert.equal(n, 3)
+  assert.equal(p.status().owner, true)
+  assert.deepEqual(sleeps, [1000, 2000, 4000])
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid, process.pid)
+  p.stop()
 })
