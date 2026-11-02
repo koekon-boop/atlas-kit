@@ -2682,7 +2682,12 @@ function recordSteer(s, text, steeredBy, source) {
 export function describeSession(id) {
   const s = registry.sessions[id]
   if (!s) return null
-  return { id: s.id, kind: s.kind || 'dev', repo: s.repo, vault: s.vault, task: s.task, status: s.status }
+  // claudeSessionId + worktree: neither is sensitive (a UUID, a local path) and
+  // both are what an addon needs to locate the session's OWN `.jsonl` transcript
+  // directly (transcriptPath() in subagent-scan.mjs) — see GET /api/agents/describe,
+  // this function's only HTTP-facing caller. Additive: every existing caller
+  // (the agent↔agent message bus, the ship route) ignores the extra fields.
+  return { id: s.id, kind: s.kind || 'dev', repo: s.repo, vault: s.vault, task: s.task, status: s.status, claudeSessionId: s.claudeSessionId, worktree: s.worktree }
 }
 
 export async function prompt({ id, text, images, force, steeredBy }) {

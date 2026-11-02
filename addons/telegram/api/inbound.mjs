@@ -35,6 +35,7 @@ import { config } from './config.mjs'
 import { flushAllRoutes, forwardToAgent, forwardToRoute, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
 import { tryInterceptClaudeLoginCode } from './claude-login-bridge.mjs'
+import { deliverToFallback, fallbackActive, onFallbackTick, recordMainDelivery, tryInterceptCommand } from './fallback.mjs'
 import { createMedia, MEDIA_TYPES } from './media.mjs'
 import { answerCallbackQuery, sendChatAction, sendMessage } from './telegram.mjs'
 import { run } from './voice-reply.mjs'
@@ -99,18 +100,39 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
     return null
   }
 
-  /** Hand an agent-bound text to the routed session or the standing one; tell the
-   *  sender when neither takes it. Shared by messages and button taps. */
+  /** Hand an agent-bound text to the routed session, the fallback session (while
+   *  the automatic emergency fallback — README "Automatic fallback" — is active),
+   *  or the standing one; tell the sender when none of them takes it. A routed
+   *  chat is checked FIRST and never touches the fallback at all — it is pinned
+   *  to its own existing session regardless of the main session's health.
+   *  Shared by messages and button taps. */
   async function deliver(chatId, text) {
     const route = config(env).chatRoutes[chatId]
-    const r = route ? await forwardToRoute({ chatId, text }, route, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
+    if (route) {
+      const r = await forwardToRoute({ chatId, text }, route, { env, fetch: f, file })
+      if (r.ok) {
+        counters.forwarded++
+        return
+      }
+      counters.forwardErrors++
+      log(`[telegram] could not hand the message to the routed session: ${r.error}`)
+      await sendMessage({ chatId, text: BASE_UNREACHABLE }, { env, fetch: f, log })
+      return
+    }
+    const fallback = fallbackActive(file)
+    const r = fallback ? await deliverToFallback({ chatId, text }, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
     if (r.ok) {
       counters.forwarded++
+      // Remembered so a block discovered on the NEXT tick can still replay
+      // this exact message to the fallback session (README "Automatic
+      // fallback" — the lost-message guard). Never while already in
+      // fallback mode: that path never reaches main at all.
+      if (!fallback) recordMainDelivery({ chatId, text }, { file })
       return
     }
     counters.forwardErrors++
-    log(`[telegram] could not hand the message to the ${route ? 'routed session' : 'agent'}: ${r.error}`)
-    await sendMessage({ chatId, text: route ? BASE_UNREACHABLE : AGENT_DOWN }, { env, fetch: f, log })
+    log(`[telegram] could not hand the message to the ${fallback ? 'fallback session' : 'agent'}: ${r.error}`)
+    await sendMessage({ chatId, text: AGENT_DOWN }, { env, fetch: f, log })
   }
 
   /**
@@ -243,6 +265,13 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
       return
     } else text = m.text
     if (type === 'text') {
+      // /ersatz, /claude, /modell (home chat only — README "Automatic fallback")
+      // are handled by this addon itself, never forwarded to any agent.
+      const cmd = await tryInterceptCommand(text, chatId, { env, fetch: f, log, file })
+      if (cmd.handled) {
+        await sendMessage({ chatId, text: cmd.reply }, { env, fetch: f, log })
+        return
+      }
       const code = await tryInterceptClaudeLoginCode(text, { env, fetch: f, log })
       if (code.handled) {
         counters.claudeLoginCodes++
@@ -255,10 +284,13 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
 
   /** The poller-tick hook (register.mjs wires this into poller.mjs's onTick):
    *  retry every configured route's pending backlog, so a stored message still
-   *  gets through even when the sender never writes again. */
+   *  gets through even when the sender never writes again, and re-check the
+   *  automatic emergency fallback (detect a block while not active, or decide
+   *  whether it is time to probe for recovery while it is — see fallback.mjs). */
   async function flushRoutes() {
     const routes = config(env).chatRoutes
     if (Object.keys(routes).length) await flushAllRoutes(routes, { env, fetch: f, file })
+    await onFallbackTick({ env, fetch: f, log, file })
   }
 
   return { counters, handleOne, flushRoutes }

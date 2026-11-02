@@ -161,7 +161,10 @@ export const framed = (chatId, text) => `[Telegram from ${chatId}] ${text}\n\n(R
 export const framedForRoute = (chatId, text, port = '3001') =>
   `[Telegram from ${chatId}] ${text}\n\n(Antwort an diese Person NUR per POST http://127.0.0.1:${port}/api/telegram/send mit {"chat_id":"${chatId}","text":"…"} und Bearer $DASHBOARD_BEARER_TOKEN — das Terminal liest sie nicht. Der Bearer-Token steht in /workspace/.env. Sprachnachricht raus → "voice":true. Kurz, Klartext.)`
 
-async function core(method, route, body, { env, fetch: f }) {
+/** The one loopback caller every core-route call in this addon goes through —
+ *  exported so fallback.mjs (same addon, see its header) can drive /api/agents
+ *  and /api/agents/describe the same way, instead of a second copy. */
+export async function core(method, route, body, { env, fetch: f }) {
   const c = config(env)
   const r = await f(`${c.apiBase}${route}`, {
     method,
