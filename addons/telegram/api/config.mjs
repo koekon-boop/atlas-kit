@@ -78,6 +78,25 @@ export const NEEDS = {
 /** Names still unset for a half ('inbound' | 'outbound'). */
 export const missing = (half, env = process.env) => NEEDS[half].filter((k) => !str(env, k))
 
+/**
+ * The emergency-fallback provider chain (README "Automatic fallback"):
+ * comma-separated profile names, tried in order on a spawn/reuse. UNSET →
+ * the default chain (so the minimal setup needs no new env at all); set to
+ * EMPTY ("TELEGRAM_FALLBACK_PROVIDERS=") → `[]`, which is the documented
+ * kill-switch for the whole feature — detection, switching, probing, the
+ * three commands, all of it. This is why it is its OWN accessor rather than
+ * going through `str()` above: that helper treats "" the same as unset, and
+ * here the two must mean opposite things.
+ */
+export function fallbackProviders(env = process.env) {
+  const raw = env.TELEGRAM_FALLBACK_PROVIDERS
+  if (raw === undefined) return ['gpt-openrouter', 'deepseek-openrouter']
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
 const posInt = (env, k, d) => {
   const n = Number(env[k])
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : d
@@ -124,6 +143,18 @@ export const config = (env = process.env) => ({
   // gets the usual "can't read that", live updates are dropped.
   locationHook: str(env, 'TELEGRAM_LOCATION_HOOK'),
   locationTimeoutMs: posInt(env, 'TELEGRAM_LOCATION_TIMEOUT_MS', 10000),
+  // Automatic fallback (README "Automatic fallback"): see fallbackProviders()
+  // above for the empty-vs-unset distinction this one deliberately does NOT use.
+  fallbackProviders: fallbackProviders(env),
+  // An "other" (not rate_limit/authentication_failed/billing_error) API-error
+  // transcript line only counts as a block once it has been the LAST line for
+  // this long — a single transient error must not flip the whole channel over.
+  fallbackStaleMs: posInt(env, 'TELEGRAM_FALLBACK_STALE_MS', 3 * 60 * 1000),
+  // How often the probe (a cheap `claude -p` haiku turn on the default Anthropic
+  // env) is retried once the reset time is unknown, or again after a failed probe.
+  fallbackProbeIntervalMs: posInt(env, 'TELEGRAM_FALLBACK_PROBE_INTERVAL_MS', 15 * 60 * 1000),
+  fallbackProbeTimeoutMs: posInt(env, 'TELEGRAM_FALLBACK_PROBE_TIMEOUT_MS', 20000),
+  fallbackProbeModel: str(env, 'TELEGRAM_FALLBACK_PROBE_MODEL', 'claude-haiku-4-5'),
 })
 
 /** Telegram's Bot API is one base URL PER METHOD, token embedded in the path —

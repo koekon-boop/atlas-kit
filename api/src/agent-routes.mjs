@@ -2122,6 +2122,21 @@ export function agentRouter(bearerAuth) {
     })
   })
 
+  // Read-only, like GET /api/agents: one session's identifying fields, by id —
+  // for an addon that needs to locate its OWN session's Claude transcript file
+  // directly (addons/telegram's fallback detection reads claudeSessionId +
+  // worktree to build the path itself via transcriptPath() in subagent-scan.mjs,
+  // rather than scraping replies through the chat-history reconstruction, which
+  // drops error-shaped transcript lines entirely). describeSession() already
+  // returns only non-sensitive fields (see its own comment).
+  router.get('/api/agents/describe', (req, res) => {
+    const id = String(req.query.id || '')
+    if (!id) return res.status(400).json({ ok: false, error: 'missing "id"' })
+    const session = local.describeSession(id)
+    if (!session) return res.status(404).json({ ok: false, error: 'unknown session' })
+    res.json({ ok: true, session })
+  })
+
   /* The model-BACKEND profiles configured on this box — the spawn dropdown's
    * source, and the RUNTIME gate for it (one build of web/dist serves every
    * install, so the picker appears because this box has profiles, never because

@@ -31,6 +31,7 @@ import crypto from 'node:crypto'
 import { config, maskChatId, missing, offsetFile, stateFile } from './config.mjs'
 import { routeInfo, sessionInfo } from './agent.mjs'
 import { createSttProbe, createTtsProbe } from './audio.mjs'
+import { fallbackStatus, noteOutbound } from './fallback.mjs'
 import { mediaStatus } from './media.mjs'
 import { createInbound } from './inbound.mjs'
 import { createPoller, readOffset } from './poller.mjs'
@@ -75,6 +76,10 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
     if (!c.allowedChatIds.includes(target)) return res.status(400).json({ ok: false, error: '"chat_id" is not in TELEGRAM_ALLOWED_CHAT_IDS' })
     if (wantVoice != null && typeof wantVoice !== 'boolean') return res.status(400).json({ ok: false, error: '"voice" must be true or false' })
     const r = wantVoice ? await voice.send({ chatId: target, text }) : await sendMessage({ chatId: target, text }, { env, fetch: f, log })
+    // Buffer the home chat's own outbound replies for the eventual handback
+    // summary (README "Automatic fallback") — a no-op while fallback isn't
+    // active. A routed chat's own conversation is never folded in here.
+    if (r.ok && target === c.homeChatId) noteOutbound(text, { file: file ?? stateFile(env) })
     res.status(r.ok ? 200 : 502).json(r)
   })
 
@@ -125,6 +130,7 @@ export default function register(ctx) {
         voiceNotes: voiceNotesStatus(stt),
         voiceReplies: voiceRepliesStatus(tts),
         media: mediaStatus(),
+        fallback: fallbackStatus({ file: stateFile() }),
         counters: { ...inbound.counters, ...voice.counters },
       }
     },

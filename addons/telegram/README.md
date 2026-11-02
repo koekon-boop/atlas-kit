@@ -9,6 +9,9 @@ id named in `TELEGRAM_CHAT_ROUTES`, which is pinned to an existing dashboard ses
 of its own instead ([Routing per chat](#routing-per-chat-optional)). You can send it
 **text, voice notes, pictures, videos and documents**, and your **location**
 ([Voice notes](#voice-notes), [Pictures, videos and documents](#pictures-videos-and-documents), [Location](#location-optional)).
+When the standing session itself cannot reach Anthropic at all (an expired login, a
+rate limit, a billing error), a replacement chat on a different model backend takes
+over automatically until it can ([Automatic fallback](#automatic-fallback)).
 
 ```
 phone ──► Telegram Bot API ──► getUpdates (long-poll, this addon PULLS — no public webhook)
@@ -492,6 +495,105 @@ raus → "voice":true. Kurz, Klartext.)
 `GET /api/addons` shows `telegram.status.chatRoutes`: one row per configured route
 — the masked chat id, its target session id, how many messages made it through,
 the last delivery time, and how many are still waiting.
+
+## Automatic fallback
+
+The standing session is an ordinary Claude Code process — if your Anthropic
+subscription cannot answer at all (the login expired, a 5h/weekly rate limit hit,
+a billing error), it sits there silently: every message still gets handed to it
+(`POST /api/agents/prompt`/`queue` succeeds — the TMUX pane took the keystrokes
+fine), but nothing comes back, because the agent itself never got an API reply to
+work with. Left alone, the operator writes into a void until the limit resets and
+the session answers the whole backlog at once. This is what happened on this box
+on 2026-11-02 (logged in the Atlas) and is why this exists.
+
+```
+every /prompt or /queue, and every poller tick
+          │
+          ▼
+  tail of the standing session's OWN .jsonl transcript (never the whole file,
+  never its replies — only whether the LAST entry is an API-error line)
+          │
+   blocked? ──no──► nothing changes
+          │yes
+          ▼
+  a REPLACEMENT knowledge chat (vault atlas, model opus) on a different
+  model-BACKEND profile (providers.json) answers in the SAME chat until a cheap
+  probe says the subscription works again, then hands back with ONE summary
+  message naming everything it answered — explicitly marked already-answered.
+```
+
+**Detection** (`api/fallback-detect.mjs`) reads only the newest line of the
+standing session's own transcript (`~/.claude/projects/<cwd>/<claude session
+uuid>.jsonl`, via core's `transcriptPath`/`tailLines` — the same primitives
+`subagent-scan.mjs` already uses for sub-agent/ship-marker detection; nothing
+here reads a reply). The session is **blocked** when that line is an
+`isApiErrorMessage` entry and either its `error` is one of the three known
+codes (`rate_limit`, `authentication_failed`, `billing_error` — blocks
+immediately, any age) or it is some OTHER api-error line that has been the
+last entry for at least `TELEGRAM_FALLBACK_STALE_MS` (3 min by default — a
+single transient blip must not flip the channel over). A normal reply landing
+later simply makes the error no longer the last line, so detection reads
+"not blocked" again on its own, with no extra bookkeeping.
+
+**Switching.** Once blocked, every new message from the home chat and from any
+*unrouted* chat goes to the replacement session instead — never ALSO to the
+still-blocked standing session (that would double-answer the backlog once the
+real limit resets). The replacement is spawned (`kind: 'knowledge', vault:
+'atlas', model: 'opus'`) against the first working entry of
+`TELEGRAM_FALLBACK_PROVIDERS` (a comma list of `providers.json` profile names,
+tried in order — the next one is tried only if a spawn is refused, e.g. an
+unconfigured profile); a still-live replacement from an earlier episode is
+*reused* instead of spawning again. Its very first reply in a new episode is
+told, once, to say in one short sentence that the replacement (and which
+model) is answering and when Claude is expected back — the rest of its brief
+and the reply contract are identical to the standing session's. A chat pinned
+by `TELEGRAM_CHAT_ROUTES` is never affected by any of this — it keeps talking
+to its own existing target regardless of the standing session's health.
+
+**Switching back.** Once a known reset time has passed (or, when none was
+readable from the error text, every `TELEGRAM_FALLBACK_PROBE_INTERVAL_MS`, 15
+min by default), a cheap probe — one `claude -p` turn on
+`TELEGRAM_FALLBACK_PROBE_MODEL` (haiku by default), the plain default
+Anthropic environment, a short timeout — checks whether the subscription
+answers again. On success the standing session gets ONE message listing every
+message that came in and every reply that went out while it was blocked (kept
+in the state file, 300 characters and 30 entries at most), explicitly saying
+they are **already answered** and only open points need following up. If the
+standing session is blocked again right away, the next tick switches back to
+the replacement exactly as before — the replacement itself is left idle
+afterwards, ready to be reused for the next episode.
+
+**By hand**, home chat only (never forwarded to any agent, and never
+intercepted from another allowed/routed chat):
+
+| command | what it does |
+|---|---|
+| `/ersatz` | forces the switch now, using the configured provider chain |
+| `/ersatz deepseek` / `/ersatz gpt` | forces it onto one named profile (matches a `TELEGRAM_FALLBACK_PROVIDERS` entry, or the matching alias) |
+| `/claude` | hands back to the standing session now (the same summary handoff) |
+| `/modell` | says who is answering right now, and why |
+
+**Off switch:** `TELEGRAM_FALLBACK_PROVIDERS=` (explicitly empty) disables all
+of this — detection, switching, probing, the three commands — and the bridge
+behaves exactly as it did before this section existed. **Unset** (the normal
+case) uses the default chain `gpt-openrouter,deepseek-openrouter`.
+
+```bash
+TELEGRAM_FALLBACK_PROVIDERS=gpt-openrouter,deepseek-openrouter   # optional; empty disables the whole feature
+TELEGRAM_FALLBACK_STALE_MS=180000                                # an "other" api-error line blocks once it's been the last one this long
+TELEGRAM_FALLBACK_PROBE_INTERVAL_MS=900000                       # how often the recovery probe retries once the reset time is unknown, or after a failed probe
+TELEGRAM_FALLBACK_PROBE_TIMEOUT_MS=20000
+TELEGRAM_FALLBACK_PROBE_MODEL=claude-haiku-4-5
+```
+
+`GET /api/addons` shows `telegram.status.fallback`: `enabled`, `active`,
+`reason`, `resetAt`/`resetText`, the replacement session id + provider, and
+the counters (`switches`, `delivered`, `probes`).
+
+⚠️ Every reply the replacement sends runs over a paid OpenRouter model, not
+your Anthropic subscription — its brief says so and asks it to work lean, but
+this is real, metered cost for as long as an episode lasts.
 
 ## Claude-login code interception (with addons/claude-login)
 
