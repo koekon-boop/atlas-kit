@@ -124,3 +124,29 @@ test('parseResetAt: wording it cannot parse (an explicit date, an unknown zone) 
   assert.equal(parseResetAt('resets 8pm (Nonexistent/Zone)', Date.now()), null)
   assert.equal(parseResetAt(null, Date.now()), null)
 })
+
+/* --- cutoffAt: the lost-message guard's replay boundary ----------------- */
+
+test('cutoffAt is the timestamp of the last successful assistant turn BEFORE the error', () => {
+  const now = Date.now()
+  const goodAt = now - 5 * 60000
+  const lines = [normalLine('alles ok bisher', new Date(goodAt).toISOString()), errLine({ error: 'rate_limit', timestamp: new Date(now).toISOString() })]
+  const r = detectBlocked({ ...base, now, tail: fixed(lines) })
+  assert.equal(r.cutoffAt, goodAt)
+})
+
+test('cutoffAt falls back to (error time - 2 min) when no successful turn is found in the tail', () => {
+  const now = Date.now()
+  const r = detectBlocked({ ...base, now, tail: fixed([errLine({ error: 'authentication_failed', timestamp: new Date(now).toISOString() })]) })
+  assert.equal(r.cutoffAt, now - 2 * 60000)
+})
+
+test('cutoffAt ignores an unparseable timestamp on an otherwise-good earlier turn (falls back to the 2-min default)', () => {
+  const now = Date.now()
+  const lines = [
+    JSON.stringify({ type: 'assistant', timestamp: 'not-a-date', message: { content: [{ type: 'text', text: 'x' }] } }),
+    errLine({ error: 'rate_limit', timestamp: new Date(now).toISOString() }),
+  ]
+  const r = detectBlocked({ ...base, now, tail: fixed(lines) })
+  assert.equal(r.cutoffAt, now - 2 * 60000)
+})

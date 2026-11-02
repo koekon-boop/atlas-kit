@@ -536,6 +536,18 @@ single transient blip must not flip the channel over). A normal reply landing
 later simply makes the error no longer the last line, so detection reads
 "not blocked" again on its own, with no extra bookkeeping.
 
+**The lost-message guard.** Detection runs on the NEXT poller tick, not the
+instant the error happens — so the message that actually triggered the failing
+turn (this box's 2026-11-02 incident: Ko wrote "Hallo", it reached the session
+fine, the turn then failed, nobody ever answered) is already delivered and
+would otherwise be gone by the time the switch engages. Every message handed
+to the standing session is kept, briefly (10 entries / 30 minutes at most, in
+the state file), for exactly this. On activation, every one of them delivered
+**after** the last turn the session is known to have actually answered (or,
+if none is found in the read transcript tail, from `the error's own time minus
+2 minutes`) is replayed to the replacement session, in order — before the
+episode's handoff list is built, so the eventual handback names them too.
+
 **Switching.** Once blocked, every new message from the home chat and from any
 *unrouted* chat goes to the replacement session instead — never ALSO to the
 still-blocked standing session (that would double-answer the backlog once the

@@ -245,6 +245,66 @@ test('onFallbackTick(): a fresh detection flips into fallback mode (no session s
   assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 0)
 })
 
+test('REGRESSION (the lost-message guard): a message delivered to main right before the error is replayed to the fallback session on the very next tick', async () => {
+  // The incident this pins: Ko writes "Hallo", it reaches the (about to be
+  // blocked) main session fine, the turn then fails against Anthropic, and
+  // — without this — nobody ever answers. deliver() must have remembered it.
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': { claudeSessionId: 'uuid-1', worktree: '/v' } } })
+  const b = build({ world: w, state: { sessionId: 'kb-main' } })
+
+  await b.inbound.handleOne(update(1, text(1, 'Hallo', HOME)))
+  assert.ok(w.core.some((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main'), 'the message really did reach main')
+
+  const now = Date.now()
+  const errorLine = JSON.stringify({
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    timestamp: new Date(now).toISOString(),
+    message: { content: 'Login expired · Please run /login' },
+  })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, tail: () => [errorLine] })
+
+  assert.equal(fallbackActive(b.file), true)
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.ok(spawn, 'the lost message is replayed right away — a fallback session is spawned for it, not left for the next real message')
+  assert.match(spawn.body.task, /\[Telegram from 111\] Hallo/)
+  // …and it is in the handoff log too, so the eventual handback names it.
+  assert.ok(readState(b.file).fallback.log.some((e) => e.dir === 'in' && e.text === 'Hallo'))
+})
+
+test('REGRESSION: a replayed message is NEVER replayed a second time in a later episode', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': { claudeSessionId: 'uuid-1', worktree: '/v' } } })
+  const b = build({ world: w, state: { sessionId: 'kb-main' } })
+
+  await b.inbound.handleOne(update(1, text(1, 'Hallo', HOME)))
+  const now = Date.now()
+  const err1 = JSON.stringify({ isApiErrorMessage: true, error: 'authentication_failed', timestamp: new Date(now).toISOString(), message: { content: 'Login expired' } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, tail: () => [err1] })
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 1, 'replayed exactly once')
+  assert.deepEqual(readState(b.file).mainDeliveries, [], 'consumed — nothing left to replay again')
+
+  // Hand back, then block again shortly after, still well inside the 30-min window.
+  await switchToMain({ env: ENV, fetch: w.fetch, file: b.file })
+  assert.equal(fallbackActive(b.file), false)
+  const err2 = JSON.stringify({ isApiErrorMessage: true, error: 'rate_limit', timestamp: new Date(now + 60000).toISOString(), message: { content: 'x · resets 8pm (UTC)' } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, tail: () => [err2] })
+  assert.equal(fallbackActive(b.file), true)
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 1, 'still exactly one spawn — "Hallo" was not replayed a second time')
+})
+
+test('the lost-message guard never fires for a block that pre-dates the message (nothing to replay, nothing double-sent)', async () => {
+  const w = makeWorld({ describeById: { 'kb-main': { claudeSessionId: 'uuid-1', worktree: '/v' } } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', mainDeliveries: [{ at: new Date(Date.now() - 20 * 60000).toISOString(), chatId: HOME, text: 'alte Nachricht' }] } })
+  const now = Date.now()
+  // a GOOD assistant turn sits between the old delivery and the error — so cutoffAt lands after it.
+  const good = new Date(now - 60000).toISOString()
+  const err = JSON.stringify({ isApiErrorMessage: true, error: 'rate_limit', timestamp: new Date(now).toISOString(), message: { content: 'x · resets 8pm (UTC)' } })
+  const goodLine = JSON.stringify({ type: 'assistant', timestamp: good, message: { content: [{ type: 'text', text: 'ok' }] } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, tail: () => [goodLine, err] })
+  assert.equal(fallbackActive(file), true)
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 0, 'the stale message is correctly left out — it was already answered before the error')
+})
+
 test('onFallbackTick(): not blocked → stays inactive, no state write', async () => {
   const w = makeWorld({ describeById: { 'kb-main': { claudeSessionId: 'uuid-1', worktree: '/v' } } })
   const { file } = build({ world: w, state: { sessionId: 'kb-main' } })

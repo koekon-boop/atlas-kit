@@ -28,25 +28,56 @@ import { tailLines, transcriptPath } from '../../../api/src/subagent-scan.mjs'
 
 export const KNOWN_BLOCKING_ERRORS = new Set(['rate_limit', 'authentication_failed', 'billing_error'])
 
-// The newest entry only is ever inspected — this is plenty of room even for a
-// long error line plus whatever partial line precedes it in the tail cut.
-const TAIL_BYTES = 20_000
+// The newest entry decides blocked/not; cutoffAt (below) additionally scans
+// backward from it for the last successful assistant turn, which can sit a
+// fair way further back (a long tool-use turn right before the error) — so
+// this tail is generous, not just "the last line's room".
+const TAIL_BYTES = 100_000
 
 /** The last PARSEABLE JSON line of a tail-read chunk — append-only file, so
  *  "last line" is the newest entry. Skips blank lines and the tail's own
- *  partial first line (cut mid-record). → { rec, raw } | null. */
+ *  partial first line (cut mid-record). → { rec, raw, index } | null. */
 export function lastEntry(lines) {
   for (let i = lines.length - 1; i >= 0; i--) {
     const raw = lines[i].trim()
     if (!raw) continue
     try {
-      return { rec: JSON.parse(raw), raw }
+      return { rec: JSON.parse(raw), raw, index: i }
     } catch {
       continue
     }
   }
   return null
 }
+
+/** Scanning STRICTLY BEFORE `beforeIndex` (the error entry itself), the
+ *  timestamp of the last entry that is a genuine, non-error assistant turn —
+ *  the point the session was last known to be working. → ms epoch | null
+ *  (not found within the tail read, or no readable timestamp on it). */
+function lastGoodAssistantAt(lines, beforeIndex) {
+  for (let i = beforeIndex - 1; i >= 0; i--) {
+    const raw = lines[i].trim()
+    if (!raw) continue
+    let rec
+    try {
+      rec = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (rec?.type === 'assistant' && rec?.isApiErrorMessage !== true) {
+      const ts = Date.parse(rec.timestamp)
+      if (Number.isFinite(ts)) return ts
+      return null // found the turn but can't date it — do not keep scanning past it
+    }
+  }
+  return null
+}
+
+// No successful assistant turn found at all (within the tail) before the
+// error → fall back to this much before the error itself, per the task's own
+// rule: an unknown "last good" point must still cover the message that
+// TRIGGERED the failing turn, not just the instant of the error line.
+const NO_GOOD_TURN_LOOKBACK_MS = 2 * 60 * 1000
 
 // "resets 8pm (UTC)" / "resets 3am (Europe/Berlin)" — the one piece of an error
 // text worth carrying forward. Anthropic's occasional explicit-date wording
@@ -92,13 +123,19 @@ export function parseResetAt(resetText, now = Date.now()) {
 }
 
 /**
- * → { blocked, reason, resetText, resetAt, since, apiErrorStatus }. `reason` is
- * the error code ('rate_limit'/'authentication_failed'/'billing_error'/'other')
- * whenever the last entry IS an api-error line, even if `blocked` is still
- * false (a fresh "other" error, not yet stale) — so a caller can show it
- * without re-deciding staleness itself. `{ blocked: false }` alone (no other
- * keys) when the last entry is not an api error, or the transcript can't be
- * read at all. Never throws. Deps are injectable for hermetic tests.
+ * → { blocked, reason, resetText, resetAt, since, apiErrorStatus, cutoffAt }.
+ * `reason` is the error code ('rate_limit'/'authentication_failed'/
+ * 'billing_error'/'other') whenever the last entry IS an api-error line, even
+ * if `blocked` is still false (a fresh "other" error, not yet stale) — so a
+ * caller can show it without re-deciding staleness itself. `cutoffAt` is the
+ * timestamp (ms epoch) a caller should replay any main-session delivery
+ * STRICTLY AFTER — the last successful assistant turn before the error, or
+ * (no such turn found within the tail) `since - 2 min` — so a message that
+ * was handed to the blocked session right before/around the failing turn is
+ * never silently lost (the task's own incident: "Hallo" went in, the error
+ * followed, nobody ever answered). `{ blocked: false }` alone (no other keys)
+ * when the last entry is not an api error, or the transcript can't be read at
+ * all. Never throws. Deps are injectable for hermetic tests.
  */
 export function detectBlocked({
   worktree,
@@ -127,6 +164,7 @@ export function detectBlocked({
   }
   const known = !!(error && KNOWN_BLOCKING_ERRORS.has(error))
   const resetText = extractResetText(entry.raw)
+  const good = lastGoodAssistantAt(lines, entry.index)
   return {
     blocked: known || now - ts >= staleMs,
     reason: error || 'other',
@@ -134,5 +172,6 @@ export function detectBlocked({
     resetAt: resetText ? parseResetAt(resetText, now) : null,
     since: Number.isFinite(ts) ? ts : null,
     apiErrorStatus: typeof entry.rec.apiErrorStatus === 'number' ? entry.rec.apiErrorStatus : null,
+    cutoffAt: good ?? ts - NO_GOOD_TURN_LOOKBACK_MS,
   }
 }

@@ -35,7 +35,7 @@ import { config } from './config.mjs'
 import { flushAllRoutes, forwardToAgent, forwardToRoute, markInbound } from './agent.mjs'
 import { fetchAudio, transcribe } from './audio.mjs'
 import { tryInterceptClaudeLoginCode } from './claude-login-bridge.mjs'
-import { deliverToFallback, fallbackActive, onFallbackTick, tryInterceptCommand } from './fallback.mjs'
+import { deliverToFallback, fallbackActive, onFallbackTick, recordMainDelivery, tryInterceptCommand } from './fallback.mjs'
 import { createMedia, MEDIA_TYPES } from './media.mjs'
 import { answerCallbackQuery, sendChatAction, sendMessage } from './telegram.mjs'
 import { run } from './voice-reply.mjs'
@@ -123,6 +123,11 @@ export function createInbound({ env = process.env, fetch: f = globalThis.fetch, 
     const r = fallback ? await deliverToFallback({ chatId, text }, { env, fetch: f, file }) : await forwardToAgent({ chatId, text }, { env, fetch: f, file })
     if (r.ok) {
       counters.forwarded++
+      // Remembered so a block discovered on the NEXT tick can still replay
+      // this exact message to the fallback session (README "Automatic
+      // fallback" — the lost-message guard). Never while already in
+      // fallback mode: that path never reaches main at all.
+      if (!fallback) recordMainDelivery({ chatId, text }, { file })
       return
     }
     counters.forwardErrors++

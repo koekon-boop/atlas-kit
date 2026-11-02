@@ -104,6 +104,41 @@ export function fallbackActive(file = stateFile()) {
   return !!readFallback(file).active
 }
 
+/* --- the lost-message guard --------------------------------------------- *
+ * The incident this exists for: Ko writes "Hallo", it reaches the standing
+ * session fine (a /prompt or /queue 200), the session's OWN turn then fails
+ * against Anthropic, and nobody ever answers — detection only runs on the
+ * NEXT poller tick, by which point the message that triggered the failure is
+ * long delivered and forgotten. So every message handed to the MAIN session
+ * (never the fallback one — that path never touches this) is remembered here,
+ * top-level in the state file (outside `fallback`, since it must keep
+ * accruing independent of whether fallback is active), capped at
+ * DELIVERY_CAP entries / DELIVERY_MAX_AGE_MS old. On activation, every entry
+ * strictly after fallback-detect's `cutoffAt` is replayed to the fallback
+ * session, in order — see onFallbackTick below. */
+const DELIVERY_CAP = 10
+const DELIVERY_MAX_AGE_MS = 30 * 60 * 1000
+
+/** Record one message just handed to the MAIN session — called from
+ *  inbound.mjs's deliver() right after a successful forwardToAgent, never
+ *  while fallback is already active (that path never reaches main at all). */
+export function recordMainDelivery({ chatId, text }, { file = stateFile() } = {}) {
+  const state = readState(file)
+  const now = Date.now()
+  const kept = (Array.isArray(state.mainDeliveries) ? state.mainDeliveries : []).filter((e) => now - Date.parse(e.at) < DELIVERY_MAX_AGE_MS)
+  kept.push({ at: new Date(now).toISOString(), chatId, text: String(text ?? '') })
+  saveState({ ...state, mainDeliveries: kept.slice(-DELIVERY_CAP) }, file)
+}
+
+/** Every recorded main-session delivery strictly after `cutoffAt`, oldest
+ *  first. `[]` when `cutoffAt` is not a finite number (nothing to replay). */
+function mainDeliveriesSince(file, cutoffAt) {
+  if (!Number.isFinite(cutoffAt)) return []
+  const list = readState(file).mainDeliveries
+  if (!Array.isArray(list)) return []
+  return list.filter((e) => Date.parse(e.at) > cutoffAt).sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
+}
+
 async function describeMain(d) {
   const file = d.file ?? stateFile(d.env)
   const state = readState(file)
@@ -298,7 +333,23 @@ export async function onFallbackTick(deps = {}) {
       ...(buildPath ? { buildPath } : {}),
       ...(statFile ? { statFile } : {}),
     })
-    if (det.blocked) activate(file, { reason: det.reason, resetAt: det.resetAt, resetText: det.resetText, since: det.since })
+    if (det.blocked) {
+      activate(file, { reason: det.reason, resetAt: det.resetAt, resetText: det.resetText, since: det.since })
+      // The lost-message guard: replay, in order, every message handed to the
+      // main session after the last point it was known to be working — it
+      // never got (and now never will get) an answer from there. Cleared right
+      // after, whether or not anything was actually replayed: anything at or
+      // before cutoffAt was genuinely already answered and is no longer
+      // useful, and anything after it has now been handed to the replacement
+      // — either way, NOTHING here may survive to be replayed a second time
+      // in a later episode (a handback within the 30-min window would
+      // otherwise see the SAME old entries again and double-deliver them).
+      const lost = mainDeliveriesSince(file, det.cutoffAt)
+      saveState({ ...readState(file), mainDeliveries: [] }, file)
+      for (const item of lost) {
+        await deliverToFallback({ chatId: item.chatId, text: item.text }, d)
+      }
+    }
     return
   }
   const switchedAtMs = Date.parse(fb.switchedAt || '') || now
