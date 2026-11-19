@@ -19,10 +19,11 @@
  * ⚠️ TMUX IS MOCKED, ENTIRELY: a fake `tmux` goes first on PATH before
  * agent-local.mjs loads, so every has-session / send-keys lands in a log file
  * here and NOTHING can reach a live pane on the box running the suite. The fake
- * answers has-session with "alive", so an allowed steer runs to its send-keys
- * (asserted from the log) and a refused one must leave the log untouched. Its
- * pane stays empty, so the executor's post-send check then reports a 502 — that
- * is past the gate and not what is under test. Every id and tmux name below is
+ * answers has-session with "alive" and capture-pane with an empty input box, so
+ * an allowed steer runs to its send-keys (asserted from the log) and a refused
+ * one must leave the log untouched. The box never shows what was typed, so the
+ * executor's read-back then reports a 502 — that is past the gate and not what
+ * is under test. Every id and tmux name below is
  * synthetic — never a real session's.
  *
  * Run: node --test api/test/agent-steer-scope.test.mjs
@@ -40,7 +41,17 @@ const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-kit-steer-'))
 const TMUX_LOG = path.join(DIR, 'tmux-calls.log')
 const SHIM = path.join(DIR, 'bin')
 fs.mkdirSync(SHIM)
-fs.writeFileSync(path.join(SHIM, 'tmux'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${TMUX_LOG}'\nexit 0\n`, { mode: 0o755 })
+// capture-pane answers with an EMPTY input box (two rules around a bare `❯`),
+// what an idle live session shows: since upstream #25 the executor looks BEFORE
+// typing and holds (409 no-box, nothing typed) on a blank pane — so without the
+// box an allowed steer would never reach send-keys and the test couldn't tell
+// it from a refused one.
+const RULE = '─'.repeat(80)
+fs.writeFileSync(
+  path.join(SHIM, 'tmux'),
+  `#!/bin/sh\nprintf '%s\\n' "$*" >> '${TMUX_LOG}'\n[ "$1" = capture-pane ] && printf '\\n${RULE}\\n❯ \\n${RULE}\\n'\nexit 0\n`,
+  { mode: 0o755 },
+)
 process.env.PATH = `${SHIM}:${process.env.PATH}`
 process.env.AGENT_LOCAL_DIR = DIR
 process.env.AGENT_LOCAL_RECONCILE = '0'
@@ -54,6 +65,12 @@ process.env.AGENT_BRIDGES = '[]'
 process.env.AGENT_BRIDGE_URL = 'http://127.0.0.1:1'
 process.env.AGENT_BRIDGE_TOKEN = 'x'.repeat(24)
 process.env.AGENT_REMOTE_PHASE_POLL_MS = String(60 * 60 * 1000)
+// …and the two background passes that probe EVERY session (has-session +
+// capture-pane): the local 3 s sampler/flush tick and the 6 s reply-receipt
+// roster. Either lands in a "refused, touched nothing" window at random once a
+// test outlasts a tick. Nothing here relies on a queued prompt flushing.
+process.env.AGENT_LOCAL_QUEUE_FLUSH_MS = String(60 * 60 * 1000)
+process.env.ATLAS_REPLY_RECEIPT_MS = String(60 * 60 * 1000)
 
 // Stand-ins: the operator's standing Telegram chat (started by the channel
 // addon, so NO spawn-parents entry) and another person's routed chat.
@@ -208,6 +225,49 @@ for (const route of ['prompt', 'queue', 'interrupt']) {
     assert.equal(scopeLines().length, before)
   })
 }
+
+/* --- 2b. /panel — answering a Claude Code panel is a steer too ------- */
+// Upstream's panel route (dismiss / review / close / keep / back over the input
+// box) presses keys in the target's TUI, so it sits behind the same gate. The
+// fake pane holds no panel, so an allowed call ends in the executor's own
+// "no panel" answer — past the gate, which is all that is asserted here.
+
+test('panel: an agent may answer a panel of its own child', async () => {
+  const before = scopeLines().length
+  assert.notEqual((await post('panel', { id: 'mine-child', action: 'dismiss', steeredBy: 'orch-a' })).status, 403)
+  assert.notEqual((await post('panel', { id: 'mine-remote', action: 'dismiss', steeredBy: 'orch-a' })).status, 403)
+  assert.equal(scopeLines().length, before)
+})
+
+test("panel: a peer chat's agent is refused (403), names the owner, touches no pane", async () => {
+  const before = scopeLines().length
+  const mark = tmuxCalls().length
+  const r = await post('panel', { id: 'theirs', action: 'dismiss', steeredBy: 'orch-a' })
+  assert.equal(r.status, 403)
+  assert.match((await r.json()).error, /spawned by "orch-b", not by you/)
+  assert.deepEqual(tmuxCalls().slice(mark), [])
+  const line = scopeLines().slice(before)[0]
+  assert.deepEqual(
+    { via: line.via, id: line.id, by: line.by, owner: line.owner, ok: line.ok },
+    { via: 'panel', id: 'theirs', by: 'orch-a', owner: 'orch-b', ok: false },
+  )
+})
+
+test("panel: a chat cannot press keys in the operator's standing session, nor a foreign bridge session", async () => {
+  const mark = tmuxCalls().length
+  const r = await post('panel', { id: STANDING, action: 'dismiss', steeredBy: ROUTED })
+  assert.equal(r.status, 403)
+  assert.match((await r.json()).error, /not spawned by any chat/)
+  assert.deepEqual(tmuxCalls().slice(mark), [])
+  assert.equal((await post('panel', { id: 'theirs-remote', action: 'dismiss', steeredBy: 'orch-a' })).status, 403)
+})
+
+test('panel: the dashboard (no caller) is unchanged', async () => {
+  const before = scopeLines().length
+  assert.notEqual((await post('panel', { id: STANDING, action: 'dismiss' })).status, 403)
+  assert.notEqual((await post('panel', { id: 'theirs-remote', action: 'dismiss' })).status, 403)
+  assert.equal(scopeLines().length, before)
+})
 
 /* --- 3. the Telegram bridge, through the real routes ---------------- */
 

@@ -35,7 +35,7 @@ Five operations act on a live session, each with a different disruption profile:
 | **cleanup** | `cleanup()` — `agent-local.mjs` | Same graceful recap/ingest path as `kill`, but sets `s.lc.cleanupOnClose = true` so the final `REAP` act (`ACTS[ACT.REAP]`) **also** calls `removeAgentArtifacts()` (line 2910) — `git worktree remove --force` + `git branch -D`. Irreversible from inside the runtime. | Only once the work is actually merged/abandoned — see [§3](#3-cleanup-gating). |
 
 **Who may steer — own descendants only.** A steer is text injected as a user turn, so
-`POST /api/agents/{prompt,queue,interrupt}` scope it by the caller: `steeredBy`, the
+`POST /api/agents/{prompt,queue,interrupt,panel}` scope it by the caller: `steeredBy`, the
 calling chat's session id, stamped by the MCP `prompt_agent`/`queue_agent`/`interrupt_agent`
 tools from `ATLAS_SESSION` (the model never supplies it). A caller may steer only
 sessions it spawned, or what those spawned in turn — `steerAllowed()` in
@@ -44,7 +44,9 @@ Everything else — a peer chat's agent, a parent, the operator's standing Teleg
 any session with no spawn parent — is a **403** naming the owner (or saying no chat owns
 it), and the refusal is a `steer-scope` line in `audit.log`. There is **no** `scope:"any"`
 override: "steer that other chat anyway" is exactly what an injected instruction would
-ask for, and the operator can always steer it directly.
+ask for, and the operator can always steer it directly. `/panel` (answering a Claude Code
+panel over the box) presses keys in the target's TUI, so it is a steer too and sits behind
+the same gate; no MCP tool calls it today, so in practice only the dashboard (no caller) does.
 
 - **`steeredBy` absent means allowed**, exactly as before: the dashboard's compose box, the
   Telegram/WhatsApp bridges delivering into their target session and Hermes'

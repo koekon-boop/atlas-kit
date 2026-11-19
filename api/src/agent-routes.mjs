@@ -2534,6 +2534,10 @@ export function agentRouter(bearerAuth) {
     const { id, action } = req.body || {}
     if (!id || typeof id !== 'string') return res.status(400).json({ ok: false, error: 'missing "id"' })
     if (!action || typeof action !== 'string') return res.status(400).json({ ok: false, error: 'missing "action"' })
+    // Fork: the same steer lineage as /prompt — pressing keys in another
+    // session's TUI is a steer. A caller naming itself (`steeredBy`) may only
+    // answer panels of its own descendants; the dashboard sends none.
+    if (steerRefused({ id, steeredBy: req.body.steeredBy }, res, 'panel')) return
     if (local.hasSession(id)) return sendLocal(res, await local.panelAction({ id, action }))
     const r = await callBridgeForId('POST', '/panel', { id, action }, id, BRIDGE_EXEC_TIMEOUT_MS)
     res.status(r.status).json(r.body)
