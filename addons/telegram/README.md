@@ -59,7 +59,10 @@ things follow:
    `api/src/mcp/*.mcp.json`). If `register()` started the poll loop unconditionally,
    every concurrent session would start its own consumer. Instead `api/poller.mjs`
    claims a small pidfile lock (`<AGENT_LOCAL_DIR>/telegram-poller.lock`) before
-   polling; a process that loses the race does not poll. `GET /api/addons` shows
+   polling; a process that loses the race does not poll. **The stdio MCP servers do
+   not even try** (since 2026-10-27): `register.mjs` sees `…/api/src/mcp/…` in
+   `process.argv[1]` and starts no poller there — when an Express restart once let
+   an MCP server win the lock, voice notes broke. `GET /api/addons` shows
    `telegram.status.poller.owner`: `true` in the process that actually consumes
    updates, `false` (with a reason) in every other one. This is an implementation
    detail of this addon, not a documented core seam — it exists because this
@@ -78,8 +81,8 @@ things follow:
      is still stale. Two claimants that saw the same dead lock can no longer both
      delete it (the second delete used to hit the first one's fresh lock).
    - **Failover**: a process that lost re-tries the claim every 30 s, so when the
-     owner dies (e.g. the stdio MCP server of a closed agent session), another
-     process takes over without a restart.
+     owner dies, another process (the API, never an MCP server) takes over
+     without a restart.
    - **Yield on conflict**: an owner whose `getUpdates` gets `409 Conflict` checks
      the lock again. If it names another live process, this one stops polling
      instead of fighting. If the lock is still its own, the conflict comes from
@@ -737,7 +740,7 @@ variables) and the counters:
 
 | signal | meaning |
 |---|---|
-| `status.poller.owner` is `false` everywhere | the API process does not hold the singleton lock. That is normal if another process on the box (an MCP server) does: check the pid in `<AGENT_LOCAL_DIR>/telegram-poller.lock`. A dead pid is taken over within ~30 s. Also check that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
+| `status.poller.owner` is `false` everywhere | the API process does not hold the singleton lock. An MCP server never takes it, so check the pid in `<AGENT_LOCAL_DIR>/telegram-poller.lock`. A dead pid is taken over within ~30 s. Also check that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
 | `getUpdates failed: Conflict: terminated by other getUpdates request` in the log | a second consumer on the same token. If the lock names another live process, this process yields after the first conflict (log line `yielding the poll`). If it keeps repeating, the other consumer is outside this box's lock: another bot process or another machine using the same token |
 | `status.poller.lastError` set, rising `pollCount` with no messages arriving | `getUpdates` itself is failing — a bad token answers `401`; `install.sh --check`'s `getMe` probe catches that early |
 | `dropped` rising | the sender's chat id is not in `TELEGRAM_ALLOWED_CHAT_IDS` (or the home chat) |
