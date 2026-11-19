@@ -9,12 +9,14 @@ import {
   spawnAgent,
   promptAgent,
   interruptAgent,
+  sendErrorText,
   queueAgent,
   unqueueAgent,
   shipAgent,
   unshipAgent,
   sendQueuedNowAgent,
   sendAgentKeys,
+  panelAgent,
   selectAgentOption,
   killAgent,
   cleanupAgent,
@@ -27,6 +29,9 @@ import {
   fetchAgentHistory,
   isTypedVault,
   type AgentAttachment,
+  type AgentPanel,
+  type AgentPanelAction,
+  type DeliverHoldReason,
   type AgentHistory,
   type AgentHistoryMessage,
   type AgentHistoryTool,
@@ -36,7 +41,8 @@ import {
 } from '../../lib/api'
 import { AgentsOverview } from './AgentsOverview'
 import { AgentDownloads } from '../AgentDownloads'
-import { Markdown } from '../../lib/markdown'
+import { ChatVault, ExtLink, Markdown, linkNodes } from '../../lib/markdown'
+import { findLinks } from '../../lib/linkify'
 import { defaultSwitcherOpen, persistSwitcherOpen } from '../../lib/switcherPref'
 import { useUsage, fmtReset } from '../../lib/useUsage'
 import { useHost, gb } from '../../lib/useHost'
@@ -45,6 +51,7 @@ import { useProviders } from '../../lib/providers'
 import { modelOptions, keepModel, modelTitle } from '../../lib/modelTiers'
 import { lockBodyScroll } from '../../lib/scrollLock'
 import { MicField } from '../MicField'
+import { useFileReads } from '../../lib/fileReads'
 import { ScheduleButton } from '../ScheduleButton'
 import { useReadAloud } from '../../lib/readAloud'
 import { sayAloud } from '../../lib/speak'
@@ -128,13 +135,13 @@ function AskQuestionBlock({ q }: { q: NonNullable<AgentHistoryTool['askUserQuest
         <div key={i} className="agent__ask-q">
           <div className="agent__ask-q-title hud-label">
             ❓ {qq.header ? `${qq.header} — ` : ''}
-            {qq.question}
+            {linkNodes(qq.question)}
             {qq.multiSelect ? ' (multi-select)' : ''}
           </div>
           {qq.options.map((o, oi) => (
             <div key={oi} className="agent__ask-opt">
-              <span className="agent__ask-opt-label">{o.label}</span>
-              {o.description ? <span className="agent__ask-opt-desc"> — {o.description}</span> : null}
+              <span className="agent__ask-opt-label">{linkNodes(o.label)}</span>
+              {o.description ? <span className="agent__ask-opt-desc"> — {linkNodes(o.description)}</span> : null}
             </div>
           ))}
         </div>
@@ -161,7 +168,7 @@ function OutboundBlock({ o }: { o: NonNullable<AgentHistoryTool['outbound']> }) 
       {note ? <div className="agent__outbound-note">{note}</div> : null}
       {body ? (
         <>
-          <div className="agent__outbound-text">{open || !body.hasMore ? body.full : body.preview}</div>
+          <div className="agent__outbound-text">{linkNodes(open || !body.hasMore ? body.full : body.preview)}</div>
           {body.hasMore ? (
             <button type="button" className="briefs__toggle agent__outbound-toggle" onClick={() => setOpen(!open)}>
               <span className="briefs__caret">{open ? '▾' : '▸'}</span>
@@ -186,8 +193,8 @@ function AskAnswerMsg({ a, ts }: { a: NonNullable<AgentHistoryMessage['askUserQu
       {a.outcome === 'answered' && a.answers
         ? Object.entries(a.answers).map(([q, label]) => (
             <div key={q} className="agent__answered-pick">
-              {q ? <div className="agent__answered-q">{q}</div> : null}
-              {label}
+              {q ? <div className="agent__answered-q">{linkNodes(q)}</div> : null}
+              {linkNodes(label)}
             </div>
           ))
         : null}
@@ -222,7 +229,7 @@ function LocalCommandMsg({ c, ts }: { c: LocalCommand; ts: string | null }) {
       ) : null}
       {out ? (
         <div className="agent__cmd-out">
-          {open || !out.hasMore ? out.full : out.preview}
+          {linkNodes(open || !out.hasMore ? out.full : out.preview)}
           {out.hasMore ? (
             <button type="button" className="briefs__toggle agent__outbound-toggle" onClick={() => setOpen(!open)}>
               <span className="briefs__caret">{open ? '▾' : '▸'}</span>
@@ -287,7 +294,7 @@ const HistMsg = memo(
               <Markdown source={m.text} />
             </div>
           ) : (
-            <div className="agent__msg-text">{m.text}</div>
+            <div className="agent__msg-text">{linkNodes(m.text)}</div>
           )
         ) : null}
         {m.tools.length ? (
@@ -338,9 +345,51 @@ function PendingAskMsg({ p }: { p: PendingAsk }) {
   return (
     <div className="agent__msg agent__msg--answered agent__msg--pending-ask">
       <div className="agent__msg-from">selecting…</div>
-      <div className="agent__answered-pick">{p.text}</div>
+      <div className="agent__answered-pick">{linkNodes(p.text)}</div>
     </div>
   )
+}
+
+// A Claude Code panel parked over the session's input box (the feedback-draft
+// card after an agent's SendFeedback call — api/src/pane-panel.mjs). Nothing is
+// typed into the session while it is up, so the card says so and offers the
+// panel's own SAFE keys. "Send" (its `2`) is never a button: sending feedback
+// to Anthropic is the operator's call, made in the terminal.
+const PANEL_WHAT: Record<AgentPanel['kind'], string> = {
+  'feedback-draft': 'a feedback draft',
+  'feedback-off-prompt': 'the "turn off drafted feedback?" prompt',
+  'feedback-review': 'the feedback-drafts list',
+  survey: 'the session survey',
+  panel: 'a Claude Code panel',
+}
+const PANEL_ACTION: Record<AgentPanelAction, string> = {
+  dismiss: 'Dismiss',
+  review: 'Review (opens the drafts list in the terminal)',
+  close: 'Close',
+  keep: 'Keep drafted feedback on',
+  back: 'Back',
+}
+function PanelBlock({ panel, busy, onAction }: { panel: AgentPanel; busy: boolean; onAction: (a: AgentPanelAction) => void }) {
+  return (
+    <div className="agent__history-menu" role="alert">
+      <div className="agent__history-menu-title hud-label">
+        ⛔ blocked by {PANEL_WHAT[panel.kind] ?? PANEL_WHAT.panel} — nothing is sent to the session while it is open
+      </div>
+      {panel.text ? <div className="agent__history-menu-q">{panel.text}</div> : null}
+      {panel.actions.map((a) => (
+        <button key={a.id} type="button" className="agent__history-opt" disabled={busy} onClick={() => onAction(a.id)}>
+          {PANEL_ACTION[a.id] ?? a.id}
+        </button>
+      ))}
+      <div className="agent__history-note">sending feedback to Anthropic is only offered in the terminal view (&gt;_ above)</div>
+    </div>
+  )
+}
+// Why a queue is held (deliverHold), on its first chip.
+const HOLD_WHY: Record<DeliverHoldReason, string> = {
+  panel: 'held: a Claude Code panel is open',
+  'no-box': 'held: input box not on screen',
+  'box-not-empty': 'held: unsent text in the input box',
 }
 
 // The parked-prompts queue as a list, tolerant of a bridge that predates the
@@ -439,29 +488,57 @@ export const EFFORT_LABEL: Record<string, string> = { high: 'High', xhigh: 'Very
 // pane's SGR escape codes. We strip the colours (the transcript renders plain)
 // but honour *faint* (ESC[2m … ESC[0m/22m) so Claude Code's dim input-box
 // placeholder shows muted instead of reading as a real, pending message.
+// URLs are linked over the STRIPPED text (lib/linkify.ts), so one the TUI dims
+// or hard-wraps across rows still links whole.
 const SGR = /\x1b\[([0-9;]*)m/g
 function renderTranscript(raw: string): (string | VNode)[] {
-  const nodes: (string | VNode)[] = []
-  let faint = false
+  // 1. The plain text, plus the [start, end) spans of it that were faint.
+  let text = ''
+  const faint: [number, number][] = []
+  let from = -1
   let cursor = 0
-  let key = 0
-  const push = (text: string) => {
-    // Drop any stray non-SGR escapes so they never leak as literal garbage.
-    const clean = text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-    if (!clean) return
-    nodes.push(faint ? <span className="agent__dim" key={key++}>{clean}</span> : clean)
-  }
+  // Drop any stray non-SGR escapes so they never leak as literal garbage —
+  // incl. OSC 8 hyperlinks (`ESC]8;id=…;url ESC\`, which Claude Code wraps
+  // links in and tmux 3.4 keeps), or `]8;id=…;https://…` shows as text.
+  const take = (chunk: string) =>
+    (text += chunk.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))
   SGR.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = SGR.exec(raw))) {
-    push(raw.slice(cursor, m.index))
+    take(raw.slice(cursor, m.index))
     cursor = SGR.lastIndex
     for (const code of m[1].split(';')) {
-      if (code === '2') faint = true
-      else if (code === '' || code === '0' || code === '22') faint = false
+      if (code === '2' && from < 0) from = text.length
+      else if ((code === '' || code === '0' || code === '22') && from >= 0) {
+        faint.push([from, text.length])
+        from = -1
+      }
     }
   }
-  push(raw.slice(cursor))
+  take(raw.slice(cursor))
+  if (from >= 0) faint.push([from, text.length])
+  // 2. Emit it, cut at every faint and link boundary.
+  let key = 0
+  const dimmed = (a: number, b: number) => {
+    const out: (string | VNode)[] = []
+    for (const [fa, fb] of faint) {
+      if (fb <= a || fa >= b) continue
+      if (fa > a) out.push(text.slice(a, fa))
+      out.push(<span className="agent__dim" key={key++}>{text.slice(Math.max(a, fa), Math.min(b, fb))}</span>)
+      a = Math.min(b, fb)
+    }
+    if (a < b) out.push(text.slice(a, b))
+    return out
+  }
+  const nodes: (string | VNode)[] = []
+  let last = 0
+  const width = Math.max(0, ...text.split('\n').map((r) => r.length))
+  for (const l of findLinks(text, { wrapWidth: width })) {
+    nodes.push(...dimmed(last, l.start))
+    nodes.push(<ExtLink key={key++} href={l.href}>{dimmed(l.start, l.end)}</ExtLink>)
+    last = l.end
+  }
+  nodes.push(...dimmed(last, text.length))
   return nodes
 }
 
@@ -699,18 +776,25 @@ export function AgentList({
   const [images, setImages] = useState<AgentAttachment[]>([])
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  // Picked files still being read: spawning now would start the agent without
+  // them (lib/fileReads.ts), so every spawn path waits for `reading` to hit 0.
+  const { reading, reads } = useFileReads()
 
   // Attach picked files (capped at MAX_IMAGES total), reading each to a data URL.
   // Mirrors AgentRow.addImages; the input is cleared so re-picking the same file fires.
-  const addImages = async (e: Event) => {
+  const addImages = (e: Event) => {
     const input = e.currentTarget as HTMLInputElement
     const files = Array.from(input.files || [])
     input.value = ''
     if (!files.length) return
-    const read = await Promise.all(
-      files.map(async (f) => ({ name: f.name, dataUrl: await readAsDataUrl(f) })),
+    const work = Promise.all(files.map(async (f) => ({ name: f.name, dataUrl: await readAsDataUrl(f) })))
+    reads.read(work, (read) => setImages((prev) => [...prev, ...read].slice(0, MAX_IMAGES))).catch(() =>
+      setErr('could not read the attached file(s)'),
     )
-    setImages((prev) => [...prev, ...read].slice(0, MAX_IMAGES))
+  }
+  const clearImages = () => {
+    reads.discard()
+    setImages([])
   }
 
   const scoped = repo !== undefined
@@ -751,7 +835,7 @@ export function AgentList({
     e.preventDefault()
     const t = task.trim()
     const r = scoped ? repo! : repoInput.trim()
-    if (!t || !r || busy) return
+    if (!t || !r || busy || reading) return
     setBusy(true)
     setErr('')
     const res = await spawnAgent({ task: t, repo: r, model, effort, provider: provider || undefined, images: images.length ? images : undefined })
@@ -759,7 +843,7 @@ export function AgentList({
     if (res.ok) {
       setTask('')
       setRepoInput('')
-      setImages([])
+      clearImages()
       onChanged()
     } else {
       setErr(res.error || 'spawn failed')
@@ -776,7 +860,7 @@ export function AgentList({
     if (res.ok) {
       setTask('')
       setRepoInput('')
-      setImages([])
+      clearImages()
       onChanged()
     }
     return res
@@ -868,7 +952,8 @@ export function AgentList({
         <button
           type="submit"
           className="btn btn--approve"
-          disabled={!task.trim() || (!scoped && !repoInput.trim()) || busy}
+          disabled={!task.trim() || (!scoped && !repoInput.trim()) || busy || !!reading}
+          title={reading ? 'waiting for the attached files to be read' : undefined}
         >
           {busy ? 'Spawning…' : 'Spawn'}
         </button>
@@ -898,8 +983,13 @@ export function AgentList({
           ))}
         </div>
       ) : null}
-      {images.length ? (
+      {images.length || reading ? (
         <div className="agent__imgs" role="group" aria-label="attached files">
+          {reading ? (
+            <span className="agent__img" role="status">
+              ⏳ reading files…
+            </span>
+          ) : null}
           {images.map((img, i) => (
             <span className="agent__img" key={`${img.name}-${i}`} title={img.name}>
               {img.dataUrl.startsWith('data:image/') ? (
@@ -1083,12 +1173,27 @@ export function AgentRow({
   // The unsent message to this agent persists per session across tab switches.
   const [text, setText] = useDraft(`agent-msg:${s.id}`)
   const [images, setImages] = useState<AgentAttachment[]>([])
+  // Picked files still being read: every send path waits (lib/fileReads.ts) —
+  // sent now, the message would go without them and they would land in the
+  // NEXT draft.
+  const { reading, reads } = useFileReads()
+  const clearImages = () => {
+    reads.discard()
+    setImages([])
+  }
   const [busy, setBusy] = useState(false)
   const [sendErr, setSendErr] = useState('')
+  // Where this chat's Atlas page links ([[Page]], `Wiki/…/X.md`) open: a
+  // knowledge chat's own vault, the Atlas for a dev chat (lib/chatNotes.ts).
+  const chatVault = useMemo(() => ({ vault: knowledge ? s.vault : 'atlas' }), [knowledge, s.vault])
   // Set when the operator tries to send free text while a choice menu is open —
   // the send is held back (it would be swallowed as an "accept the preselect")
   // and the card asks them to pick an option or explicitly dismiss & send.
   const [menuWarn, setMenuWarn] = useState(false)
+  // Set when a send came back 409 `box-not-empty`: the session's input box
+  // already holds text nobody sent. Nothing was typed; the card offers an
+  // explicit "clear it & send" instead of appending or wiping it silently.
+  const [boxWarn, setBoxWarn] = useState(false)
   const [expanded, setExpanded] = useState(startFullscreen)
   const [fullscreen, setFullscreen] = useState(startFullscreen)
   // Show the live-app pane beside the transcript in full-screen (toggleable). On
@@ -1451,15 +1556,15 @@ export function AgentRow({
   // Attach picked files (capped at MAX_IMAGES total), reading each to a data URL
   // for upload. Allowlisted by extension (CSV etc. report MIME unreliably). The
   // input is cleared so re-picking the same file fires.
-  const addImages = async (e: Event) => {
+  const addImages = (e: Event) => {
     const input = e.currentTarget as HTMLInputElement
     const files = Array.from(input.files || [])
     input.value = ''
     if (!files.length) return
-    const read = await Promise.all(
-      files.map(async (f) => ({ name: f.name, dataUrl: await readAsDataUrl(f) })),
+    const work = Promise.all(files.map(async (f) => ({ name: f.name, dataUrl: await readAsDataUrl(f) })))
+    reads.read(work, (read) => setImages((prev) => [...prev, ...read].slice(0, MAX_IMAGES))).catch(() =>
+      setSendErr('could not read the attached file(s)'),
     )
-    setImages((prev) => [...prev, ...read].slice(0, MAX_IMAGES))
   }
 
   // One path for all three ways to deliver typed text:
@@ -1468,7 +1573,7 @@ export function AgentRow({
   //  - 'queue'     → park it; the backend delivers it when the turn finishes
   const deliver = async (mode: 'send' | 'interrupt' | 'queue') => {
     const t = text.trim()
-    if ((!t && !images.length) || busy) return
+    if ((!t && !images.length) || busy || reading) return
     setBusy(true)
     setSendErr('')
     const body = { id: s.id, text: t, images: images.length ? images : undefined }
@@ -1479,7 +1584,7 @@ export function AgentRow({
     setBusy(false)
     if (r.ok) {
       setText('')
-      setImages([])
+      clearImages()
       onChanged()
     } else if (r.error === 'menu') {
       // Backend caught a choice menu the card hadn't seen yet (poll lag) — show
@@ -1487,8 +1592,44 @@ export function AgentRow({
       setMenuWarn(true)
       if (!expanded) setExpanded(true)
     } else {
-      setSendErr(r.error || `${mode} failed`)
+      // A hold (panel / box-not-empty / no-box): nothing was typed. Refresh so a
+      // panel the poll hadn't caught yet shows up with its buttons.
+      if (r.error === 'box-not-empty' && mode === 'send') setBoxWarn(true)
+      if (r.error === 'panel') onChanged()
+      setSendErr(sendErrorText(r, mode))
     }
+  }
+
+  // The box-not-empty warning's escape hatch: empty the session's input box
+  // (server-side, verified) and send the typed text — the operator's explicit
+  // choice, never a silent wipe of someone's draft.
+  const clearBoxAndSend = async () => {
+    const t = text.trim()
+    if (busy || reading || (!t && !images.length)) return
+    setBusy(true)
+    setSendErr('')
+    const r = await promptAgent({ id: s.id, text: t, images: images.length ? images : undefined, clearBox: true })
+    setBusy(false)
+    if (r.ok) {
+      setText('')
+      clearImages()
+      setBoxWarn(false)
+      onChanged()
+    } else {
+      setSendErr(sendErrorText(r))
+    }
+  }
+
+  // A panel button (Dismiss / Review / Close…): the server re-reads the panel
+  // and presses that action's own key — the queue then delivers on its own.
+  const answerPanel = async (action: AgentPanelAction) => {
+    if (busy) return
+    setBusy(true)
+    setSendErr('')
+    const r = await panelAgent(s.id, action)
+    setBusy(false)
+    if (!r.ok) setSendErr(r.error || 'panel action failed')
+    onChanged()
   }
 
   // Enter / the form's submit picks the safe default for the current state:
@@ -1534,7 +1675,7 @@ export function AgentRow({
   // "I didn't want to answer the question — I want to say this instead."
   const dismissMenuAndSend = async () => {
     const t = text.trim()
-    if (busy || (!t && !images.length)) return
+    if (busy || reading || (!t && !images.length)) return
     setBusy(true)
     setSendErr('')
     await sendAgentKeys({ id: s.id, keys: ['Escape'] })
@@ -1543,12 +1684,12 @@ export function AgentRow({
     setBusy(false)
     if (r.ok) {
       setText('')
-      setImages([])
+      clearImages()
       setMenuWarn(false)
       if (!expanded) setExpanded(true)
       onChanged()
     } else {
-      setSendErr(r.error || 'send failed')
+      setSendErr(sendErrorText(r))
     }
   }
 
@@ -1850,7 +1991,7 @@ export function AgentRow({
           </div>
           {/* The prompt above the options, so it's clear WHAT is being asked —
               not just bare Yes/No buttons (parsed from the pane, menu.mjs). */}
-          {s.menuQuestion ? <div className="agent__history-menu-q">{s.menuQuestion}</div> : null}
+          {s.menuQuestion ? <div className="agent__history-menu-q">{linkNodes(s.menuQuestion)}</div> : null}
           {s.menuUnsupported ? (
             <div className="agent__history-note">
               {s.menuUnsupportedReason === 'multi-select'
@@ -2287,7 +2428,7 @@ export function AgentRow({
           transcriptPane
         )
       ) : (
-        <div className="agent__output">{s.lastOutput}</div>
+        <div className="agent__output">{linkNodes(s.lastOutput)}</div>
       )}
       {s.status === 'idle' ? (
         <div className="agent__keys" role="group" aria-label="respond to agent">
@@ -2350,8 +2491,13 @@ export function AgentRow({
           </button>
         </div>
       ) : null}
-      {images.length ? (
+      {images.length || reading ? (
         <div className="agent__imgs" role="group" aria-label="attached files">
+          {reading ? (
+            <span className="agent__img" role="status">
+              ⏳ reading files…
+            </span>
+          ) : null}
           {images.map((img, i) => (
             <span className="agent__img" key={`${img.name}-${i}`} title={img.name}>
               {img.dataUrl.startsWith('data:image/') ? (
@@ -2375,17 +2521,19 @@ export function AgentRow({
           ))}
         </div>
       ) : null}
+      {s.panel ? <PanelBlock panel={s.panel} busy={busy} onAction={answerPanel} /> : null}
       {queuedList(s.queued).map((q, i, all) => (
         <div className="agent__queued" role="status" key={i}>
           <span className="agent__queued-label hud-label">
             ⏱ queued{all.length > 1 ? ` ${i + 1}/${all.length}` : ''}
+            {i === 0 && s.deliverHold ? ` · ${HOLD_WHY[s.deliverHold.reason] ?? 'held'}` : ''}
           </span>
           <span className="agent__queued-text" title={q.kind === 'atlas-brief' ? q.summary : undefined}>
             {q.kind === 'atlas-brief' ? (
               `📚 Atlas briefing${q.summary ? ` — ${q.summary}` : ''}`
             ) : (
               <>
-                {q.text || (q.images ? `${q.images} file${q.images > 1 ? 's' : ''}` : '')}
+                {q.text ? linkNodes(q.text) : q.images ? `${q.images} file${q.images > 1 ? 's' : ''}` : ''}
                 {q.text && q.images ? ` (+${q.images} file${q.images > 1 ? 's' : ''})` : ''}
               </>
             )}
@@ -2431,6 +2579,26 @@ export function AgentRow({
       ))}
       {dict.error ? <div className="agents__err">✗ {dict.error}</div> : null}
       {sendErr ? <div className="agents__err">✗ {sendErr}</div> : null}
+      {boxWarn ? (
+        <div className="agent__menu-warn" role="alert">
+          <span className="agent__menu-warn-text">
+            ⚠ The session&apos;s input box already holds text nobody sent — a draft typed in the terminal, or a
+            message Claude Code held back. Sending now would have been appended to it.
+          </span>
+          <button
+            type="button"
+            className="agent__menu-warn-send"
+            onClick={clearBoxAndSend}
+            disabled={busy || !!reading || (!text.trim() && !images.length)}
+            title="empty the session's input box, then send your text"
+          >
+            Clear it &amp; send
+          </button>
+          <button type="button" className="agent__menu-warn-x" onClick={() => setBoxWarn(false)} title="dismiss this warning">
+            ✕
+          </button>
+        </div>
+      ) : null}
       {menuWarn && s.menuKind === 'choice' ? (
         <div className="agent__menu-warn" role="alert">
           <span className="agent__menu-warn-text">
@@ -2441,7 +2609,7 @@ export function AgentRow({
             type="button"
             className="agent__menu-warn-send"
             onClick={dismissMenuAndSend}
-            disabled={busy || (!text.trim() && !images.length)}
+            disabled={busy || !!reading || (!text.trim() && !images.length)}
             title="dismiss the menu (Esc), then send your text as a normal prompt"
           >
             Dismiss menu &amp; send
@@ -2487,7 +2655,7 @@ export function AgentRow({
               type="button"
               className="btn btn--interrupt"
               onClick={() => deliver('interrupt')}
-              disabled={(!text.trim() && !images.length) || busy}
+              disabled={(!text.trim() && !images.length) || busy || !!reading}
               title="stop the current response and send this now — the work it has done this turn is kept"
             >
               Interrupt &amp; send
@@ -2495,8 +2663,8 @@ export function AgentRow({
             <button
               type="submit"
               className="btn"
-              disabled={(!text.trim() && !images.length) || busy}
-              title="send after the current response finishes"
+              disabled={(!text.trim() && !images.length) || busy || !!reading}
+              title={reading ? 'waiting for the attached files to be read' : 'send after the current response finishes'}
             >
               Queue
             </button>
@@ -2505,8 +2673,8 @@ export function AgentRow({
           <button
             type="submit"
             className="btn"
-            disabled={(!text.trim() && !images.length) || busy || s.status !== 'idle'}
-            title={s.status === 'idle' ? 'send a prompt' : 'session is not running'}
+            disabled={(!text.trim() && !images.length) || busy || !!reading || s.status !== 'idle'}
+            title={reading ? 'waiting for the attached files to be read' : s.status === 'idle' ? 'send a prompt' : 'session is not running'}
           >
             Send
           </button>
@@ -2567,7 +2735,7 @@ export function AgentRow({
   // identical body renders either way, so head, transcript, respond toolbar and
   // prompt all keep working — only the container (and its CSS) changes.
   return (
-    <>
+    <ChatVault.Provider value={chatVault}>
       {fullscreen ? (
         createPortal(
           <div className={cls} role="dialog" aria-modal="true" ref={fullscreenRef}>
@@ -2608,6 +2776,6 @@ export function AgentRow({
         <li className={cls}>{body}</li>
       )}
       {appOverlay}
-    </>
+    </ChatVault.Provider>
   )
 }
