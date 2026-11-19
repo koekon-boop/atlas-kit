@@ -20,6 +20,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -272,6 +273,52 @@ test('the timeouts are configurable and the transcription default outlasts the v
   await new Promise((r) => setTimeout(r, 30))
   assert.equal(seen[0].aborted, false)
   assert.equal(seen[1].aborted, true)
+})
+
+/* The real loopback path (hotfix 28.10.2026). Node's built-in fetch (undici) gives up
+ * waiting for response headers after a fixed 300 s, whatever the AbortSignal says — a
+ * long voice note takes longer than that to transcribe. So with the DEFAULT fetch the
+ * call goes over node:http to a real local server here; an injected fetch still wins. */
+async function sttServer(answer) {
+  const seen = []
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (ch) => chunks.push(ch))
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, type: req.headers['content-type'], length: req.headers['content-length'], body: Buffer.concat(chunks).toString() })
+      answer(res)
+    })
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  after(() => { server.closeAllConnections(); server.close() })
+  return { seen, port: String(server.address().port) }
+}
+const json = (status, body) => (res) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
+
+test('default fetch → the transcription goes over node:http (body, auth, type, length), never through global fetch', async () => {
+  const s = await sttServer(json(200, { ok: true, text: ' Hallo Box ' }))
+  const real = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('global fetch must not carry the loopback transcription') }
+  try {
+    assert.deepEqual(await transcribe(OGG, 'audio/ogg', { env: { ...ENV, API_PORT: s.port }, log: () => {} }), { ok: true, text: 'Hallo Box' })
+  } finally {
+    globalThis.fetch = real
+  }
+  assert.deepEqual(s.seen, [{ method: 'POST', url: '/api/voice/transcribe', auth: `Bearer ${BEARER}`, type: 'audio/ogg', length: String(OGG.length), body: OGG.toString() }])
+})
+
+test('node:http path: the route\'s answers map exactly as over fetch, and the configured timeout still fires', async () => {
+  const opts = (port, extra = {}) => ({ env: { ...ENV, API_PORT: port, ...extra }, log: () => {} })
+  const empty = await sttServer(json(503, { ok: false, error: 'the STT command produced no transcript' }))
+  assert.equal((await transcribe(OGG, 'audio/ogg', opts(empty.port))).kind, 'empty')
+  const off = await sttServer(json(503, { ok: false, error: 'no ATLAS_VOICE_STT_CMD' }))
+  assert.deepEqual(await transcribe(OGG, 'audio/ogg', opts(off.port)), { ok: false, kind: 'unavailable', error: 'HTTP 503: no ATLAS_VOICE_STT_CMD' })
+  const big = await sttServer(json(413, { ok: false, error: 'too large' }))
+  assert.equal((await transcribe(OGG, 'audio/ogg', opts(big.port))).kind, 'too-large')
+  const hang = await sttServer(() => {}) // never answers
+  const r = await transcribe(OGG, 'audio/ogg', opts(hang.port, { TELEGRAM_TRANSCRIBE_TIMEOUT_MS: '50' }))
+  assert.equal(r.kind, 'error')
+  assert.match(r.error, /transcription timed out/)
 })
 
 test('the STT probe: caches, answers from the voice addon\'s status, and never asks twice while in flight', async () => {
