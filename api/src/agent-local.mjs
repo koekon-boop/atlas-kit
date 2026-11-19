@@ -59,7 +59,10 @@ import { capacityVerdict, readMemStatus } from './agent-capacity.mjs'
 // the spinner line above the input box — because the footer is rendered to the
 // pane width and drops that marker mid-turn. Shared, not copied.
 import { isBusy } from './pane-busy.mjs'
-import { sanitizeForTyping, deliveryLanded, clearInputBox, TUI_CLEAR_KEY, TUI_VERIFY, TUI_VERIFY_MAX_CHARS, TUI_VERIFY_SETTLE_MS, TUI_VERIFY_TRIES } from './tui-input.mjs'
+// withImages: attached-file paths folded into the prompt, `[Image N]` markers in place.
+import { withImages } from './agent-attachments.mjs'
+import { typeAndSubmit, payloadFingerprint, pressPanelAction, holdResponse, TUI_HOLD_STAGES } from './tui-input.mjs'
+import { parsePanel } from './pane-panel.mjs'
 // A launch prompt travels by FILE, never inside the tmux command — the shell
 // shape is shared with the bridge executor so the two cannot drift.
 import { promptFileBody, promptFileCommand } from './prompt-file-launch.mjs'
@@ -67,6 +70,10 @@ import { promptFileBody, promptFileCommand } from './prompt-file-launch.mjs'
 import { buildCandidates, evidencePrompt } from './atlas-candidates.mjs'
 // The bus log — where a note dropped as stale stays visible (delivered: false).
 import { appendMessage } from './agent-messages.mjs'
+// Where a new worktree starts: a freshly fetched origin default branch.
+import { addAgentWorktree } from './worktree-base.mjs'
+// Closes Claude Code's own cross-session channel on every launch (--settings).
+import { withNativeMsgPolicy } from './native-msg-policy.mjs'
 
 const HERE = path.dirname(new URL(import.meta.url).pathname)
 const REPOS_FILE = process.env.AGENT_LOCAL_REPOS || path.join(HERE, 'agent-local-repos.json')
@@ -102,17 +109,22 @@ const DEV_MCP_CONFIG = `${WORKSPACE}/api/src/mcp/dev.mcp.json`
 // ENOENT while an interactive `serve.sh restart` worked. A custom
 // AGENT_*_LAUNCH_CMD is left exactly as the operator wrote it.
 const CLAUDE = claudeShellWord()
-export const LAUNCH_CMD =
+// Every template below is folded through withNativeMsgPolicy, which adds the
+// `--settings` closing Claude Code's own cross-session messaging (see
+// native-msg-policy.mjs) — dev sessions refuse inbound AND lose both native
+// messaging tools, knowledge sessions only refuse inbound. It wraps the env
+// override too: a custom template must not reopen the channel.
+export const LAUNCH_CMD = withNativeMsgPolicy(
   process.env.AGENT_LOCAL_LAUNCH_CMD ||
-  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${DEV_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`
+  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${DEV_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`, 'dev')
 // Knowledge agents (vault chats) additionally pin `--session-id {sid}`: they all
 // share the vault as cwd, so without a pinned id the transcript reader's
 // newest-file heuristic would cross-read between concurrent chats.
 // Same `{claudeEnv}` slot as a dev agent's: a knowledge chat can take a PROVIDER
 // PROFILE too, and with none the slot is the same `-u ANTHROPIC_API_KEY ` literal.
-export const KNOWLEDGE_LAUNCH_CMD =
+export const KNOWLEDGE_LAUNCH_CMD = withNativeMsgPolicy(
   process.env.AGENT_KNOWLEDGE_LAUNCH_CMD ||
-  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} --dangerously-skip-permissions {task}`
+  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} --dangerously-skip-permissions {task}`, 'knowledge')
 // The Atlas ORCHESTRATOR (the vault:'atlas' chat) is a knowledge agent that can
 // ALSO spawn/monitor/steer other agents. It loads the Atlas Kit MCP server via
 // control.mcp.json, which sets ATLAS_AGENT_CONTROL=1 in the MCP child's env —
@@ -123,9 +135,9 @@ const CONTROL_MCP_CONFIG = `${WORKSPACE}/api/src/mcp/control.mcp.json`
 // `ATLAS_SESSION={atlasSession}` exports this chat's session id into the
 // claude process — and so into its MCP child, which reads it in spawn_agent to
 // stamp every agent it spawns with `parent`, drawing the lineage constellation.
-export const ATLAS_CONTROL_LAUNCH_CMD =
+export const ATLAS_CONTROL_LAUNCH_CMD = withNativeMsgPolicy(
   process.env.AGENT_ATLAS_LAUNCH_CMD ||
-  `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`
+  `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`, 'knowledge')
 // The PAIRED ATLAS WORKER is a restricted, dashboard-driven session — the same
 // knowledge-only READ profile a dev agent gets (worker.mcp.json), and never the
 // orchestrator's control tools. It writes the Atlas through its own worktree, not
@@ -135,9 +147,9 @@ export const ATLAS_CONTROL_LAUNCH_CMD =
 // operator, and it takes no `provider` from anywhere — so it stays on the
 // subscription backend whatever backend the agent it is paired to runs on.
 const WORKER_MCP_CONFIG = `${WORKSPACE}/api/src/mcp/worker.mcp.json`
-export const ATLAS_WORKER_LAUNCH_CMD =
+export const ATLAS_WORKER_LAUNCH_CMD = withNativeMsgPolicy(
   process.env.AGENT_ATLAS_WORKER_LAUNCH_CMD ||
-  `IS_SANDBOX=1 env -u ANTHROPIC_API_KEY ${CLAUDE} --model {model} --effort {effort} --session-id {sid} --mcp-config ${WORKER_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`
+  `IS_SANDBOX=1 env -u ANTHROPIC_API_KEY ${CLAUDE} --model {model} --effort {effort} --session-id {sid} --mcp-config ${WORKER_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`, 'knowledge')
 // Extended (1M) context is the DEFAULT and applies to EVERY model — the
 // subscription serves the 1M window without usage credits — so the fallback model
 // + the meter's window default to it. AGENT_EXTENDED_CONTEXT=0 (or false/no/off)
@@ -178,7 +190,8 @@ const APP_PORT = Number(process.env.AGENT_LOCAL_APP_PORT || 8701)
 const APP_PROBE_MS = Number(process.env.AGENT_LOCAL_APP_PROBE_MS || 300)
 // Upload limits (the prompt path can carry attached files — see prompt()). The
 // `images` wire field is historical; it now carries any file type.
-const MAX_IMAGES = Number(process.env.AGENT_MAX_IMAGES || 6)
+// The COUNT cap is 20: a pasted message with several screenshots in it.
+const MAX_IMAGES = Number(process.env.AGENT_MAX_IMAGES || 20)
 const MAX_IMAGE_BYTES = Number(process.env.AGENT_MAX_IMAGE_BYTES || 8 * 1024 * 1024)
 // Sanity cap on a single prompt's text, delivered as one literal tmux
 // send-keys line — not a real terminal paste, so no bracketed-paste chunking.
@@ -259,17 +272,17 @@ const REVIVE_MEM_PER_AGENT_MB = Number(process.env.AGENT_LOCAL_REVIVE_MEM_PER_AG
 const REVIVE_STAGGER_MS = Number(process.env.AGENT_LOCAL_REVIVE_STAGGER_MS || RECONCILE_STAGGER_MS)
 // Resume launch: like LAUNCH_CMD but `--resume {sid}` restores the full session
 // (the task/preamble is already in the transcript), so none is re-supplied.
-export const RESUME_CMD =
+export const RESUME_CMD = withNativeMsgPolicy(
   process.env.AGENT_LOCAL_RESUME_CMD ||
-  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${DEV_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions --resume {sid}`
+  `IS_SANDBOX=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${DEV_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions --resume {sid}`, 'dev')
 // Resume launch for the Atlas ORCHESTRATOR (the vault:'atlas' chat): like RESUME_CMD
 // but re-attaches the agent-control MCP config + ATLAS_SESSION, so a revived
 // orchestrator gets its spawn/prompt/kill tools back — a plain resume would bring the
 // chat back DE-FANGED. Mirrors ATLAS_CONTROL_LAUNCH_CMD with `--resume` in place of
 // `--session-id {sid} {task}` (the conversation is already in the transcript).
-export const ATLAS_CONTROL_RESUME_CMD =
+export const ATLAS_CONTROL_RESUME_CMD = withNativeMsgPolicy(
   process.env.AGENT_ATLAS_RESUME_CMD ||
-  `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions --resume {sid}`
+  `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions --resume {sid}`, 'knowledge')
 // Serial ship train backstop: a member that goes busy and never prints
 // ATLAS:SHIPPED is detected as stopped the moment it returns to idle (see
 // pumpShipTrain); this only bounds a member that stays wedged-busy forever, so
@@ -475,16 +488,6 @@ export function saveImages(id, images) {
     paths.push(file)
   }
   return paths
-}
-
-// Fold attached-file paths into a SINGLE-LINE prompt (newlines would submit
-// early in the TUI). The agent is told to Read them before responding.
-function withImages(text, paths) {
-  if (!paths.length) return text
-  const noun = paths.length > 1 ? 'files' : 'a file'
-  const them = paths.length > 1 ? 'them' : 'it'
-  const tail = `[I attached ${noun} at: ${paths.join(', ')} — use the Read tool to view ${them} before responding.]`
-  return text ? `${text} ${tail}` : tail
 }
 
 function readJson(file, fallback) {
@@ -1319,6 +1322,8 @@ function publicView(s, status, lastOutput, menuKind, transcript, appUp, menuChoi
             ...(q.kind ? { kind: q.kind } : {}),
             ...(q.summary ? { summary: q.summary } : {}),
           })),
+          // Why the queue is not going out (a panel, a draft in the box…).
+          ...(s.deliverHold ? { deliverHold: s.deliverHold } : {}),
         }
       : {}),
     ...(transcript && transcript.context
@@ -1675,9 +1680,14 @@ export async function listSessions() {
       applyingCardNow.add(s.id)
       applyCardNow(s, cardNow)
     }
-    out.push(
-      publicView(s, status, tail || s.lastSeen || '', menuKind, transcript, appUp, menuChoice, listDownloads(s.id)),
-    )
+    // A Claude Code panel over the input box (the feedback-draft card) — the
+    // card shows it with its safe keys, and delivery is held while it is up
+    // (pane-panel.mjs).
+    const panel = alive ? parsePanel(pane) : null
+    out.push({
+      ...publicView(s, status, tail || s.lastSeen || '', menuKind, transcript, appUp, menuChoice, listDownloads(s.id)),
+      ...(panel ? { panel } : {}),
+    })
   }
   if (changed) persist()
   out.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
@@ -2040,7 +2050,8 @@ export async function reviveAll() {
  * none the prompt must stay BYTE-IDENTICAL to what an unbriefed spawn has always
  * had. `{statsFile}`/`{downloadsDir}`/`{worktree}` are this session's own paths
  * (only the executor knows the id); attached-file paths fold into the task text
- * as a single-line tail, the same mechanism a follow-up prompt's images use. */
+ * (an appended tail, or in place at `[Image N]` markers), the same mechanism a
+ * follow-up prompt's images use. */
 export function devPrompt({ id, task, repo, preamble, context, worktree, imagePaths = [] }) {
   const taskBody = withImages(task, imagePaths)
   if (!preamble) return taskBody
@@ -2160,13 +2171,17 @@ export async function spawn({ task, repo, preamble, model, effort, context, imag
   }
 
   await run(['mkdir', '-p', worktreeBase])
-  const wt = await run(['git', '-C', repoPath, 'worktree', 'add', '-b', branch, worktree])
+  // Start from a freshly fetched origin default branch, not repoPath's HEAD
+  // (worktree-base.mjs); the base it used rides the session and the audit line.
+  const wt = await addAgentWorktree({ repo: repoPath, branch, worktree, baseRef: target.baseRef, exec: run })
+  const wtBase = { baseRef: wt.baseRef, baseSha: wt.baseSha, baseFetched: wt.baseFetched }
+  Object.assign(session, wtBase)
   if (!wt.ok) {
     session.status = 'error'
     session.error = (wt.stderr || 'git worktree add failed').slice(0, 500)
     registry.sessions[id] = session
     persist()
-    audit({ action: 'spawn', id, repo, ok: false, error: session.error })
+    audit({ action: 'spawn', id, repo, ...wtBase, ok: false, error: session.error })
     return { status: 502, ok: false, error: session.error }
   }
 
@@ -2205,7 +2220,7 @@ export async function spawn({ task, repo, preamble, model, effort, context, imag
 
   registry.sessions[id] = session
   persist()
-  audit({ action: 'spawn', id, repo, branch, model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, ...(provider ? { provider } : {}), images: imagePaths.length, ok: true })
+  audit({ action: 'spawn', id, repo, branch, ...wtBase, ...(wt.fetchError ? { fetchError: wt.fetchError } : {}), model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, ...(provider ? { provider } : {}), images: imagePaths.length, ok: true })
   return { status: 200, ok: true, id }
 }
 
@@ -2221,8 +2236,8 @@ export async function spawn({ task, repo, preamble, model, effort, context, imag
  * asked can never read as part of the briefing. `{downloadsDir}` in the preamble
  * (DOWNLOADS_PREAMBLE) becomes this chat's own download dir. */
 export function knowledgePrompt({ id, question, preamble, context, imagePaths = [] }) {
-  // Attached-file paths fold into the question text (a single-line tail) so the
-  // chat reads them on its first turn — same mechanism as a dev spawn's.
+  // Attached-file paths fold into the question text (an appended tail, or in
+  // place at `[Image N]` markers) so the chat reads them on its first turn — same mechanism as a dev spawn's.
   const body = withImages(question, imagePaths)
   return preamble
     ? `${preamble.replaceAll('{downloadsDir}', downloadsDir(id))}${context ? `\n\n${context}` : ''}\n\n---\n# Operator question\n${body}`
@@ -2610,49 +2625,30 @@ async function prepare(id, text, images) {
 // back off the pane we clear the box and fail, so the caller sees an error and
 // the queue keeps the prompt for the next tick. Never delivered beats silently
 // replaced — and both are loud (audit + the card's error).
-async function deliver(s, payload) {
-  const safe = sanitizeForTyping(payload)
-  const stripped = payload.length - safe.length
-  // ⚠️ NEVER type into a non-empty box. Whatever is in there — our own residue
-  // from a refusal, a half-delivered prompt from a crash — the typed text
-  // concatenates onto it and the next Enter submits the pair. Clearing is
-  // VERIFIED, not counted: `C-u` kills a display ROW, so the count depends on
-  // the wrapped height of content we didn't put there (tui-input.mjs).
-  const io = {
+//
+// And look BEFORE typing: a Claude Code panel above the box, no box on screen,
+// or a box already holding text each refuse with nothing typed (a HOLD — see
+// tui-input.mjs TUI_HOLD_STAGES; holds are audited by their callers, once, not
+// per refusal). `clearDraft` empties a non-empty box first, verified — only for
+// an operator's explicit "clear & send" and the lifecycle prompts below.
+async function deliver(s, payload, { clearDraft = false } = {}) {
+  const d = await typeAndSubmit(payload, {
     readPane: () => captureTail(s, TAIL_LINES, true),
-    pressClear: () => run(['tmux', 'send-keys', '-t', s.tmux, TUI_CLEAR_KEY]),
-  }
-  let cleared = 0
-  if (TUI_VERIFY) {
-    const pre = await clearInputBox(io)
-    if (!pre.ok) {
-      audit({ action: 'deliver-box-stuck', id: s.id, repo: s.repo, len: safe.length, presses: pre.presses, residue: pre.residue, ok: false })
-      return { ok: false, error: 'input box is not empty and could not be cleared (nothing typed)' }
-    }
-    cleared = pre.presses
-  }
-  const t = await run(['tmux', 'send-keys', '-t', s.tmux, '-l', safe])
-  if (!t.ok) return { ok: false, error: t.stderr.slice(0, 500) || 'send-keys failed' }
-  if (TUI_VERIFY && safe.length <= TUI_VERIFY_MAX_CHARS && !(await typedTextLanded(s, safe))) {
-    const post = await clearInputBox(io)
-    audit({ action: 'deliver-mangled', id: s.id, repo: s.repo, len: safe.length, stripped, presses: post.presses, emptied: post.ok, ok: false })
-    return { ok: false, error: 'input did not land in the session (not submitted)' }
-  }
-  await run(['tmux', 'send-keys', '-t', s.tmux, 'Enter'])
-  return { ok: true, stripped, cleared }
+    typeText: (text) => run(['tmux', 'send-keys', '-t', s.tmux, '-l', text]),
+    pressKey: (key) => run(['tmux', 'send-keys', '-t', s.tmux, key]),
+    clearDraft,
+  })
+  if (!d.ok && d.stage !== 'type' && !TUI_HOLD_STAGES.has(d.stage)) auditDeliverFail(s, payload, d)
+  return d
 }
 
-// Read the typed text back off the pane. The pane lags the keystrokes, so this
-// looks more than once (see TUI_VERIFY_SETTLE_MS) — the happy path still
-// returns on the first look, and only a genuinely mangled buffer pays the wait.
-// The capture keeps its SGR (`-e`): the box's faint placeholder is what tells
-// an empty box from one holding text.
-async function typedTextLanded(s, payload) {
-  for (let i = 0; i < TUI_VERIFY_TRIES; i++) {
-    if (i) await sleep(TUI_VERIFY_SETTLE_MS)
-    if (deliveryLanded(await captureTail(s, TAIL_LINES, true), payload)) return true
-  }
-  return false
+// One audit line per refused delivery, named by the stage that refused it. The
+// payload rides as a FINGERPRINT (length + non-ASCII counts by category), never
+// its content — enough to tell an invisible-mark paste from pane lag later.
+function auditDeliverFail(s, payload, d) {
+  const action = { 'box-stuck': 'deliver-box-stuck', mangled: 'deliver-mangled', unsubmitted: 'deliver-unsubmitted' }[d.stage]
+  const { len, lines, nonAscii } = payloadFingerprint(payload)
+  audit({ action, id: s.id, repo: s.repo, len, lines, nonAscii, stripped: d.stripped, presses: d.presses, ...(d.residue !== undefined ? { residue: d.residue } : {}), ...(d.emptied !== undefined ? { emptied: d.emptied } : {}), ...(d.boxSeen === false ? { boxSeen: false } : {}), ok: false })
 }
 
 // Remember that an Atlas orchestrator — not the operator — injected this prompt.
@@ -2690,7 +2686,7 @@ export function describeSession(id) {
   return { id: s.id, kind: s.kind || 'dev', repo: s.repo, vault: s.vault, task: s.task, status: s.status, claudeSessionId: s.claudeSessionId, worktree: s.worktree }
 }
 
-export async function prompt({ id, text, images, force, steeredBy }) {
+export async function prompt({ id, text, images, force, steeredBy, clearBox }) {
   const p = await prepare(id, text, images)
   if (p.err) return p.err
   // Refuse to type into a pending CHOICE menu (plan/permission/AskUserQuestion):
@@ -2702,8 +2698,23 @@ export async function prompt({ id, text, images, force, steeredBy }) {
     const pane = await captureTail(p.s, TAIL_LINES)
     if (menuKindOf(pane) === 'choice') return { status: 409, ok: false, error: 'menu', menuKind: 'choice' }
   }
-  const d = await deliver(p.s, p.payload)
-  if (!d.ok) return { status: 502, ok: false, error: d.error }
+  // `clearBox`: the card's "clear the input & send", after a 409 box-not-empty.
+  const d = await deliver(p.s, p.payload, { clearDraft: !!clearBox })
+  // Held before a key was typed — a panel, no box on screen, a box holding
+  // text: 409 with the reason (and the panel), which the card turns into its
+  // buttons.
+  if (!d.ok && TUI_HOLD_STAGES.has(d.stage)) {
+    audit({ action: 'prompt-held', id, repo: p.s.repo, stage: d.stage, ...(d.panel ? { panel: d.panel.kind } : {}), len: p.payload.length, ok: false })
+    return holdResponse(d)
+  }
+  // 502 here is a CONTRACT, not "the server is down": deliver() either typed
+  // AND submitted, or it submitted NOTHING (typeAndSubmit in tui-input.mjs).
+  // `notDelivered` says exactly that, machine-readably — it is what lets the
+  // client retry this 502 once and only this one: a *transport* 502 ("bridge
+  // unreachable") carries no such proof, and retrying that could double-send.
+  // The retry cannot stack a copy: a box the refusal could not SEE empty
+  // (`emptied: false`) holds the retry at box-not-empty/no-box before it types.
+  if (!d.ok) return { status: 502, ok: false, error: d.error, notDelivered: true }
   // Attribute the next run to this prompt (phase tracker snapshots it on open).
   p.s.lastPrompt = { text: p.text, at: nowIso() }
   recordSteer(p.s, p.text, steeredBy)
@@ -2722,7 +2733,7 @@ export async function interrupt({ id, text, images, steeredBy }) {
   await run(['tmux', 'send-keys', '-t', p.s.tmux, 'Escape'])
   await sleep(INTERRUPT_SETTLE_MS)
   const d = await deliver(p.s, p.payload)
-  if (!d.ok) return { status: 502, ok: false, error: d.error }
+  if (!d.ok) return TUI_HOLD_STAGES.has(d.stage) ? holdResponse(d) : { status: 502, ok: false, error: d.error, notDelivered: true }
   // The Escape blip clears the busy marker briefly — hold the run phase so the
   // steer doesn't register as the turn ending; attribute the run to this input.
   p.s.phaseHold = Date.now() + PHASE_HOLD_MS
@@ -2896,7 +2907,7 @@ export async function sendNow({ id }) {
   if (!d.ok) {
     s.queued = [q, ...(s.queued || [])]
     persist()
-    return { status: 502, ok: false, error: d.error }
+    return TUI_HOLD_STAGES.has(d.stage) ? holdResponse(d) : { status: 502, ok: false, error: d.error }
   }
   // Same as interrupt: hold the run across the Escape blip and attribute it.
   s.phaseHold = Date.now() + PHASE_HOLD_MS
@@ -2953,6 +2964,19 @@ export function purgeNotesAbout(childId) {
 // just on the GET poll) so a queued prompt fires even with the dashboard closed.
 // Skips sessions still working (busy marker) or parked on a menu (text would land
 // in the menu, not as a prompt). Re-entrancy-guarded; a failed send retries next tick.
+// A held queue (TUI_HOLD_STAGES): the reason rides the session to the card
+// (`deliverHold`), and only a CHANGE of reason is logged — a hold is re-checked
+// every 3 s tick and must not write a line per tick the way a refusal did.
+function holdQueue(s, hold) {
+  if ((s.deliverHold?.reason || null) === (hold?.reason || null) && (s.deliverHold?.kind || null) === (hold?.kind || null)) return
+  if (hold) {
+    s.deliverHold = { ...hold, at: nowIso() }
+    console.log(`[agent-local] queue for ${s.id} held — ${hold.reason}${hold.kind ? ` (${hold.kind})` : ''}; the messages stay queued`)
+  } else delete s.deliverHold
+  audit({ action: hold ? 'queue-held' : 'queue-unheld', id: s.id, repo: s.repo, ...(hold || {}), ok: true })
+  persist()
+}
+
 let flushing = false
 async function flushQueued() {
   if (flushing) return
@@ -2982,12 +3006,25 @@ async function flushQueued() {
       })
       if (sel.drops.length) dropStaleNotes(s, sel.drops)
       if (!sel.pick) continue
+      // A panel over the box PARKS the queue — no typing, no backoff ladder —
+      // until it is gone (pane-panel.mjs: hours of refusals under a feedback
+      // card, each leaving a copy behind). Checked off this tick's capture
+      // first; deliver() re-checks at typing time and holds the same way.
+      const panel = parsePanel(pane)
+      if (panel) {
+        holdQueue(s, { reason: 'panel', kind: panel.kind })
+        continue
+      }
       const picked = new Set(sel.pick.entries)
       const q = sel.pick.entries[0]
       const dec = { via: sel.pick.via }
       const text = deliveryText(sel.pick.entries, Date.now())
       const payload = withImages(text, sel.pick.entries.flatMap((e) => e.paths || []))
       const d = await deliver(s, payload)
+      if (!d.ok && TUI_HOLD_STAGES.has(d.stage)) {
+        holdQueue(s, { reason: d.stage, ...(d.panel ? { kind: d.panel.kind } : {}) })
+        continue
+      }
       if (!d.ok) {
         s.deliverFailures = (s.deliverFailures || 0) + 1
         const backoffMs = deliveryBackoffMs(s.deliverFailures)
@@ -3001,6 +3038,7 @@ async function flushQueued() {
       }
       delete s.deliverFailures
       delete s.deliverRetryAt
+      holdQueue(s, null)
       s.lastPrompt = { text, at: nowIso() }
       // The steer fingerprint is taken over the DELIVERED string, so a text this
       // path had to rebuild (an age line, a digest, image paths) must be
@@ -3133,7 +3171,9 @@ const ACTS = {
     const m = registry.shipTrain.members.find((x) => x.id === s.id)
     const text = (m && m.text) || s.lc.shipText
     if (!text) return
-    const d = await deliver(s, text)
+    // Ship is operator-commanded and always cleared the box first; a stray
+    // draft must not wedge the serial train. A panel still holds it.
+    const d = await deliver(s, text, { clearDraft: true })
     if (!d.ok) return // retry next tick
     s.lc.shipPromptedAt = nowIso()
     s.lastPrompt = { text: '(ship)', at: nowIso() }
@@ -3162,7 +3202,7 @@ const ACTS = {
     if (worker && recap && (await sessionAlive(worker))) {
       await run(['tmux', 'send-keys', '-t', worker.tmux, 'Escape'])
       await sleep(INTERRUPT_SETTLE_MS)
-      const d = await deliver(worker, atlasIngestPrompt(recap, s))
+      const d = await deliver(worker, atlasIngestPrompt(recap, s), { clearDraft: true })
       if (d.ok) {
         s.lc.closePhase = 'ingest'
         s.lc.ingestAt = nowIso()
@@ -3464,6 +3504,10 @@ export async function keys({ id, keys: ks }) {
   for (const k of ks)
     if (!ALLOWED_KEYS.has(k)) return { status: 400, ok: false, error: `key not allowed: ${k}` }
   if (!(await sessionAlive(s))) return { status: 409, ok: false, error: 'session not running' }
+  // Raw keys never reach a Claude Code PANEL: its digits act (a `2`, twice,
+  // sends feedback to Anthropic). Its own safe keys go through panelAction.
+  const panel = parsePanel(await captureTail(s, TAIL_LINES))
+  if (panel) return { status: 409, ok: false, error: 'panel', panel }
   const r = await run(['tmux', 'send-keys', '-t', s.tmux, ...ks])
   if (!r.ok) return { status: 502, ok: false, error: r.stderr.slice(0, 500) || 'send-keys failed' }
   // A menu confirmation can unblock a run — attribute it (no free-text prompt).
@@ -3471,6 +3515,23 @@ export async function keys({ id, keys: ks }) {
   persist()
   audit({ action: 'keys', id, repo: s.repo, keys: ks, ok: true })
   return { status: 200, ok: true }
+}
+
+// Answer the Claude Code panel blocking a session with one of ITS safe keys —
+// the card's Dismiss / Review / Close (tui-input.mjs pressPanelAction: the
+// action is re-read off the live pane, and `2` is never one).
+export async function panelAction({ id, action }) {
+  const s = registry.sessions[id]
+  if (!s) return { status: 404, ok: false, error: 'no such session' }
+  if (typeof action !== 'string' || !action) return { status: 400, ok: false, error: 'action required' }
+  if (!(await sessionAlive(s))) return { status: 409, ok: false, error: 'session not running' }
+  const r = await pressPanelAction(action, {
+    readPane: () => captureTail(s, TAIL_LINES, true),
+    typeText: (text) => run(['tmux', 'send-keys', '-t', s.tmux, '-l', text]),
+    pressKey: (key) => run(['tmux', 'send-keys', '-t', s.tmux, key]),
+  })
+  audit({ action: 'panel-action', id, repo: s.repo, panelAction: action, ...(r.panel ? { left: r.panel.kind } : {}), ...(r.ok ? {} : { error: r.error }), ok: r.ok })
+  return r.ok ? { status: 200, ok: true, panel: r.panel } : { status: 409, ok: false, error: r.error, panel: r.panel }
 }
 
 // Verified selection of a pending choice-menu option — never a blind
@@ -3526,7 +3587,7 @@ export async function kill({ id }) {
     // Typed vaults (atlas, a sibling vault, … — those carrying a Wiki/Legend.md)
     // flush insights the TYPED way (typed edges/dates + Legend + log).
     const closePrompt = isTypedVault(s.vault) ? ATLAS_KNOWLEDGE_CLOSE_PROMPT : KNOWLEDGE_CLOSE_PROMPT
-    const d = await deliver(s, closePrompt)
+    const d = await deliver(s, closePrompt, { clearDraft: true })
     if (d.ok) {
       beginClose(s) // → ingesting (no closePhase); the driver reaps when the wrap-up turn ends
       audit({ action: 'close', id, repo: s.repo, ok: true })
@@ -3542,7 +3603,7 @@ export async function kill({ id }) {
     delete s.queued
     await run(['tmux', 'send-keys', '-t', s.tmux, 'Escape'])
     await sleep(INTERRUPT_SETTLE_MS)
-    const d = await deliver(s, DEV_RECAP_PROMPT)
+    const d = await deliver(s, DEV_RECAP_PROMPT, { clearDraft: true })
     if (d.ok) {
       beginClose(s, { phase: 'recap' }) // → ingesting/recap; the driver runs recap → ingest → merge → reap
       audit({ action: 'close', id, repo: s.repo, kind: 'dev', ok: true })
@@ -3602,7 +3663,7 @@ export async function cleanup({ id }) {
     delete s.queued
     await run(['tmux', 'send-keys', '-t', s.tmux, 'Escape'])
     await sleep(INTERRUPT_SETTLE_MS)
-    const d = await deliver(s, DEV_RECAP_PROMPT)
+    const d = await deliver(s, DEV_RECAP_PROMPT, { clearDraft: true })
     if (d.ok) {
       beginClose(s, { phase: 'recap', cleanup: true })
       audit({ action: 'close', id, repo: s.repo, kind: 'dev', cleanup: true, ok: true })

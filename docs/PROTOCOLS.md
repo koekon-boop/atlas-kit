@@ -28,14 +28,14 @@ Five operations act on a live session, each with a different disruption profile:
 | Action | Implementation | Behavior | Use when |
 |---|---|---|---|
 | **queue** | `queuePrompt()` — `agent-local.mjs` | Appends to `s.queued` (a FIFO). `flushQueued()`, on a 3s timer (`QUEUE_FLUSH_MS`), delivers the first entry **`queue-delivery.mjs` says it may** — the head at idle — see [§1a](#1a-when-a-queued-message-is-delivered). A menu, or being the active ship-train head, still holds everything. | The agent is mid-turn; you want to add context without breaking its flow. The gentle default. |
-| **prompt** | `prompt()` — `agent-local.mjs` | Delivers immediately. Refuses with `409` if a choice menu (plan/permission) is pending, unless `force` is set — typing into a live menu would silently confirm the highlighted option. Delivery itself **sanitises terminal escapes and reads the input box back before pressing Enter** (`tui-input.mjs`): `send-keys -l` is a keyboard, so an escape sequence in pasted text is parsed as keys and swallows the words around it. A buffer that can't be read back is cleared and the call fails rather than submitting something mangled. | The agent is already idle, waiting on you. |
+| **prompt** | `prompt()` — `agent-local.mjs` | Delivers immediately. Refuses with `409` if a choice menu (plan/permission) is pending, unless `force` is set — typing into a live menu would silently confirm the highlighted option. Delivery itself **sanitises terminal escapes and reads the input box back before pressing Enter** (`tui-input.mjs`): `send-keys -l` is a keyboard, so an escape sequence in pasted text is parsed as keys and swallows the words around it. A buffer that can't be read back is cleared and the call fails rather than submitting something mangled. Invisible Unicode (bidi marks, ZWSP, BOM… — Claude Code strips those itself on Enter and then submits *nothing*) is removed before typing, and **every Enter is verified**: the box must empty, else it is cleared and the call fails `deliver-unsubmitted`. Every refusal is a `502` with `notDelivered: true` (nothing was sent — the web client resends once), audited as a payload fingerprint, never the text. A send that never got JSON back from the API (an edge's HTML 502, a network error) reads *dashboard not reachable* in the card and is reported to `POST /api/agents/client-send-fail` once the API answers again. All of it is `typeAndSubmit` in `tui-input.mjs`, shared by both executors. | The agent is already idle, waiting on you. |
 | **interrupt** | `interrupt()` — `agent-local.mjs:2101` | Sends `Escape` (stops the in-flight turn, **keeps** the transcript), waits `INTERRUPT_SETTLE_MS` (400ms) for the TUI to settle, then delivers. Disruptive. | The agent is going wrong and must change course *now*. |
 | **kill** | `kill()` — `agent-local.mjs:2856` | For a dev agent **without** a live paired Atlas worker (or on a second press), an immediate `tmux kill-session` — the worktree + `agent/<id>` branch are **kept** for review. For a dev agent **with** a paired worker (first press), closes gracefully: delivers `DEV_RECAP_PROMPT` (line 2671), moves the session to `ingesting/recap`, and lets the driver run recap → worker ingest → Atlas merge → reap. Never touches the git remote beyond killing tmux. | The agent's work is done or it was started in error, but you're not ready to delete its branch. |
 | **merge** | `mergePr()` — `agent-local.mjs` | Pre-flights the PR server-side (`merge-preflight.mjs`) and **refuses a stale / conflicted / blocked / red / checks-pending one with the state named**; on pass, runs `gh pr merge --merge` in the session's repo checkout and records who merged. Box-local only. `force: true` skips the pre-flight, audited as such. Neither `kill` nor `cleanup` ever merges anything. | You already know the PR is fresh and green. Otherwise **ship** the agent — merging does not rebase. |
 | **cleanup** | `cleanup()` — `agent-local.mjs` | Same graceful recap/ingest path as `kill`, but sets `s.lc.cleanupOnClose = true` so the final `REAP` act (`ACTS[ACT.REAP]`) **also** calls `removeAgentArtifacts()` (line 2910) — `git worktree remove --force` + `git branch -D`. Irreversible from inside the runtime. | Only once the work is actually merged/abandoned — see [§3](#3-cleanup-gating). |
 
 **Who may steer — own descendants only.** A steer is text injected as a user turn, so
-`POST /api/agents/{prompt,queue,interrupt}` scope it by the caller: `steeredBy`, the
+`POST /api/agents/{prompt,queue,interrupt,panel}` scope it by the caller: `steeredBy`, the
 calling chat's session id, stamped by the MCP `prompt_agent`/`queue_agent`/`interrupt_agent`
 tools from `ATLAS_SESSION` (the model never supplies it). A caller may steer only
 sessions it spawned, or what those spawned in turn — `steerAllowed()` in
@@ -44,7 +44,9 @@ Everything else — a peer chat's agent, a parent, the operator's standing Teleg
 any session with no spawn parent — is a **403** naming the owner (or saying no chat owns
 it), and the refusal is a `steer-scope` line in `audit.log`. There is **no** `scope:"any"`
 override: "steer that other chat anyway" is exactly what an injected instruction would
-ask for, and the operator can always steer it directly.
+ask for, and the operator can always steer it directly. `/panel` (answering a Claude Code
+panel over the box) presses keys in the target's TUI, so it is a steer too and sits behind
+the same gate; no MCP tool calls it today, so in practice only the dashboard (no caller) does.
 
 - **`steeredBy` absent means allowed**, exactly as before: the dashboard's compose box, the
   Telegram/WhatsApp bridges delivering into their target session and Hermes'
@@ -88,9 +90,18 @@ tick ([§1b](#1b-an-observation-is-only-true-when-it-was-made)):
   forwarding — an unstamped entry would silently read as observational.
 
 A pending **menu** holds every kind (typing into a menu is a selection, not text), as does
-being the active ship-train head. A delivery the executor refuses (a box it can't clear, a
-buffer that won't read back) backs the session off with `deliveryBackoffMs` instead of
-retrying every 3 s; the message stays queued. `AGENT_BOUNDARY_DELIVERY=0` /
+being the active ship-train head. So does a **hold**: delivery looks at the pane before it
+types a key (`typeAndSubmit`, `tui-input.mjs`), and a Claude Code **panel** above the box (the
+feedback-draft card, the session survey — `pane-panel.mjs`), no input box on screen, or a box
+that already holds text each refuse with *nothing typed*. The queue parks on its reason
+(`deliverHold`, shown on the first queued chip; `queue-held`/`queue-unheld` audited once per
+change, no backoff ladder) and delivers the moment it is gone; a direct prompt answers `409`
+with the reason. Text already in the box is never typed onto and never wiped — only the card's
+explicit "Clear it & send" and the lifecycle prompts (ship, close/recap, ingest hand-off) clear
+it first, verified. The card answers a panel through `POST /api/agents/panel` with the panel's
+own safe keys (dismiss `0`, review `1`, Esc) — never its `2`, which sends feedback to Anthropic.
+A delivery the executor refuses after typing (a buffer that won't read back) backs the session
+off with `deliveryBackoffMs` instead of retrying every 3 s; the message stays queued. `AGENT_BOUNDARY_DELIVERY=0` /
 `BRIDGE_BOUNDARY_DELIVERY=0` restore idle-only delivery, independently per executor.
 
 ---
@@ -593,6 +604,21 @@ message in the other direction.
   exactly the thing that must not vanish. `GET /api/agents/messages` reads it back.
   ⚠️ `delivered: true` means *handed off*, not *read*.
 
+**Claude Code's OWN cross-session messaging is closed at spawn — the bus is the only channel.**
+Claude Code ≥ 2.1.224 gives every session `ListAgents`/`SendMessage` plus a per-session inbox
+socket, **on by default**, so every agent session on the box is an addressable peer — a second
+channel with no lineage bound, no budget, no log line and nothing the dashboard can show. So every
+spawned session launches with `claude --settings <json>` from `api/src/native-msg-policy.mjs`, **one
+decision imported by both executors** (`agent-local.mjs`, `agent-bridge/server.mjs`), applied to every
+launch **and resume** template so a revived agent can't come back with the channel reopened. Per kind:
+**dev** = `crossSessionInbound: "refuse"` **plus** deny rules on both tools; **knowledge/Atlas** =
+`refuse` only, because `SendMessage` also continues an in-process subagent by id and an orchestrator
+needs that. A dev agent keeps the `Agent` tool (it still spawns sub-agents) and only loses the
+follow-up to one it already spawned. `--settings` loads *additional* settings (deny rules union across
+scopes) and unknown keys are ignored, so an older Claude Code launches unchanged; a template that
+already passes `--settings` is left alone. Kill-switch **`ATLAS_NATIVE_MSG_POLICY=off`**, read per
+process so the box and a bridge revert independently; off injects nothing.
+
 **The remote half.** The box's API is loopback-bound, so a container agent posts to its own
 bridge instead. The bridge parks the attempt, the box drains `POST /outbox` on the remote
 poll it already runs, decides it with the **same** `deliverAgentMessage()`, and posts the
@@ -724,7 +750,24 @@ any file type, not just images. They are validated once, above the kind branch, 
 `AGENT_MAX_IMAGES`; the executor saves them under `uploads/<id>` **after** the session id is
 resolved and **before** anything is registered or launched (so a bad attachment fails fast
 leaving nothing behind), and folds their absolute paths into the opening prompt as a
-single-line tail telling the agent to `Read` them first.
+tail telling the agent to `Read` them first. Prompts, queued prompts and interrupts carry
+attachments the same way. The cap is 20 files.
+
+**Inline images.** A pasted message with screenshots in it carries an `[Image N]` marker
+where each image sat, and image N travels as a file named `image-N.<ext>`
+(`web/src/lib/pasteImages.ts`). Both executors fold paths through the one `withImages`
+in `api/src/agent-attachments.mjs`. It swaps each marker for `[Image N: <saved path>]`
+in place, because N survives in the saved basename, so queued entries need no new field.
+Files without a marker keep the appended tail. With no marker at all, the output is
+byte-identical to the plain tail. An image the page could not read stays in the text as
+`[Image N unreadable: <src>]`, with a warning chip under the field. It is never dropped.
+
+**Drops.** Each composer is a drop zone (`useDropZone` in `web/src/components/AgentAttach.tsx`):
+the dev spawn form, the Ask form, and a whole chat, in its card row or full screen. A drop on
+the field works like a paste at the drop point. A drop anywhere else in the zone becomes chips.
+The 📎 picker goes the same way. A drop only fills the draft and never sends or spawns. Files
+over the per-file cap, empty files and files past the 20-file cap get a visible chip. A file
+dropped outside every zone is refused at the window (`web/src/lib/fileDrop.ts`).
 
 ---
 

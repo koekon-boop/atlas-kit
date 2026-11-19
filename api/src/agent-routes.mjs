@@ -52,7 +52,7 @@ import { EVIDENCE_FRAMING_BYTES } from './atlas-candidates.mjs'
 const BRIDGE_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_TIMEOUT_MS || 8000)
 const BRIDGE_EXEC_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_EXEC_TIMEOUT_MS || 30000)
 // Cap on image attachments per prompt (also enforced in each executor).
-const MAX_IMAGES = Number(process.env.AGENT_MAX_IMAGES || 6)
+const MAX_IMAGES = Number(process.env.AGENT_MAX_IMAGES || 20)
 // The prompt route opts out of the global 32kb parser (LARGE_BODY_ROUTES in
 // server.mjs) so it can carry base64 images; parse it here with a roomier limit.
 const jsonPrompt = express.json({ limit: process.env.AGENT_PROMPT_BODY_LIMIT || '24mb' })
@@ -163,7 +163,7 @@ export const ATLAS_SEARCH_PREAMBLE =
   `Atlas search — you can query the operator's Knowledge Atlas (a typed, queryable wiki of projects, decisions and open tasks) with these READ-ONLY tools:
 - \`query_atlas\` — the TYPED relational/temporal engine: filter and traverse the snake_case frontmatter keys (\`for_project\`, \`area\`, \`depends_on\`, \`stakeholders\`, \`status\`, \`due\`). Use it for "what else is in flight on this project", "what depends on this", "is there already an open task about X".
 - \`query_vault\` — full-text (prose) search over page CONTENT, when you have keywords rather than a relationship.
-- \`get_note\` reads one page; \`wiki_index\` / \`wiki_pages\` / \`wiki_graph\` list and link pages; \`recent_activity\` shows what changed recently.
+- \`get_note\` reads one page: past 20,000 chars you get its head, an outline of the cut sections and the exact next call (\`section\` fetches one \`##\`/\`###\` section, \`offset\` continues), so nothing is out of reach; \`wiki_index\` / \`wiki_pages\` / \`wiki_graph\` list and link pages; \`recent_activity\` shows what changed recently.
 PREFER them over hand-rolled grep; if they aren't available to you, grepping those exact snake_case keys over a vault checkout is the fallback.
 Reach for them BEFORE assuming something is new, when a decision your task touches looks already-made, and when the task names a project, person or system this repo doesn't explain — the Atlas carries prior decisions, constraints and open tasks the code never states.
 ⚠️ Absence from a search result is NOT evidence of absence: these retrieve by keyword and by typed key over what happens to be written down, so never conclude "X doesn't exist" or "this is new" from an empty result — say the search surfaced nothing. And a CODE question is answered by READING THE CODE: the Atlas records intent and history, the repo is the truth about behaviour.
@@ -181,7 +181,7 @@ export const ATLAS_REMOTE_SEARCH_PREAMBLE =
   `Atlas search — you can query the operator's Knowledge Atlas (a typed, queryable wiki of projects, decisions and open tasks) with the READ-ONLY \`atlas-query\` command. It runs the query on the dashboard box and prints the result; it blocks for a few seconds, so just run it and read the output (never poll for it).
 - \`atlas-query query_atlas '{"type":"task","status":"next","edge_key":"for_project","edge_target":"My Project"}'\` — the TYPED relational/temporal engine: filter and traverse the snake_case frontmatter keys (\`for_project\`, \`area\`, \`depends_on\`, \`stakeholders\`, \`status\`, \`due\`). Use it for "what else is in flight on this project", "what depends on this", "is there already an open task about X".
 - \`atlas-query query_vault '{"query":"cloudflare tunnel","limit":5}'\` — full-text (prose) search over page CONTENT, when you have keywords rather than a relationship.
-- \`atlas-query get_note '{"path":"Wiki/Projects/My Project.md"}'\` reads one page; \`wiki_index\` / \`wiki_pages\` / \`wiki_graph\` list and link pages; \`recent_activity\` shows what changed recently. Arguments are JSON (single-quote them for your shell; \`-\` reads them on stdin); run \`atlas-query\` with no arguments for the usage.
+- \`atlas-query get_note '{"path":"Wiki/Projects/My Project.md"}'\` reads one page: past 20,000 chars you get its head, an outline of the cut sections and the exact next call (\`section\` fetches one \`##\`/\`###\` section, \`offset\` continues), so nothing is out of reach; \`wiki_index\` / \`wiki_pages\` / \`wiki_graph\` list and link pages; \`recent_activity\` shows what changed recently. Arguments are JSON (single-quote them for your shell; \`-\` reads them on stdin); run \`atlas-query\` with no arguments for the usage.
 Reach for it BEFORE assuming something is new, when a decision your task touches looks already-made, and when the task names a project, person or system this repo doesn't explain — the Atlas carries prior decisions, constraints and open tasks the code never states.
 ⚠️ Absence from a search result is NOT evidence of absence: these retrieve by keyword and by typed key over what happens to be written down, so never conclude "X doesn't exist" or "this is new" from an empty result — say the search surfaced nothing. And a CODE question is answered by READING THE CODE: the Atlas records intent and history, the repo is the truth about behaviour.
 Read-only is deliberate — you never write the Atlas yourself; your paired Atlas worker does that at the end of your run. Queries are budgeted and logged, so make each one count. If the command isn't installed here (an older bridge), carry on without it — just don't treat the gap as evidence.`
@@ -383,7 +383,7 @@ Keep replies short — durable knowledge belongs in Atlas pages, not in the tran
 const EXTENDED_CONTEXT = !/^(0|false|no|off)$/i.test(process.env.AGENT_EXTENDED_CONTEXT || '')
 const CTX = EXTENDED_CONTEXT ? '[1m]' : ''
 const AGENT_MODELS = {
-  fable: `claude-fable-5${CTX}`,
+  fable: `claude-fable-5-2${CTX}`,
   // Opus 5.5 since 2026-09-30 (operator's request). Both `claude-opus-5-5` and
   // the `[1m]` variant were checked against the installed CLI (2.1.286) before
   // the switch — the long-context suffix works here, unlike for Haiku below.
@@ -1366,6 +1366,34 @@ export const withHeader = (sender, text) => `${messageHeader(sender)}\n\n${text}
  *    can't ping-pong forever. Exhaustion is a 429 the sending agent reads.
  * ------------------------------------------------------------------ */
 
+/* A send the BROWSER saw fail without ever getting a JSON answer from this API
+ * — fetch threw, or a 502/524 came back as Cloudflare's HTML page or Caddy's
+ * empty upstream-down body. None of those reach audit.log on their own — a
+ * "502, then it works again" in the browser leaves no trace here — so the
+ * client reports them here once it can. Whitelisted, bounded fields only —
+ * never the text: which op, what came back (status, a Cloudflare ray id when
+ * there is one), how long it took. */
+const CLIENT_SEND_OPS = new Set(['prompt', 'interrupt', 'queue'])
+export function clientSendFailEntry(b) {
+  const o = b && typeof b === 'object' ? b : {}
+  const int = (v, max) => (Number.isInteger(v) && v >= 0 && v <= max ? v : undefined)
+  const str = (v, re) => (typeof v === 'string' && re.test(v) ? v : undefined)
+  if (!CLIENT_SEND_OPS.has(o.op)) return null
+  const e = {
+    action: 'client-send-fail',
+    op: o.op,
+    kind: o.kind === 'network' ? 'network' : 'non-json',
+    status: int(o.status, 599),
+    cfRay: str(o.cfRay, /^[0-9a-f]{8,32}(-[A-Z]{3})?$/i),
+    ms: int(o.ms, 3600000),
+    len: int(o.len, 10_000_000),
+    sentAt: str(o.at, /^\d{4}-\d\d-\d\dT[\d:.]+Z$/),
+    ok: false,
+  }
+  for (const k of Object.keys(e)) if (e[k] === undefined) delete e[k]
+  return e
+}
+
 // Is `from` allowed to message `to`? Pure (parent lookup injected) so the
 // bounding rule is testable without a registry. Returns { ok } or { ok:false, error }.
 export function messageAllowed(from, to, parentOf) {
@@ -2326,9 +2354,22 @@ export function agentRouter(bearerAuth) {
     // `force` bypasses the pending-choice-menu guard — set by the card's "dismiss
     // menu & send" after it has Escaped the menu (see local/bridge prompt()).
     body.force = !!(req.body && req.body.force)
+    // `clearBox` empties a box that already held text first — the card's "clear
+    // the input & send", offered only after a 409 box-not-empty.
+    if (req.body && req.body.clearBox === true) body.clearBox = true
     if (local.hasSession(body.id)) return sendLocal(res, armIfSent(body, await local.prompt(body)))
     const r = armIfSent(body, await callBridgeForId('POST', '/prompt', body, body.id, BRIDGE_EXEC_TIMEOUT_MS))
     res.status(r.status).json(r.body)
+  })
+
+  router.post('/api/agents/client-send-fail', bearerAuth, (req, res) => {
+    const reports = Array.isArray(req.body?.reports) ? req.body.reports.slice(0, 20) : [req.body]
+    let n = 0
+    for (const r of reports) {
+      const e = clientSendFailEntry(r)
+      if (e) { local.audit(e); n++ }
+    }
+    res.json({ ok: true, recorded: n })
   })
 
   // Interrupt the in-flight turn and steer with the given context (Esc, then send;
@@ -2480,6 +2521,25 @@ export function agentRouter(bearerAuth) {
     if (!Array.isArray(keys) || !keys.length) return res.status(400).json({ ok: false, error: 'missing "keys"' })
     if (local.hasSession(id)) return sendLocal(res, await local.keys({ id, keys }))
     const r = await callBridgeForId('POST', '/keys', { id, keys }, id, BRIDGE_EXEC_TIMEOUT_MS)
+    res.status(r.status).json(r.body)
+  })
+
+  // Answer a Claude Code PANEL over the input box (the feedback-draft card,
+  // the session survey) with one of its own safe keys: `action` is dismiss /
+  // review / close / keep / back, re-read off the live pane by the executor —
+  // never a key from the client, and never `2` (send feedback to Anthropic:
+  // the operator's call, in the terminal). An un-restarted bridge 404s here,
+  // which the card shows as an error; nothing is pressed.
+  router.post('/api/agents/panel', bearerAuth, async (req, res) => {
+    const { id, action } = req.body || {}
+    if (!id || typeof id !== 'string') return res.status(400).json({ ok: false, error: 'missing "id"' })
+    if (!action || typeof action !== 'string') return res.status(400).json({ ok: false, error: 'missing "action"' })
+    // Fork: the same steer lineage as /prompt — pressing keys in another
+    // session's TUI is a steer. A caller naming itself (`steeredBy`) may only
+    // answer panels of its own descendants; the dashboard sends none.
+    if (steerRefused({ id, steeredBy: req.body.steeredBy }, res, 'panel')) return
+    if (local.hasSession(id)) return sendLocal(res, await local.panelAction({ id, action }))
+    const r = await callBridgeForId('POST', '/panel', { id, action }, id, BRIDGE_EXEC_TIMEOUT_MS)
     res.status(r.status).json(r.body)
   })
 

@@ -37,7 +37,7 @@ const CTX = /^(0|false|no|off)$/i.test(process.env.AGENT_EXTENDED_CONTEXT || '')
 
 test('knowledge/Atlas spawn with no model/effort → Opus at xhigh', () => {
   assert.deepEqual(spawnPicks({ kind: 'knowledge' }), {
-    modelId: `claude-opus-5${CTX}`,
+    modelId: `claude-opus-5-5${CTX}`,
     effortLevel: 'xhigh',
   })
 })
@@ -64,19 +64,19 @@ test('MCP spawn_agent (knowledge) sends no model/effort — it inherits the rout
   assert.equal(body.model, undefined)
   assert.equal(body.effort, undefined)
   assert.equal(body.vault, 'atlas')
-  assert.deepEqual(spawnPicks(body), { modelId: `claude-opus-5${CTX}`, effortLevel: 'xhigh' })
+  assert.deepEqual(spawnPicks(body), { modelId: `claude-opus-5-5${CTX}`, effortLevel: 'xhigh' })
 })
 
 test('explicit picks still override in every path', () => {
   assert.equal(spawnPicks({ model: 'sonnet', kind: 'knowledge' }).modelId, `claude-sonnet-5${CTX}`)
-  assert.equal(spawnPicks({ model: 'fable', kind: 'knowledge' }).modelId, `claude-fable-5${CTX}`)
-  assert.equal(spawnPicks({ model: 'fable' }).modelId, `claude-fable-5${CTX}`)
+  assert.equal(spawnPicks({ model: 'fable', kind: 'knowledge' }).modelId, `claude-fable-5-2${CTX}`)
+  assert.equal(spawnPicks({ model: 'fable' }).modelId, `claude-fable-5-2${CTX}`)
   assert.equal(spawnPicks({ model: 'haiku', kind: 'knowledge' }).modelId, 'claude-haiku-4-5')
   assert.equal(spawnPicks({ effort: 'max', kind: 'knowledge' }).effortLevel, 'max')
   // …and through the MCP tool, for a dev agent and a knowledge agent alike.
   assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'sonnet', effort: 'max' })).modelId, `claude-sonnet-5${CTX}`)
   assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'sonnet', effort: 'max' })).effortLevel, 'max')
-  assert.equal(spawnPicks(spawnBody({ task: 't', kind: 'knowledge', model: 'fable' })).modelId, `claude-fable-5${CTX}`)
+  assert.equal(spawnPicks(spawnBody({ task: 't', kind: 'knowledge', model: 'fable' })).modelId, `claude-fable-5-2${CTX}`)
   assert.equal(spawnPicks(spawnBody({ task: 't', repo: 'demo-repo', model: 'haiku' })).modelId, 'claude-haiku-4-5')
 })
 
@@ -97,9 +97,9 @@ test('AGENT_EXTENDED_CONTEXT=0 is the [1m] kill-switch — on every model', asyn
   // The suffix is frozen at module init, so re-import with a cache-busting query
   // to get a fresh instance under the flag (its own imports stay cached).
   const off = await import('../src/agent-routes.mjs?extended-context=off')
-  assert.equal(off.spawnPicks({ kind: 'knowledge' }).modelId, 'claude-opus-5')
+  assert.equal(off.spawnPicks({ kind: 'knowledge' }).modelId, 'claude-opus-5-5')
   assert.equal(off.spawnPicks({}).modelId, 'claude-sonnet-5')
-  assert.equal(off.spawnPicks({ model: 'fable' }).modelId, 'claude-fable-5')
+  assert.equal(off.spawnPicks({ model: 'fable' }).modelId, 'claude-fable-5-2')
   assert.equal(off.spawnPicks({ model: 'haiku' }).modelId, 'claude-haiku-4-5') // unaffected either way
   if (prev === undefined) delete process.env.AGENT_EXTENDED_CONTEXT
   else process.env.AGENT_EXTENDED_CONTEXT = prev

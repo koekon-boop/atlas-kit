@@ -233,7 +233,9 @@ test('submitCode: a wrong code is rejected, counted, and the SAME window stays o
 test('submitCode: three wrong codes give up and release the lock', async () => {
   const fx = fixture({ loggedIn: false })
   const { fetch } = telegramFetch()
-  const env = envFor(fx, { CLAUDE_LOGIN_METHODS: 'telegram' })
+  // A roomy window: three confirm polls back to back can outlast the suite's
+  // 200 ms under load, and then the third answer is "expired", not "given up".
+  const env = envFor(fx, { CLAUDE_LOGIN_METHODS: 'telegram', CLAUDE_LOGIN_CODE_WAIT_MS: '10000' })
   await startAttempt({ env, fetch, exec: fx.exec, file: fx.stateFile, trigger: 'broken' })
   await submitCode(WRONG_CODE, { env, fetch, exec: fx.exec, file: fx.stateFile })
   await submitCode(WRONG_CODE, { env, fetch, exec: fx.exec, file: fx.stateFile })
