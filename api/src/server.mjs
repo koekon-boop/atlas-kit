@@ -20,6 +20,7 @@
  * ------------------------------------------------------------------ */
 import express from 'express'
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import { readRouter } from './read-routes.mjs'
 import { agentRouter } from './agent-routes.mjs'
 import { atlasRouter } from './atlas-routes.mjs'
@@ -77,6 +78,26 @@ reportClaudeBinAtBoot()
 app.get('/api/health', (_req, res) =>
   res.json({ ok: true, service: 'atlas-kit-api', claude: claudeBinHealth() }),
 )
+
+// Etsy OAuth callback catch — writes the authorization code to a temp file
+// so the Atlas agent can pick it up to complete the OAuth token exchange.
+app.get('/etsy-callback', (req, res) => {
+  const code = req.query.code
+  const state = req.query.state
+  const error = req.query.error
+  if (error) {
+    console.error('[etsy-callback] ERROR:', req.originalUrl)
+    res.status(400).send(`Etsy OAuth error: ${error}. Check agent logs.`)
+    return
+  }
+  if (!code) {
+    res.status(400).send('No code parameter in callback URL. Try again.')
+    return
+  }
+  fs.writeFileSync('/tmp/etsy-oauth-code.json', JSON.stringify({ code, state, ts: Date.now() }, null, 2))
+  console.error('[etsy-callback] GOT CODE, saved to /tmp/etsy-oauth-code.json')
+  res.status(200).send(`<html><body><h1>✅ Auth received!</h1><p>Code captured. Return to the Atlas agent.</p></body></html>`)
+})
 
 app.use(readRouter())
 app.use(agentRouter(bearerAuth))

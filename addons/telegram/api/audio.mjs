@@ -21,6 +21,7 @@
  * saves images/videos/documents). Everything takes its `fetch` as an argument, so
  * the tests never leave the process.
  * ------------------------------------------------------------------ */
+import http from 'node:http'
 import { apiUrl, config, fileUrl } from './config.mjs'
 
 export const clip = (s, n = 300) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n)
@@ -97,6 +98,30 @@ export async function fetchAudio(fileId, opts = {}) {
   return r.ok ? { ok: true, audio: r.bytes } : r
 }
 
+/* Atlas 28.10.2026: Node's built-in fetch (undici) gives up waiting for response headers
+ * after a fixed 300 s, whatever the AbortSignal says ("fetch failed") — long voice notes
+ * take longer than that to transcribe on the box. The loopback call therefore goes
+ * through node:http with the configured timeout; an injected fetch (tests) still wins. */
+function postLoopback(url, { headers, body, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url)
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(body)
+    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'POST',
+      headers: { ...headers, 'content-length': buf.length } }, (res) => {
+      const chunks = []
+      res.on('data', (ch) => chunks.push(ch))
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, json: async () => JSON.parse(text) })
+      })
+      res.on('error', reject)
+    })
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`transcription timed out after ${Math.round(timeoutMs / 1000)} s`)))
+    req.on('error', reject)
+    req.end(buf)
+  })
+}
+
 /* addons/voice answers "the STT command produced no transcript" with a 503, the
  * same status as "no engine configured" — the message is the only difference. */
 const EMPTY = /produced no transcript/i
@@ -111,12 +136,11 @@ export async function transcribe(audio, mime, { env = process.env, fetch: f = gl
   const c = config(env)
   if (!c.bearer) return { ok: false, kind: 'error', error: 'DASHBOARD_BEARER_TOKEN is not set — cannot call /api/voice/transcribe' }
   try {
-    const r = await f(`${c.apiBase}/api/voice/transcribe`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${c.bearer}`, 'content-type': mime || 'application/octet-stream' },
-      body: audio,
-      signal: AbortSignal.timeout(c.transcribeTimeoutMs),
-    })
+    const url = `${c.apiBase}/api/voice/transcribe`
+    const headers = { Authorization: `Bearer ${c.bearer}`, 'content-type': mime || 'application/octet-stream' }
+    const r = f === globalThis.fetch && url.startsWith('http://')
+      ? await postLoopback(url, { headers, body: audio, timeoutMs: c.transcribeTimeoutMs })
+      : await f(url, { method: 'POST', headers, body: audio, signal: AbortSignal.timeout(c.transcribeTimeoutMs) })
     const j = await r.json().catch(() => ({}))
     if (r.ok && j?.ok !== false) {
       const text = typeof j?.text === 'string' ? j.text.trim() : ''

@@ -197,7 +197,7 @@ changing `.env`.
 |---|---|---|---|
 | audio size | **16 MB** | `WHATSAPP_MAX_AUDIO_BYTES` | Meta's own cap for audio messages. A voice note is Opus at roughly 6 KB/s, so this is far more than anyone speaks; it only stops something absurd being downloaded into memory. ⚠️ `addons/voice` caps its upload at `ATLAS_VOICE_MAX_AUDIO_BYTES` (**12 MB**) — a clip between the two is downloaded and then refused with the "too long" hint. Raise that variable too if you want the full 16 MB. |
 | Meta requests | 30 s each | `WHATSAPP_MEDIA_TIMEOUT_MS` | the lookup and the download are each one request; a voice note is a few hundred KB |
-| transcription | 120 s | `WHATSAPP_TRANSCRIBE_TIMEOUT_MS` | whisper.cpp needs several seconds per minute of audio on this kind of box; the voice route kills its engine after `ATLAS_VOICE_STT_TIMEOUT_MS` (60 s), so this stays **above** that and the route's precise error wins over a blind abort |
+| transcription | 120 s | `WHATSAPP_TRANSCRIBE_TIMEOUT_MS` | whisper.cpp needs several seconds per minute of audio on this kind of box; the voice route kills its engine after `ATLAS_VOICE_STT_TIMEOUT_MS` (60 s), so this stays **above** that and the route's precise error wins over a blind abort. The call goes over `node:http`, not `fetch`: Node's built-in fetch gives up waiting for response headers after a fixed 300 s regardless of this setting, so only `node:http` honours a value above 300 s |
 
 Cost: one on-box Whisper run per voice note (~290 MB RAM for the `base` model, only while it
 transcribes). No API call, no key.

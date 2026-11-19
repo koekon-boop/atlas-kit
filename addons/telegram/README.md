@@ -59,7 +59,10 @@ things follow:
    `api/src/mcp/*.mcp.json`). If `register()` started the poll loop unconditionally,
    every concurrent session would start its own consumer. Instead `api/poller.mjs`
    claims a small pidfile lock (`<AGENT_LOCAL_DIR>/telegram-poller.lock`) before
-   polling; a process that loses the race does not poll. `GET /api/addons` shows
+   polling; a process that loses the race does not poll. **The stdio MCP servers do
+   not even try** (since 2026-10-27): `register.mjs` sees `…/api/src/mcp/…` in
+   `process.argv[1]` and starts no poller there — when an Express restart once let
+   an MCP server win the lock, voice notes broke. `GET /api/addons` shows
    `telegram.status.poller.owner`: `true` in the process that actually consumes
    updates, `false` (with a reason) in every other one. This is an implementation
    detail of this addon, not a documented core seam — it exists because this
@@ -78,8 +81,8 @@ things follow:
      is still stale. Two claimants that saw the same dead lock can no longer both
      delete it (the second delete used to hit the first one's fresh lock).
    - **Failover**: a process that lost re-tries the claim every 30 s, so when the
-     owner dies (e.g. the stdio MCP server of a closed agent session), another
-     process takes over without a restart.
+     owner dies, another process (the API, never an MCP server) takes over
+     without a restart.
    - **Yield on conflict**: an owner whose `getUpdates` gets `409 Conflict` checks
      the lock again. If it names another live process, this one stops polling
      instead of fighting. If the lock is still its own, the conflict comes from
@@ -201,7 +204,7 @@ too. A **restart** of the API is needed after changing `.env`.
 |---|---|---|---|
 | audio size | **20 MB** | `TELEGRAM_MAX_AUDIO_BYTES` | Telegram's own `getFile` cap — a voice note is Opus at roughly 6 KB/s, so this is far more than anyone speaks; it only stops something absurd being downloaded into memory. ⚠️ `addons/voice` caps its upload at `ATLAS_VOICE_MAX_AUDIO_BYTES` (**12 MB**) — a clip between the two is downloaded and then refused with the "too long" hint. Raise that variable if you want the full 20 MB. |
 | Telegram requests | 30 s each | `TELEGRAM_MEDIA_TIMEOUT_MS` | the `getFile` lookup and the download are each one request; a voice note is a few hundred KB |
-| transcription | 120 s | `TELEGRAM_TRANSCRIBE_TIMEOUT_MS` | whisper.cpp needs several seconds per minute of audio on this kind of box; the voice route kills its engine after `ATLAS_VOICE_STT_TIMEOUT_MS` (60 s), so this stays **above** that and the route's precise error wins over a blind abort |
+| transcription | 120 s | `TELEGRAM_TRANSCRIBE_TIMEOUT_MS` | whisper.cpp needs several seconds per minute of audio on this kind of box; the voice route kills its engine after `ATLAS_VOICE_STT_TIMEOUT_MS` (60 s), so this stays **above** that and the route's precise error wins over a blind abort. The call goes over `node:http`, not `fetch`: Node's built-in fetch gives up waiting for response headers after a fixed 300 s regardless of this setting, so only `node:http` honours a value above 300 s |
 
 Cost: one on-box Whisper run per voice note (~290 MB RAM for the `base` model, only
 while it transcribes). No API call, no key.
@@ -714,6 +717,11 @@ you) — anything, e.g. "hi". Then message [@userinfobot](https://t.me/userinfob
 TELEGRAM_BOT_TOKEN=123456789:AAAA...     # step 1
 TELEGRAM_HOME_CHAT_ID=987654321          # step 2
 ```
+Optional: `TELEGRAM_AGENT_EFFORT=high` (or `xhigh` / `max`) sets the effort the
+standing session is **spawned** with; unset, core's default for a knowledge chat
+applies (`xhigh`). It only takes effect when the next session is created — close the
+current one to switch. Any other value makes core refuse the spawn (`400 unknown
+"effort"`), and the message is not delivered.
 `DASHBOARD_BEARER_TOKEN` must be set (core wants it anyway). Enable the addon —
 `addons.json` `{"enabled": ["telegram"]}` or `ATLAS_ADDONS=…,telegram` — and
 `scripts/serve.sh restart`.
@@ -737,7 +745,7 @@ variables) and the counters:
 
 | signal | meaning |
 |---|---|
-| `status.poller.owner` is `false` everywhere | the API process does not hold the singleton lock. That is normal if another process on the box (an MCP server) does: check the pid in `<AGENT_LOCAL_DIR>/telegram-poller.lock`. A dead pid is taken over within ~30 s. Also check that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
+| `status.poller.owner` is `false` everywhere | the API process does not hold the singleton lock. An MCP server never takes it, so check the pid in `<AGENT_LOCAL_DIR>/telegram-poller.lock`. A dead pid is taken over within ~30 s. Also check that `TELEGRAM_BOT_TOKEN` is set (no token, no poller at all) |
 | `getUpdates failed: Conflict: terminated by other getUpdates request` in the log | a second consumer on the same token. If the lock names another live process, this process yields after the first conflict (log line `yielding the poll`). If it keeps repeating, the other consumer is outside this box's lock: another bot process or another machine using the same token |
 | `status.poller.lastError` set, rising `pollCount` with no messages arriving | `getUpdates` itself is failing — a bad token answers `401`; `install.sh --check`'s `getMe` probe catches that early |
 | `dropped` rising | the sender's chat id is not in `TELEGRAM_ALLOWED_CHAT_IDS` (or the home chat) |

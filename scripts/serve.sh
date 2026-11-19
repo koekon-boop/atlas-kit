@@ -186,7 +186,10 @@ EOF
 # Dispatch only when executed, not when sourced (tests source the functions above).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-restart}" in
-    ensure)       is_up && { log "already up"; exit 0; }; start ;;
+    # Local fix 2026-10-27 (Atlas): under heavy CPU load (Blender renders) a single 2-s health miss
+    # restarted Express mid-transcription and Ko's voice notes were lost. Only restart after 3 slow misses.
+    ensure)       for _try in 1 2 3; do curl -fsS --max-time 10 "$HEALTH" >/dev/null 2>&1 && { log "already up"; exit 0; }; sleep 15; done
+                  log "health failed 3x (10 s timeout each) — restarting"; start ;;
     restart)      start ;;
     # Explicit full stop: also drop the session/keepalive (safe — nothing restarts
     # right after, so there's no new-session to race the server's shutdown).

@@ -48,7 +48,11 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb)
 }
 
-export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run, startPoller = true } = {}) {
+// Local fix 2026-10-27 (Atlas): the MCP stdio servers (api/src/mcp/server.mjs, one per agent session) load addons too.
+// They must never own the getUpdates poller: when Express restarted they won the lock and voice notes broke (STT runs there blind).
+const IN_MCP_SERVER = /[\\/]api[\\/]src[\\/]mcp[\\/]/.test(String(process.argv[1] || ''))
+
+export function buildRoutes({ Router, express }, { env = process.env, fetch: f = globalThis.fetch, log = console.error, file, exec = run, startPoller = !IN_MCP_SERVER } = {}) {
   const routes = Router()
   const inbound = createInbound({ env, fetch: f, log, file, exec })
   const stt = createSttProbe({ env, fetch: f })

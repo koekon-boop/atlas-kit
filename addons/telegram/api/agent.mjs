@@ -202,7 +202,8 @@ export async function forwardToAgent({ chatId, text }, deps = {}) {
     if (!live) {
       const brief = sessionBrief({ port: c.apiPort, maxVoiceChars: c.maxVoiceChars, homeChatId: c.homeChatId, otherChats: c.allowedChatIds.filter((x) => x !== c.homeChatId) })
       const task = `${brief}\n\n---\nFirst message:\n${framed(chatId, text)}`
-      const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas' }, d)
+      const effort = d.env.TELEGRAM_AGENT_EFFORT // 15.11.2026 (Ko): stehende Telegram-Sitzung auf "high" statt Standard xhigh
+      const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas', ...(effort ? { effort } : {}) }, d)
       if (!r.ok || !r.body.id) return { ok: false, error: `spawn → ${r.status} ${r.body?.error || ''}`.trim() }
       saveState({ ...state, sessionId: r.body.id, createdAt: new Date().toISOString() }, file)
       return { ok: true, via: 'spawn', id: r.body.id }

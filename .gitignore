@@ -25,3 +25,4 @@ agent-bridge/repos.json
 agent-bridge/bridge.env
 #   the real Caddy config, filled in from infra/Caddyfile.example (<REPO_ROOT>)
 infra/Caddyfile
+etsy-token.json
