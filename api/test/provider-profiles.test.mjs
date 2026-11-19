@@ -328,7 +328,7 @@ test('the knowledge model default is a MAPPABLE tier under a profile', () => {
   // A chat defaults to Opus where a dev agent defaults to Sonnet; with a profile
   // both must come out as the TIER ALIAS, or the gateway is asked for (and bills)
   // Anthropic's own model.
-  assert.equal(spawnPicks({ kind: 'knowledge' }).modelId, `claude-opus-5${CTX}`)
+  assert.equal(spawnPicks({ kind: 'knowledge' }).modelId, `claude-opus-5-5${CTX}`)
   assert.equal(spawnPicks({ kind: 'knowledge', provider: 'deepseek-openrouter' }).modelId, 'opus')
   assert.equal(spawnPicks({ kind: 'knowledge', model: 'sonnet', provider: 'deepseek-openrouter' }).modelId, 'sonnet')
 })
@@ -406,7 +406,7 @@ test('the session record + audit line carry the profile NAME only', async () => 
 test('the opus/sonnet/haiku picker is unchanged — with a profile it names the TIER', () => {
   // Without a profile: the resolved Anthropic model ID, exactly as before.
   assert.deepEqual(spawnPicks({ model: 'sonnet' }), { modelId: `claude-sonnet-5${CTX}`, effortLevel: 'xhigh' })
-  assert.deepEqual(spawnPicks({ model: 'opus', effort: 'high' }), { modelId: `claude-opus-5${CTX}`, effortLevel: 'high' })
+  assert.deepEqual(spawnPicks({ model: 'opus', effort: 'high' }), { modelId: `claude-opus-5-5${CTX}`, effortLevel: 'high' })
   assert.deepEqual(spawnPicks({ model: 'haiku' }), { modelId: 'claude-haiku-4-5', effortLevel: 'xhigh' })
   // With one: the tier alias, which is what ANTHROPIC_DEFAULT_<TIER>_MODEL maps —
   // haiku included, so a resolved Anthropic model id never reaches the backend.
