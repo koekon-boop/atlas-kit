@@ -157,6 +157,17 @@ test('first message spawns, the id is remembered in the state file, the next reu
   assert.match(p.body.text, /\[Telegram from 111\] zweite/)
 })
 
+test('TELEGRAM_AGENT_EFFORT sets the standing session\'s effort at spawn; unset leaves it to core\'s default', async () => {
+  const spawnBody = async (env) => {
+    const b = build({ env })
+    await b.inbound.handleOne(update(1, text(1, 'hallo')))
+    return b.world.core.find((c) => c.route === '/api/agents/spawn').body
+  }
+  assert.equal((await spawnBody({ ...ENV, TELEGRAM_AGENT_EFFORT: 'high' })).effort, 'high')
+  assert.equal('effort' in (await spawnBody(ENV)), false)
+  assert.equal('effort' in (await spawnBody({ ...ENV, TELEGRAM_AGENT_EFFORT: '' })), false)
+})
+
 test('a RUNNING session gets the message queued, not typed into the turn', async () => {
   const w = makeWorld({ sessions: [{ id: 'kb-atlas-7', status: 'running' }] })
   const b = build({ world: w })

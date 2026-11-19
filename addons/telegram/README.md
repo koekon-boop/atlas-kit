@@ -717,6 +717,11 @@ you) — anything, e.g. "hi". Then message [@userinfobot](https://t.me/userinfob
 TELEGRAM_BOT_TOKEN=123456789:AAAA...     # step 1
 TELEGRAM_HOME_CHAT_ID=987654321          # step 2
 ```
+Optional: `TELEGRAM_AGENT_EFFORT=high` (or `xhigh` / `max`) sets the effort the
+standing session is **spawned** with; unset, core's default for a knowledge chat
+applies (`xhigh`). It only takes effect when the next session is created — close the
+current one to switch. Any other value makes core refuse the spawn (`400 unknown
+"effort"`), and the message is not delivered.
 `DASHBOARD_BEARER_TOKEN` must be set (core wants it anyway). Enable the addon —
 `addons.json` `{"enabled": ["telegram"]}` or `ATLAS_ADDONS=…,telegram` — and
 `scripts/serve.sh restart`.
