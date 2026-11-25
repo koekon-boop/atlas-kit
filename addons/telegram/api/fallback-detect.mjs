@@ -16,7 +16,8 @@
  * Detection rule (see the task's own note on what a live transcript showed):
  * the LAST entry is an `isApiErrorMessage: true` line, and EITHER its `error`
  * is one of the three known-blocking codes (rate_limit, authentication_failed,
- * billing_error — blocks immediately, any age) OR it is some OTHER
+ * billing_error — blocks immediately, any age), or it is an out-of-credits 402
+ * or a safety refusal (see CREDITS_RE/REFUSAL_RE below — also immediate), OR it is some OTHER
  * isApiErrorMessage line that has been the last entry for at least `staleMs`
  * (a transient blip must not flip the whole channel over). A normal reply
  * landing after an error — the common, non-blocked case — simply makes the
@@ -27,6 +28,18 @@ import fs from 'node:fs'
 import { tailLines, transcriptPath } from '../../../api/src/subagent-scan.mjs'
 
 export const KNOWN_BLOCKING_ERRORS = new Set(['rate_limit', 'authentication_failed', 'billing_error'])
+
+// Two more shapes that block at once, both seen on this box (24./25.11.2026):
+//   · an OpenRouter-backed session out of credits — `error: "unknown"`, but
+//     `apiErrorStatus: 402` / `apiErrorType: "billing_error"` and "…exceed your
+//     available credits…" / "Insufficient credits" in the text. Read as
+//     'billing_error'.
+//   · a safety-classifier refusal — `error: "invalid_request"`, a
+//     `refusingModel` field, and "…can't help with this. Start a new session to
+//     continue." Every later turn of that session ends the same way, so it is
+//     its own reason, 'refused': the session has to be REPLACED, not waited out.
+const CREDITS_RE = /exceed your available credits|insufficient credits/i
+const REFUSAL_RE = /start a new session to continue/i
 
 // The newest entry decides blocked/not; cutoffAt (below) additionally scans
 // backward from it for the last successful assistant turn, which can sit a
@@ -123,9 +136,9 @@ export function parseResetAt(resetText, now = Date.now()) {
 }
 
 /**
- * → { blocked, reason, resetText, resetAt, since, apiErrorStatus, cutoffAt }.
+ * → { blocked, reason, transient, resetText, resetAt, since, apiErrorStatus, cutoffAt }.
  * `reason` is the error code ('rate_limit'/'authentication_failed'/
- * 'billing_error'/'other') whenever the last entry IS an api-error line, even
+ * 'billing_error'/'refused', else the raw `error` or 'other') whenever the last entry IS an api-error line, even
  * if `blocked` is still false (a fresh "other" error, not yet stale) — so a
  * caller can show it without re-deciding staleness itself. `cutoffAt` is the
  * timestamp (ms epoch) a caller should replay any main-session delivery
@@ -162,12 +175,20 @@ export function detectBlocked({
       ts = now
     }
   }
-  const known = !!(error && KNOWN_BLOCKING_ERRORS.has(error))
+  const rec = entry.rec
+  const refused = typeof rec.refusingModel === 'string' || REFUSAL_RE.test(entry.raw)
+  const billing = error === 'billing_error' || rec.apiErrorStatus === 402 || rec.apiErrorType === 'billing_error' || CREDITS_RE.test(entry.raw)
+  const known = refused || billing || !!(error && KNOWN_BLOCKING_ERRORS.has(error))
   const resetText = extractResetText(entry.raw)
   const good = lastGoodAssistantAt(lines, entry.index)
   return {
     blocked: known || now - ts >= staleMs,
-    reason: error || 'other',
+    reason: refused ? 'refused' : billing ? 'billing_error' : error || 'other',
+    // true for everything that is NOT a known-blocking shape (a "Connection
+    // lost mid-response" server_error, an overload…): such a line only blocks
+    // once stale, and even then the caller first checks whether Claude simply
+    // answers again before paying for a replacement (fallback.mjs).
+    transient: !known,
     resetText,
     resetAt: resetText ? parseResetAt(resetText, now) : null,
     since: Number.isFinite(ts) ? ts : null,

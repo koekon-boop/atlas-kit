@@ -150,3 +150,49 @@ test('cutoffAt ignores an unparseable timestamp on an otherwise-good earlier tur
   const r = detectBlocked({ ...base, now, tail: fixed(lines) })
   assert.equal(r.cutoffAt, now - 2 * 60000)
 })
+
+/* --- the shapes seen on this box on 24./25.11.2026 (fields as in the real lines) */
+
+test('REGRESSION (25.11.): an OpenRouter 402 out-of-credits line (error "unknown") blocks IMMEDIATELY as billing_error', () => {
+  const now = Date.now()
+  const line = JSON.stringify({
+    type: 'assistant', isApiErrorMessage: true, error: 'unknown', apiErrorStatus: 402, apiErrorType: 'billing_error', resendCannotCure: true,
+    timestamp: new Date(now - 1000).toISOString(),
+    message: { content: 'API Error: 402 This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle' },
+  })
+  const r = detectBlocked({ ...base, now, tail: fixed([line]) })
+  assert.equal(r.blocked, true)
+  assert.equal(r.reason, 'billing_error')
+  assert.equal(r.transient, false)
+})
+
+test('the older "Insufficient credits" wording (no apiErrorType) is billing_error too', () => {
+  const now = Date.now()
+  const line = errLine({ error: 'unknown', apiErrorStatus: 402, timestamp: new Date(now).toISOString(), text: 'API Error: 402 Insufficient credits. Add more using https://openrouter.ai/settings/credits' })
+  assert.equal(detectBlocked({ ...base, now, tail: fixed([line]) }).reason, 'billing_error')
+})
+
+test('REGRESSION (24.11.): a safety refusal ("Start a new session", general_harms) blocks IMMEDIATELY as "refused"', () => {
+  const now = Date.now()
+  const line = JSON.stringify({
+    type: 'assistant', isApiErrorMessage: true, error: 'invalid_request', refusingModel: 'claude-opus-4-8',
+    timestamp: new Date(now - 1000).toISOString(),
+    message: { content: "API Error: Opus 4.8 can't help with this. Start a new session to continue.\n\nDetails: `[general_harms]`" },
+  })
+  const r = detectBlocked({ ...base, now, tail: fixed([line]) })
+  assert.equal(r.blocked, true)
+  assert.equal(r.reason, 'refused')
+  assert.equal(r.transient, false)
+})
+
+test('"Connection lost mid-response" (server_error) is TRANSIENT: not blocked while fresh, blocked — still transient — once stale', () => {
+  const now = Date.now()
+  const line = (age) => errLine({ error: 'server_error', timestamp: new Date(now - age).toISOString(), text: 'API Error: Connection lost mid-response. The response above may be incomplete.' })
+  const fresh = detectBlocked({ ...base, now, tail: fixed([line(60000)]) })
+  assert.equal(fresh.blocked, false)
+  assert.equal(fresh.transient, true)
+  const stale = detectBlocked({ ...base, now, tail: fixed([line(STALE_MS + 1000)]) })
+  assert.equal(stale.blocked, true)
+  assert.equal(stale.transient, true)
+  assert.equal(stale.reason, 'server_error')
+})

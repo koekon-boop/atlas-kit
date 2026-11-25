@@ -17,6 +17,10 @@
  *   · the three home-chat commands (/ersatz, /claude, /modell)
  *   · TELEGRAM_FALLBACK_PROVIDERS="" is the kill switch for the whole feature
  *   · a ROUTED chat is never touched by any of this
+ *   · the 24./25.11.2026 hardening (bottom of the file, README "What keeps it
+ *     from getting stuck"): own session ids, the probe always comes due, a
+ *     fallback out of credits → Claude at once or ONE note + buffer, a refusal
+ *     replaces the session, a transient error retries on Claude first
  *
  * Hermetic: Telegram + core's agent routes are one stubbed `fetch` (the same
  * convention as routing.test.mjs/poller.test.mjs), extended with
@@ -34,7 +38,7 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { buildRoutes } from '../api/register.mjs'
 import { readState } from '../api/agent.mjs'
-import { deliverToFallback, fallbackActive, fallbackStatus, onFallbackTick, switchToMain, tryInterceptCommand } from '../api/fallback.mjs'
+import { deliverToFallback, fallbackActive, fallbackStatus, noteOutbound, onFallbackTick, switchToMain, tryInterceptCommand } from '../api/fallback.mjs'
 
 const express = createRequire(new URL('../../../api/src/', import.meta.url))('express')
 const ctx = { name: 'telegram', express, Router: (o) => express.Router(o) }
@@ -57,7 +61,14 @@ const ENV = {
 const newFile = (name) => path.join(TMP, `${name}-${crypto.randomUUID()}.json`)
 
 /** Core's agent routes + Telegram, extended with /api/agents/describe. */
-function makeWorld({ sessions = [], describeById = {}, spawnFails = [], telegramOk = true } = {}) {
+/** core's own id rule (spawnKnowledge → slugify in api/src/agent-local.mjs):
+ *  the first 40 slug characters of the task, de-duplicated only against what
+ *  is still REGISTERED — a purged id is handed out again. Copied (it is not
+ *  exported) so the id-collision regression below is tested against the real
+ *  rule, not a stub that could never collide. */
+const coreSlug = (task) => String(task).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
+
+function makeWorld({ sessions = [], describeById = {}, spawnFails = [], telegramOk = true, coreIds = false } = {}) {
   const w = { sent: [], core: [], sessions, describeById, spawnFails, telegramOk, spawned: 0 }
   w.fetch = async (url, opts = {}) => {
     const body = opts.body ? JSON.parse(opts.body) : undefined
@@ -78,9 +89,19 @@ function makeWorld({ sessions = [], describeById = {}, spawnFails = [], telegram
     }
     if (route === '/api/agents/spawn') {
       if (w.spawnFails.includes(body.provider)) return json(400, { ok: false, error: `unknown "provider" profile` })
-      const id = `kb-atlas-fallback-${++w.spawned}`
+      ++w.spawned
+      let id = `kb-atlas-fallback-${w.spawned}`
+      if (coreIds) {
+        const base = `kb-${coreSlug(body.task)}`
+        id = base
+        for (let n = 2; w.sessions.some((s) => s.id === id); n++) id = `${base}-${n}`
+      }
       w.sessions.push({ id, status: 'idle' })
       return json(200, { ok: true, id })
+    }
+    if (route === '/api/agents/kill') {
+      w.sessions = w.sessions.filter((s) => s.id !== body.id)
+      return json(200, { ok: true })
     }
     if (route === '/api/agents/prompt') return json(200, { ok: true })
     if (route === '/api/agents/queue') return json(200, { ok: true })
@@ -340,7 +361,9 @@ test('onFallbackTick(): before the reset time (or the 15-min interval), no probe
   const w = makeWorld()
   const { file } = build({
     world: w,
-    state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', resetAt: Date.now() + 3600000, fallbackSessionId: 'kb-fb', noted: true, log: [] } },
+    // a fresh episode (switchedAt = now) — an episode WITHOUT a start time
+    // probes at once instead, see the 25.11.2026 regression further down
+    state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', resetAt: Date.now() + 3600000, switchedAt: new Date().toISOString(), fallbackSessionId: 'kb-fb', noted: true, log: [] } },
   })
   let probed = false
   await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => ((probed = true), true) })
@@ -458,4 +481,247 @@ test('a ROUTED chat is delivered to its own target even while fallback is global
   assert.ok(toRoute, 'the route delivers to its own pinned target')
   const toFallback = w.core.filter((c) => c.body?.id === 'kb-fb')
   assert.equal(toFallback.length, 0, 'a routed chat never reaches the fallback session')
+})
+
+/* ===================================================================== *
+ * Hardening after the outages of 24./25.11.2026 — one block per finding.
+ * ===================================================================== */
+
+const MAIN_UUID = { claudeSessionId: 'uuid-main', worktree: '/v' }
+const FB_UUID = { claudeSessionId: 'uuid-fb', worktree: '/v' }
+const at = (msAgo) => new Date(Date.now() - msAgo).toISOString()
+const apiErr = (fields, msAgo = 0) => JSON.stringify({ type: 'assistant', isApiErrorMessage: true, timestamp: at(msAgo), ...fields })
+const goodTurn = (msAgo) => JSON.stringify({ type: 'assistant', timestamp: at(msAgo), message: { content: [{ type: 'text', text: 'ok' }] } })
+/** A tail() that answers per transcript: the fake path is "<worktree>/<uuid>". */
+const tails = (byUuid) => ({ buildPath: (_w, uuid) => uuid, tail: (p) => byUuid[p] || null })
+const CREDITS_402 = { error: 'unknown', apiErrorStatus: 402, apiErrorType: 'billing_error', message: { content: 'API Error: 402 This request would exceed your available credits given your current in-flight requests.' } }
+const REFUSAL = { error: 'invalid_request', refusingModel: 'claude-opus-4-8', message: { content: "API Error: Opus 4.8 can't help with this. Start a new session to continue.\n\nDetails: `[general_harms]`" } }
+const CONN_LOST = { error: 'server_error', message: { content: 'API Error: Connection lost mid-response. The response above may be incomplete.' } }
+const STANDING = 'kb-telegram-channel-a-standing-chat-session' // the id both sessions had on 25.11.
+
+/* --- 1. the fallback session gets its OWN id, never the main session's -- */
+
+test('REGRESSION 1 (25.11.): with the old main purged, a fallback spawned WITHOUT the header (noted) still gets its own kb-telegram-fallback-… id', async () => {
+  // The exact trigger: main's id no longer registered (core hands it out
+  // again), and `noted: true` left the task starting with the brief itself —
+  // which used to slug to the main session's id.
+  const w = makeWorld({ coreIds: true })
+  const { file } = build({ world: w, state: { sessionId: STANDING, fallback: { active: true, reason: 'rate_limit', noted: true, log: [] } } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'hallo?' }, { env: ENV, fetch: w.fetch, file })
+  assert.equal(r.ok, true)
+  assert.match(r.id, /^kb-telegram-fallback-\d{8}-\d{6}-ersatz$/, 'own prefix, unique stamp, ends cleanly at core’s 40-char cut')
+  assert.notEqual(r.id, STANDING)
+  const st = readState(file)
+  assert.equal(st.sessionId, STANDING, 'the main session id is never overwritten')
+  assert.notEqual(st.fallback.fallbackSessionId, st.sessionId)
+})
+
+test('REGRESSION 1: a fresh standing session gets a unique kb-telegram-channel-…-session id, never the fallback’s', async () => {
+  const w = makeWorld({ coreIds: true })
+  const b = build({ world: w })
+  await b.inbound.handleOne(update(1, text(1, 'hi', HOME)))
+  const id = readState(b.file).sessionId
+  assert.match(id, /^kb-telegram-channel-\d{8}-\d{6}-session$/)
+})
+
+test('REGRESSION 1 (self-heal): a state file that still has sessionId == fallbackSessionId spawns a fresh CLAUDE session instead of prompting the GPT one', async () => {
+  const w = makeWorld({ coreIds: true, sessions: [{ id: STANDING, status: 'idle' }] })
+  const b = build({ world: w, state: { sessionId: STANDING, fallback: { active: false, fallbackSessionId: STANDING, providerUsed: 'gpt-openrouter', log: [] } } })
+  await b.inbound.handleOne(update(1, text(1, 'bist du Claude?', HOME)))
+  assert.equal(w.core.filter((c) => c.body?.id === STANDING && c.route !== '/api/agents/describe').length, 0, 'nothing goes to the GPT session')
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.ok(spawn, 'a fresh standing session is spawned')
+  assert.equal(spawn.body.provider, undefined, 'on the default (Claude) backend — no provider profile')
+  assert.notEqual(readState(b.file).sessionId, STANDING, 'telegram.json now points at the new session')
+})
+
+/* --- 2. the probe ALWAYS comes due while active, and hands back -------- */
+
+test('REGRESSION 2 (25.11.): the exact stuck state — active, switchedAt null, lastProbeAt null — probes on the next tick and hands back to a CLAUDE session', async () => {
+  const w = makeWorld({ coreIds: true, sessions: [{ id: STANDING, status: 'idle' }] })
+  const { file } = build({
+    world: w,
+    state: { sessionId: STANDING, fallback: { active: true, reason: 'rate_limit', switchedAt: null, lastProbeAt: null, fallbackSessionId: STANDING, providerUsed: 'gpt-openrouter', noted: true, log: [] } },
+  })
+  let probed = 0
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => (++probed, true) })
+  assert.equal(probed, 1, 'the probe fires — it used to wait for a switchedAt that never came')
+  assert.equal(fallbackActive(file), false)
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.ok(spawn && /SYSTEM-HANDOFF/.test(spawn.body.task), 'the handoff goes to a FRESH Claude session…')
+  assert.equal(w.core.filter((c) => ['/api/agents/prompt', '/api/agents/queue'].includes(c.route) && c.body?.id === STANDING).length, 0, '…never back into the GPT session that held both ids')
+})
+
+test('2: activation stamps switchedAt even when a LIVE fallback session is reused, so the interval probe comes due', async () => {
+  const env = { ...ENV, TELEGRAM_FALLBACK_PROBE_INTERVAL_MS: '1' }
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }, { id: 'kb-fb', status: 'idle' }], describeById: { 'kb-main': MAIN_UUID } })
+  const b = build({ world: w, env, state: { sessionId: 'kb-main', fallback: { active: false, fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [] } } })
+  await b.inbound.handleOne(update(1, text(1, 'Hallo', HOME)))
+  await onFallbackTick({ env, fetch: w.fetch, file: b.file, probe: async () => false, ...tails({ 'uuid-main': [apiErr({ error: 'rate_limit', message: { content: 'x' } })] }) })
+  const fb = readState(b.file).fallback
+  assert.equal(fb.active, true)
+  assert.ok(w.core.some((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-fb'), 'the live fallback was reused (no spawn)')
+  assert.ok(fb.switchedAt, 'switchedAt is set although nothing was spawned')
+  await new Promise((r) => setTimeout(r, 5))
+  let probed = false
+  await onFallbackTick({ env, fetch: w.fetch, file: b.file, probe: async () => ((probed = true), false) })
+  assert.equal(probed, true)
+})
+
+test('2: the handback hands over what the fallback left UNANSWERED, verbatim, as still open', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }, { id: 'kb-fb', status: 'idle' }] })
+  const b = build({ world: w, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(1000), fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [] } } })
+  await b.inbound.handleOne(update(1, text(1, 'Frage eins', HOME)))
+  noteOutbound('Antwort auf eins', { file: b.file }) // what POST /api/telegram/send calls while active
+  await b.inbound.handleOne(update(2, text(2, 'Frage zwei, ganz lang '.repeat(30), HOME)))
+  const r = await switchToMain({ env: ENV, fetch: w.fetch, file: b.file })
+  assert.equal(r.ok, true)
+  const handoff = w.core.find((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main').body.text
+  const [answered, open] = handoff.split('NOCH UNBEANTWORTET')
+  assert.match(answered, /Frage eins/)
+  assert.match(answered, /Antwort auf eins/)
+  assert.doesNotMatch(answered, /Frage zwei/, 'an unanswered message is not listed as answered')
+  assert.ok(open.includes(`[Telegram from ${HOME}] ${'Frage zwei, ganz lang '.repeat(30)}`), 'handed over in full, not cut at 300 chars')
+})
+
+/* --- 3. a fallback out of credits → Claude at once, else ONE note + buffer */
+
+test('3: a 402 in the FALLBACK session probes Claude at once (no interval wait) and hands back on success — no note to Ko', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }, { id: 'kb-fb', status: 'idle' }], describeById: { 'kb-fb': FB_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(60000), fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [], pending: [{ chatId: HOME, text: 'noch offen', at: at(20000) }] } } })
+  let probed = 0
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => (++probed, true), ...tails({ 'uuid-fb': [apiErr(CREDITS_402, 10000)] }) })
+  assert.equal(probed, 1)
+  assert.equal(fallbackActive(file), false, 'back on Claude')
+  assert.ok(w.core.some((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main' && /noch offen/.test(c.body.text)))
+  assert.equal(w.sent.length, 0, 'Claude answers — no outage note needed')
+})
+
+test('3: 402 in the fallback AND Claude down → exactly ONE direct note per outage, and every message is buffered, not sent or dropped', async () => {
+  const env = { ...ENV, TELEGRAM_FALLBACK_PROBE_INTERVAL_MS: '1' }
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }, { id: 'kb-fb', status: 'idle' }], describeById: { 'kb-fb': FB_UUID } })
+  const b = build({ world: w, env, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(60000), fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [] } } })
+  const t = tails({ 'uuid-fb': [apiErr(CREDITS_402, 10000)] })
+  await onFallbackTick({ env, fetch: w.fetch, file: b.file, probe: async () => false, ...t })
+  assert.equal(w.sent.length, 1)
+  assert.match(w.sent[0].body.text, /KI gerade nicht erreichbar/)
+  assert.match(w.sent[0].body.text, /Guthaben leer/)
+  assert.equal(String(w.sent[0].body.chat_id), HOME)
+
+  const before = w.core.length
+  await b.inbound.handleOne(update(1, text(1, 'Hallo? Jemand da?', HOME)))
+  assert.equal(w.core.slice(before).filter((c) => c.route !== '/api/agents' && c.route !== '/api/agents/describe').length, 0, 'nothing is sent into the dead fallback')
+  assert.equal(w.sent.length, 1, 'no "can’t reach the agent" reply either — the one note already said it')
+  assert.equal(readState(b.file).fallback.pending.at(-1).text, 'Hallo? Jemand da?')
+
+  await new Promise((r) => setTimeout(r, 5))
+  await onFallbackTick({ env, fetch: w.fetch, file: b.file, probe: async () => false, ...t })
+  assert.equal(w.sent.length, 1, 'still ONE note for the whole outage')
+
+  await new Promise((r) => setTimeout(r, 5))
+  await onFallbackTick({ env, fetch: w.fetch, file: b.file, probe: async () => true, ...t })
+  assert.equal(fallbackActive(b.file), false, 'Claude is back → handed back')
+  const handoff = w.core.find((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main').body.text
+  assert.match(handoff, /NOCH UNBEANTWORTET[\s\S]*Hallo\? Jemand da\?/, 'the buffered message reaches Claude')
+  assert.equal(readState(b.file).fallback.outage, null)
+})
+
+test('3: a 402 left over from an EARLIER episode (older than switchedAt) does not count as the fallback failing', async () => {
+  const w = makeWorld({ describeById: { 'kb-fb': FB_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(1000), fallbackSessionId: 'kb-fb', noted: true, log: [] } } })
+  let probed = false
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => ((probed = true), false), ...tails({ 'uuid-fb': [apiErr(CREDITS_402, 3600000)] }) })
+  assert.equal(probed, false)
+  assert.equal(readState(file).fallback.outage ?? null, null)
+})
+
+/* --- 4. a safety refusal replaces the standing session ----------------- */
+
+test('4 (24.11.): a refusal ("Start a new session") closes the standing session and a FRESH one answers what was left open', async () => {
+  const w = makeWorld({ coreIds: true, sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': MAIN_UUID } })
+  const b = build({ world: w, state: { sessionId: 'kb-main' } })
+  await b.inbound.handleOne(update(1, text(1, 'Und was meinst du dazu?', HOME)))
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, probe: async () => assert.fail('no probe — Claude works, the session is poisoned'), ...tails({ 'uuid-main': [goodTurn(600000), apiErr(REFUSAL)] }) })
+  assert.ok(w.core.some((c) => c.route === '/api/agents/kill' && c.body?.id === 'kb-main'), 'the refused session is closed')
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.ok(spawn, 'a fresh session is spawned')
+  assert.equal(spawn.body.provider, undefined, 'on Claude, not on a paid fallback')
+  assert.match(spawn.body.task, /Sicherheitsfilter/)
+  assert.match(spawn.body.task, /Und was meinst du dazu\?/)
+  assert.match(spawn.body.task, /NICHT von dir aus erneut/, 'told not to reopen the file that tripped the filter')
+  const st = readState(b.file)
+  assert.match(st.sessionId, /^kb-telegram-channel-\d{8}-\d{6}-session$/, 'telegram.json now points at the new session')
+  assert.equal(fallbackActive(b.file), false)
+})
+
+test('4: a SECOND refusal within 30 min replays nothing (it keeps tripping the filter) and tells Ko directly', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': MAIN_UUID } })
+  const b = build({ world: w, state: { sessionId: 'kb-main', mainRestarts: [Date.now() - 5 * 60000] } })
+  await b.inbound.handleOne(update(1, text(1, 'nochmal', HOME)))
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, ...tails({ 'uuid-main': [goodTurn(600000), apiErr(REFUSAL)] }) })
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 0)
+  assert.equal(readState(b.file).sessionId, null, 'unhooked — the next message spawns a clean session')
+  assert.match(w.sent.at(-1).body.text, /abgelehnt/)
+})
+
+/* --- 5. a transient error does not flip onto the paid fallback --------- */
+
+test('5: "Connection lost mid-response" that persists → Claude is probed; it answers → the SAME main session retries, no fallback', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': MAIN_UUID } })
+  const b = build({ world: w, state: { sessionId: 'kb-main' } })
+  await b.inbound.handleOne(update(1, text(1, 'Wie wird das Wetter?', HOME)))
+  const t = tails({ 'uuid-main': [goodTurn(600000), apiErr(CONN_LOST, 4 * 60000)] })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, probe: async () => true, ...t })
+  assert.equal(fallbackActive(b.file), false, 'not switched to the paid fallback')
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 0)
+  const retry = w.core.filter((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main').at(-1)
+  assert.match(retry.body.text, /Verbindungsfehler/)
+  assert.match(retry.body.text, /Wie wird das Wetter\?/)
+  // the same old error line on the next tick changes nothing
+  const n = w.core.length
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file: b.file, probe: async () => assert.fail('not probed again'), ...t })
+  assert.equal(w.core.slice(n).filter((c) => c.route !== '/api/agents/describe').length, 0)
+})
+
+test('5: a transient error that is still FRESH changes nothing at all', async () => {
+  const w = makeWorld({ describeById: { 'kb-main': MAIN_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main' } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => assert.fail('no probe'), ...tails({ 'uuid-main': [apiErr(CONN_LOST, 1000)] }) })
+  assert.equal(fallbackActive(file), false)
+})
+
+test('5: a persisting transient error with Claude NOT answering switches — and the episode is probe-able (point 2)', async () => {
+  const w = makeWorld({ describeById: { 'kb-main': MAIN_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main' } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => false, ...tails({ 'uuid-main': [apiErr(CONN_LOST, 4 * 60000)] }) })
+  const fb = readState(file).fallback
+  assert.equal(fb.active, true)
+  assert.equal(fb.reason, 'server_error')
+  assert.ok(fb.switchedAt, 'start time set → the recovery probe comes due')
+})
+
+test('5: after two retries within 30 min the error no longer counts as transient — the fallback takes over', async () => {
+  const w = makeWorld({ describeById: { 'kb-main': MAIN_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', mainRetries: [Date.now() - 20 * 60000, Date.now() - 10 * 60000] } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => assert.fail('no retry probe past the cap'), ...tails({ 'uuid-main': [apiErr(CONN_LOST, 4 * 60000)] }) })
+  assert.equal(fallbackActive(file), true)
+})
+
+test('after a handback, the main session’s OLD error line does not flip the channel straight back', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }], describeById: { 'kb-main': MAIN_UUID } })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(3600000), fallbackSessionId: 'kb-fb', noted: true, log: [] } } })
+  const oldErr = apiErr({ error: 'rate_limit', message: { content: 'x · resets 8pm (UTC)' } }, 3600000)
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => true, ...tails({ 'uuid-main': [oldErr] }) })
+  assert.equal(fallbackActive(file), false)
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, probe: async () => true, ...tails({ 'uuid-main': [oldErr] }) })
+  assert.equal(fallbackActive(file), false, 'the line from before the handback is ignored')
+})
+
+test('3: /ersatz during an outage ends the outage and really delivers to the fallback again (e.g. after topping up credits)', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle' }] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: { active: true, reason: 'rate_limit', switchedAt: at(60000), fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [], outage: { since: Date.now() - 1000, reason: 'billing_error', notifiedAt: Date.now() } } } })
+  const r = await tryInterceptCommand('/ersatz', HOME, { env: ENV, fetch: w.fetch, file })
+  assert.match(r.reply, /übernimmt jetzt/)
+  assert.equal(readState(file).fallback.outage, null)
+  assert.ok(w.core.some((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-fb'))
 })
