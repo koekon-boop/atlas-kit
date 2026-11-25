@@ -107,8 +107,16 @@ export function routeInfo({ routes, file = stateFile() } = {}) {
 /** What the session is told when it is created (the same rule rides along, in
  *  one line, with every message after — a long chat compacts, the rule must
  *  survive it). */
-export function sessionBrief({ port = '3001', maxVoiceChars = 3000, homeChatId, otherChats = [] } = {}) {
+export function sessionBrief({ port = '3001', maxVoiceChars = 3000, homeChatId, otherChats = [], envFile } = {}) {
   const url = `http://127.0.0.1:${port}/api/telegram/send`
+  // A session's tmux does not always inherit DASHBOARD_BEARER_TOKEN (a tmux
+  // server started before the API keeps its own environment), and then every
+  // send answered "unauthorized". So the header falls back to reading it from
+  // the kit's own .env AT CALL TIME, inside the curl's own shell — the value is
+  // never written into the brief, the transcript or a log line.
+  const bearer = envFile
+    ? `\${DASHBOARD_BEARER_TOKEN:-$(sed -n 's/^DASHBOARD_BEARER_TOKEN=//p' '${envFile}' | tr -d '"')}`
+    : '$DASHBOARD_BEARER_TOKEN'
   const several = otherChats.length > 0
   const chatIdField = several ? `"chat_id":"<the chat id from the marker, when replying to someone other than the home chat>",` : ''
   return `Telegram channel — a standing chat session with the operator.
@@ -125,7 +133,7 @@ PICTURES, VIDEOS AND DOCUMENTS — you can be sent files too. They arrive as LOC
 
 HOW YOU ANSWER — read this twice. NOBODY reads this terminal. The operator sees ONLY what you send through the send route, so for EVERY Telegram message your last step is to POST your reply:
 
-curl -sS -X POST ${url} -H "Authorization: Bearer $DASHBOARD_BEARER_TOKEN" -H 'content-type: application/json' --data-binary @- <<'EOF'
+curl -sS -X POST ${url} -H "Authorization: Bearer ${bearer}" -H 'content-type: application/json' --data-binary @- <<'EOF'
 {${chatIdField}"text":"your reply here"}
 EOF
 
@@ -161,6 +169,31 @@ export const framed = (chatId, text) => `[Telegram from ${chatId}] ${text}\n\n(R
 export const framedForRoute = (chatId, text, port = '3001') =>
   `[Telegram from ${chatId}] ${text}\n\n(Antwort an diese Person NUR per POST http://127.0.0.1:${port}/api/telegram/send mit {"chat_id":"${chatId}","text":"…"} und Bearer $DASHBOARD_BEARER_TOKEN — das Terminal liest sie nicht. Der Bearer-Token steht in /workspace/.env. Sprachnachricht raus → "voice":true. Kurz, Klartext.)`
 
+/** The brief exactly as every spawn of THIS addon gets it (the standing
+ *  session, a fresh one after a refusal, and the fallback session). */
+export const channelBrief = (c) =>
+  sessionBrief({ port: c.apiPort, maxVoiceChars: c.maxVoiceChars, homeChatId: c.homeChatId, otherChats: c.allowedChatIds.filter((x) => x !== c.homeChatId), envFile: c.envFile })
+
+/**
+ * The first line of a spawn task — and so, through core's slug (first 40
+ * characters of the task, lowercase alnum + dashes: spawnKnowledge() in
+ * api/src/agent-local.mjs), the session ID. It used to be the brief itself, so
+ * EVERY spawn of this addon — the standing session and the fallback one alike —
+ * derived the same id, `kb-telegram-channel-a-standing-chat-session`, and once
+ * core had purged the old one the fallback session was born under the main
+ * session's id (24./25.11.2026: `sessionId == fallbackSessionId`, Telegram ran
+ * on GPT for hours). Now each kind has its own prefix plus a UTC stamp to the
+ * second; 'channel'/'fallback' + 15-character stamp + 'session'/'ersatz' is
+ * exactly 40 slug characters, so the id ends cleanly instead of mid-word.
+ *   main:     kb-telegram-channel-20261125-131005-session
+ *   fallback: kb-telegram-fallback-20261125-131005-ersatz
+ */
+export function spawnTitle(kind, now = new Date()) {
+  const iso = now.toISOString()
+  const stamp = `${iso.slice(0, 10).replace(/-/g, '')}-${iso.slice(11, 19).replace(/:/g, '')}`
+  return kind === 'fallback' ? `Telegram fallback ${stamp} ersatz` : `Telegram channel ${stamp} session`
+}
+
 /** The one loopback caller every core-route call in this addon goes through —
  *  exported so fallback.mjs (same addon, see its header) can drive /api/agents
  *  and /api/agents/describe the same way, instead of a second copy. */
@@ -191,7 +224,10 @@ export async function forwardToAgent({ chatId, text }, deps = {}) {
   try {
     const state = readState(file)
     let live = null
-    if (state.sessionId) {
+    // Never treat the FALLBACK session as the standing one: a state file that
+    // still carries the 24./25.11. collision (both ids equal) gets a fresh
+    // Claude session here instead of handing Claude's messages to GPT.
+    if (state.sessionId && state.sessionId !== state.fallback?.fallbackSessionId) {
       const list = await core('GET', '/api/agents', null, d)
       if (!list.ok) return { ok: false, error: `GET /api/agents → ${list.status}` }
       live = (list.body.sessions || []).find((s) => s.id === state.sessionId) || null
@@ -200,8 +236,7 @@ export async function forwardToAgent({ chatId, text }, deps = {}) {
       if (live && ['done', 'error', 'dormant'].includes(live.status)) live = null
     }
     if (!live) {
-      const brief = sessionBrief({ port: c.apiPort, maxVoiceChars: c.maxVoiceChars, homeChatId: c.homeChatId, otherChats: c.allowedChatIds.filter((x) => x !== c.homeChatId) })
-      const task = `${brief}\n\n---\nFirst message:\n${framed(chatId, text)}`
+      const task = `${spawnTitle('main')}\n\n${channelBrief(c)}\n\n---\nFirst message:\n${framed(chatId, text)}`
       const effort = d.env.TELEGRAM_AGENT_EFFORT // 15.11.2026 (Ko): stehende Telegram-Sitzung auf "high" statt Standard xhigh
       const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas', ...(effort ? { effort } : {}) }, d)
       if (!r.ok || !r.body.id) return { ok: false, error: `spawn → ${r.status} ${r.body?.error || ''}`.trim() }

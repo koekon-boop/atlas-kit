@@ -26,7 +26,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { buildRoutes, default as registerAddon } from '../api/register.mjs'
-import { sessionBrief } from '../api/agent.mjs'
+import { channelBrief, sessionBrief } from '../api/agent.mjs'
+import { config } from '../api/config.mjs'
 
 const express = createRequire(new URL('../../../api/src/', import.meta.url))('express')
 const ctx = { name: 'telegram', express, Router: (o) => express.Router(o) }
@@ -216,6 +217,14 @@ test('the session brief tells it to PUSH its reply through the send route, brief
   assert.match(b, /No tables, no code blocks/)
   assert.match(b, /language of the message/)
   assert.match(sessionBrief({ port: '4444' }), /127\.0\.0\.1:4444\/api\/telegram\/send/)
+})
+
+test('bonus: with the kit’s .env path, the brief’s curl falls back to reading the bearer from it AT CALL TIME — the value itself is never in the brief', () => {
+  const b = sessionBrief({ port: '3001', envFile: '/srv/kit/.env' })
+  assert.ok(b.includes(`Authorization: Bearer \${DASHBOARD_BEARER_TOKEN:-$(sed -n 's/^DASHBOARD_BEARER_TOKEN=//p' '/srv/kit/.env' | tr -d '"')}`))
+  const real = channelBrief(config(ENV))
+  assert.equal(real.includes(BEARER), false, 'the bearer value never lands in a spawn task')
+  assert.match(real, /DASHBOARD_BEARER_TOKEN=\/\/p' '\/.+\/\.env'/, 'the repo-root .env path is filled in')
 })
 
 test('the brief mentions a second chat only when there is one — the default single-chat brief stays uncluttered', () => {

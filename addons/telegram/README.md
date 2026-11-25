@@ -533,7 +533,10 @@ uuid>.jsonl`, via core's `transcriptPath`/`tailLines` — the same primitives
 here reads a reply). The session is **blocked** when that line is an
 `isApiErrorMessage` entry and either its `error` is one of the three known
 codes (`rate_limit`, `authentication_failed`, `billing_error` — blocks
-immediately, any age) or it is some OTHER api-error line that has been the
+immediately, any age), an out-of-credits `402` (`apiErrorStatus: 402` /
+`apiErrorType: "billing_error"` / "…exceed your available credits…", read as
+`billing_error`), or a safety refusal (`refusingModel` / "Start a new session
+to continue", reason `refused` — see below), or it is some OTHER api-error line that has been the
 last entry for at least `TELEGRAM_FALLBACK_STALE_MS` (3 min by default — a
 single transient blip must not flip the channel over). A normal reply landing
 later simply makes the error no longer the last line, so detection reads
@@ -566,18 +569,69 @@ and the reply contract are identical to the standing session's. A chat pinned
 by `TELEGRAM_CHAT_ROUTES` is never affected by any of this — it keeps talking
 to its own existing target regardless of the standing session's health.
 
-**Switching back.** Once a known reset time has passed (or, when none was
-readable from the error text, every `TELEGRAM_FALLBACK_PROBE_INTERVAL_MS`, 15
-min by default), a cheap probe — one `claude -p` turn on
+**Switching back.** Every `TELEGRAM_FALLBACK_PROBE_INTERVAL_MS` (15 min by
+default) from the episode's start or the last probe — earlier if a known reset
+time comes first — a cheap probe — one `claude -p` turn on
 `TELEGRAM_FALLBACK_PROBE_MODEL` (haiku by default), the plain default
 Anthropic environment, a short timeout — checks whether the subscription
 answers again. On success the standing session gets ONE message listing every
 message that came in and every reply that went out while it was blocked (kept
 in the state file, 300 characters and 30 entries at most), explicitly saying
-they are **already answered** and only open points need following up. If the
+they are **already answered** and only open points need following up — plus,
+**verbatim**, every message nobody answered yet (the fallback had not replied
+since, or could not), marked `NOCH UNBEANTWORTET` to be answered now. If that
+handoff cannot be delivered, the episode stays active and the next probe tries
+again — nothing pending is dropped. If the
 standing session is blocked again right away, the next tick switches back to
 the replacement exactly as before — the replacement itself is left idle
 afterwards, ready to be reused for the next episode.
+
+### What keeps it from getting stuck
+
+Each rule below closes one failure seen on this box on 24./25.11.2026, and each
+has a `REGRESSION` test in `test/fallback.test.mjs` / `test/fallback-detect.test.mjs`:
+
+1. **Own session ids.** Core derives a session id from the first 40 slug
+   characters of the spawn task, and hands a purged id out again. Both kinds of
+   session used to start with the same brief, so the fallback was once born under
+   the standing session's id (`sessionId == fallbackSessionId`) and Telegram ran
+   on GPT for hours — the handback went to GPT, too. Now every spawn starts with
+   its own title line: `kb-telegram-channel-<UTC stamp>-session` for the standing
+   session, `kb-telegram-fallback-<UTC stamp>-ersatz` for the fallback. A state
+   file that still carries equal ids is healed on the next message: a fresh
+   Claude session is spawned instead.
+2. **The probe always comes due.** The episode's start (`switchedAt`) is set when
+   fallback mode is entered, not only when a fallback session is spawned (a
+   reused one left it `null`, and the probe never fired). An episode with no
+   readable start time probes on the next tick.
+3. **A fallback without credits is not silence.** While active, the fallback
+   session's own transcript is checked too. A blocking error from *this* episode
+   (a 402 above all) → Claude is probed **at once**; if it answers, the handback
+   runs. If not, this is an **outage**: the home chat gets **one** short text
+   straight from the bot (no agent involved — "KI gerade nicht erreichbar,
+   Grund: …"), once per outage, and every further message is **buffered** in full
+   (`fallback.pending`), never sent into the dead session and never dropped.
+   Claude is then probed every 5 min at most; the handback hands the buffer
+   over. `/ersatz` ends an outage by hand (e.g. after topping up credits).
+4. **A refusal replaces the session.** After "…can't help with this. Start a new
+   session" every later turn of that session is refused too. So the standing
+   session is closed (`POST /api/agents/kill`), unhooked from `telegram.json`, and
+   a fresh Claude session (same brief, new id) gets every message after its last
+   good turn, told not to reopen the files in them (re-reading the picture would
+   trip the filter again). A second refusal within 30 min replays nothing and
+   tells Ko directly to send it again without the picture.
+5. **A blip is not an outage.** A transient error (`server_error` "Connection lost
+   mid-response", an overload…) still only counts once it has been the last line
+   for `TELEGRAM_FALLBACK_STALE_MS`, and even then Claude is probed **first**: if
+   it answers, the unanswered messages go to the **same** standing session again
+   and the paid fallback stays off. Only after two such retries within 30 min, or
+   a failed probe, does the fallback take over — and then point 2 brings it back.
+
+An error line older than the last handback / replacement / retry is ignored —
+the session simply has not written a newer line yet, and must not flip the
+channel straight back over.
+
+`TELEGRAM_FALLBACK_PROVIDERS=` (the off switch below) turns all five off as well.
 
 **By hand**, home chat only (never forwarded to any agent, and never
 intercepted from another allowed/routed chat):
@@ -603,8 +657,10 @@ TELEGRAM_FALLBACK_PROBE_MODEL=claude-haiku-4-5
 ```
 
 `GET /api/addons` shows `telegram.status.fallback`: `enabled`, `active`,
-`reason`, `resetAt`/`resetText`, the replacement session id + provider, and
-the counters (`switches`, `delivered`, `probes`).
+`reason`, `resetAt`/`resetText`, the replacement session id + provider,
+`switchedAt`, `lastProbeAt`, `outage` (`since`, `reason`, `notified`), how many
+messages are `pending`, and the counters (`switches`, `delivered`, `probes`,
+`buffered`, `outages`, `restarts`, `retries`).
 
 ⚠️ Every reply the replacement sends runs over a paid OpenRouter model, not
 your Anthropic subscription — its brief says so and asks it to work lean, but
@@ -722,7 +778,12 @@ standing session is **spawned** with; unset, core's default for a knowledge chat
 applies (`xhigh`). It only takes effect when the next session is created — close the
 current one to switch. Any other value makes core refuse the spawn (`400 unknown
 "effort"`), and the message is not delivered.
-`DASHBOARD_BEARER_TOKEN` must be set (core wants it anyway). Enable the addon —
+`DASHBOARD_BEARER_TOKEN` must be set (core wants it anyway). A session whose
+tmux did not inherit it (a tmux server older than the API keeps its own
+environment) would get `unauthorized` from the send route — so the brief's curl
+falls back to reading it from the kit's own `.env` (repo root) **at call time**,
+inside its own shell; the value is never written into the brief, a transcript
+or a log line. Enable the addon —
 `addons.json` `{"enabled": ["telegram"]}` or `ATLAS_ADDONS=…,telegram` — and
 `scripts/serve.sh restart`.
 

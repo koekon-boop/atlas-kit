@@ -7,6 +7,7 @@
  * ------------------------------------------------------------------ */
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const str = (env, k, d = '') => {
   const v = env[k]
@@ -110,6 +111,10 @@ export const config = (env = process.env) => ({
   bearer: str(env, 'DASHBOARD_BEARER_TOKEN'),
   apiBase: `http://127.0.0.1:${str(env, 'API_PORT', '3001')}`,
   apiPort: str(env, 'API_PORT', '3001'),
+  // The kit's own .env (repo root — what `node --env-file=../.env` loads) —
+  // only its PATH, for the brief's bearer fallback (sessionBrief in agent.mjs);
+  // this addon never opens the file itself.
+  envFile: fileURLToPath(new URL('../../../.env', import.meta.url)),
   // Voice notes in (README "Voice notes"): Telegram's own getFile caps a
   // downloadable file at 20 MB — raising this past that would just be misleading.
   maxAudioBytes: posInt(env, 'TELEGRAM_MAX_AUDIO_BYTES', 20 * 1024 * 1024),
