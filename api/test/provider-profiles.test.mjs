@@ -122,7 +122,7 @@ process.env.CLAUDE_BIN = STUB
 const { listProviders, resolveProvider, tiersOf } = await import('../src/providers.mjs')
 const {
   LAUNCH_CMD, RESUME_CMD, KNOWLEDGE_LAUNCH_CMD, ATLAS_CONTROL_LAUNCH_CMD, ATLAS_CONTROL_RESUME_CMD,
-  ATLAS_WORKER_LAUNCH_CMD, launchCommand, providerLaunch, providerEnvPrefix, knowledgeLaunch, atlasWorkerLaunch,
+  LEAN_KNOWLEDGE_LAUNCH_CMD, LEAN_RESUME_CMD, ATLAS_WORKER_LAUNCH_CMD, launchCommand, providerLaunch, providerEnvPrefix, knowledgeLaunch, atlasWorkerLaunch,
 } = await import('../src/agent-local.mjs')
 const { spawnPicks } = await import('../src/agent-routes.mjs')
 const { spawnBody } = await import('../src/mcp/tools.mjs')
@@ -138,6 +138,8 @@ const PROFILED_TEMPLATES = [
   ['KNOWLEDGE_LAUNCH_CMD', KNOWLEDGE_LAUNCH_CMD],
   ['ATLAS_CONTROL_LAUNCH_CMD', ATLAS_CONTROL_LAUNCH_CMD],
   ['ATLAS_CONTROL_RESUME_CMD', ATLAS_CONTROL_RESUME_CMD],
+  ['LEAN_KNOWLEDGE_LAUNCH_CMD', LEAN_KNOWLEDGE_LAUNCH_CMD],
+  ['LEAN_RESUME_CMD', LEAN_RESUME_CMD],
 ]
 
 /* --- the store ------------------------------------------------------------ */
@@ -189,7 +191,8 @@ test('ZERO-PROFILE INVARIANT: no provider ⇒ the launch line is what it always 
     // …then the claude binary (an absolute shell-quoted path, or the bare word
     // when it did not resolve — CI runners have no `claude` installed), and the
     // native-messaging `--settings` (native-msg-policy.mjs) right after it.
-    assert.match(line, /^IS_SANDBOX=1 (ATLAS_SESSION='[^']*' )?env -u ANTHROPIC_API_KEY \S+ (--settings '[^']*' )?--model /, `${name} lost the subscription-auth guarantee`)
+    // (A LEAN template also switches Claude Code's auto-memory off, in front of `env`.)
+    assert.match(line, /^IS_SANDBOX=1 (ATLAS_SESSION='[^']*' )?(CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 )?env -u ANTHROPIC_API_KEY \S+ (--settings '[^']*' )?--model /, `${name} lost the subscription-auth guarantee`)
     assert.match(line, /--model 'claude-sonnet-5\[1m\]' --effort 'xhigh'/, name)
   }
 })

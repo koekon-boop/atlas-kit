@@ -138,6 +138,21 @@ const CONTROL_MCP_CONFIG = `${WORKSPACE}/api/src/mcp/control.mcp.json`
 export const ATLAS_CONTROL_LAUNCH_CMD = withNativeMsgPolicy(
   process.env.AGENT_ATLAS_LAUNCH_CMD ||
   `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions {task}`, 'knowledge')
+// A LEAN knowledge chat (spawn body `lean: true`, see performSpawn) — made for
+// addons/telegram's PAID emergency fallback, where every turn re-sends the whole
+// context to a metered backend. Measured on this box (claude 2.1.332, the Atlas
+// vault as cwd): a plain Atlas chat starts at ~67k tokens before its first word —
+// ~30k of default built-in tool schemas, ~14k auto-memory index, ~8k agent-control
+// MCP tools, ~6k skill listing — plus a ~39k-character opening prompt. This
+// template keeps only what answering a question needs: the knowledge-only READ
+// MCP profile (dev.mcp.json, never the control tools), eight built-in tools, no
+// skills, no auto-memory — ~12k tokens. The vault's own CLAUDE.md still loads.
+// `--tools=` (with `=`) on purpose: the flag is variadic, and a bare
+// `--tools a,b {task}` would swallow the prompt as a tool name.
+const LEAN_FLAGS = `--mcp-config ${DEV_MCP_CONFIG} --strict-mcp-config --disable-slash-commands --tools=Bash,Read,Grep,Glob,Edit,Write,WebFetch,WebSearch`
+export const LEAN_KNOWLEDGE_LAUNCH_CMD = withNativeMsgPolicy(
+  process.env.AGENT_LEAN_LAUNCH_CMD ||
+  `IS_SANDBOX=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --session-id {sid} ${LEAN_FLAGS} --dangerously-skip-permissions {task}`, 'knowledge')
 // The PAIRED ATLAS WORKER is a restricted, dashboard-driven session — the same
 // knowledge-only READ profile a dev agent gets (worker.mcp.json), and never the
 // orchestrator's control tools. It writes the Atlas through its own worktree, not
@@ -283,6 +298,11 @@ export const RESUME_CMD = withNativeMsgPolicy(
 export const ATLAS_CONTROL_RESUME_CMD = withNativeMsgPolicy(
   process.env.AGENT_ATLAS_RESUME_CMD ||
   `IS_SANDBOX=1 ATLAS_SESSION={atlasSession} env {claudeEnv}${CLAUDE} --model {model} --effort {effort} --mcp-config ${CONTROL_MCP_CONFIG} --strict-mcp-config --dangerously-skip-permissions --resume {sid}`, 'knowledge')
+// A LEAN chat (LEAN_KNOWLEDGE_LAUNCH_CMD) comes back lean — a plain or
+// orchestrator resume would hand it the full tool set it was spawned without.
+export const LEAN_RESUME_CMD = withNativeMsgPolicy(
+  process.env.AGENT_LEAN_RESUME_CMD ||
+  `IS_SANDBOX=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 env {claudeEnv}${CLAUDE} --model {model} --effort {effort} ${LEAN_FLAGS} --dangerously-skip-permissions --resume {sid}`, 'knowledge')
 // Serial ship train backstop: a member that goes busy and never prints
 // ATLAS:SHIPPED is detected as stopped the moment it returns to idle (see
 // pumpShipTrain); this only bounds a member that stays wedged-busy forever, so
@@ -1962,7 +1982,7 @@ async function launchResume(s) {
   if (noClaude) return { ok: false, stderr: noClaude.error }
   // The Atlas orchestrator (vault:'atlas' chat) must resume WITH its agent-control
   // MCP config or it loses its spawn/prompt/kill steering tools; all else resumes plain.
-  const tmpl = s.vault === 'atlas' ? ATLAS_CONTROL_RESUME_CMD : RESUME_CMD
+  const tmpl = s.lean ? LEAN_RESUME_CMD : s.vault === 'atlas' ? ATLAS_CONTROL_RESUME_CMD : RESUME_CMD
   // A session pinned to a PROVIDER profile must come back on the SAME backend —
   // resuming a DeepSeek session onto Anthropic (or onto a profile the operator has
   // since edited away) would switch model mid-conversation, silently. Refuse with
@@ -2257,11 +2277,15 @@ export function knowledgePrompt({ id, question, preamble, context, imagePaths = 
  * SAME harness (same template, same MCP config, same prompt, same CLAUDE.md
  * pickup — the CLI does that from the vault it is launched in) pointed at an
  * Anthropic-compatible endpoint. Without one, every byte of this line is what it
- * was before profiles existed. */
-export function knowledgeLaunch({ id, sid, vaultKey, model, effort, prompt, provider }) {
+ * was before profiles existed.
+ *
+ * `lean` picks LEAN_KNOWLEDGE_LAUNCH_CMD whatever the vault (read-only MCP, a
+ * short tool list, no skills, no auto-memory) — absent, nothing here changes. */
+export function knowledgeLaunch({ id, sid, vaultKey, model, effort, prompt, provider, lean }) {
+  const tmpl = lean ? LEAN_KNOWLEDGE_LAUNCH_CMD : vaultKey === 'atlas' ? ATLAS_CONTROL_LAUNCH_CMD : KNOWLEDGE_LAUNCH_CMD
   return promptFileLaunch(
     providerEnvPrefix(id, provider) +
-      launchCommand(vaultKey === 'atlas' ? ATLAS_CONTROL_LAUNCH_CMD : KNOWLEDGE_LAUNCH_CMD, {
+      launchCommand(tmpl, {
         atlasSession: id, // no-op token for the non-atlas template
         model,
         effort,
@@ -2280,7 +2304,7 @@ export function knowledgeLaunch({ id, sid, vaultKey, model, effort, prompt, prov
  * preamble's add-and-link + pull-rebase-then-commit rules are the boundary.
  * Gated on the same opt-in as the rest of box-local execution (the repo
  * allowlist file): no allowlist → no execution on this box, of either kind. */
-export async function spawnKnowledge({ question, preamble, model, effort, vault, images, provider }) {
+export async function spawnKnowledge({ question, preamble, model, effort, vault, images, provider, lean }) {
   if (!question || typeof question !== 'string') return { status: 400, ok: false, error: 'question required' }
   if (!localRepoKeys().length) return { status: 503, ok: false, error: 'box-local executor disabled' }
   // Re-checked here for the same reason spawn() re-checks it: this function is
@@ -2329,6 +2353,8 @@ export async function spawnKnowledge({ question, preamble, model, effort, vault,
     // (state.json is a plain file). It is also what makes a Revive come back on
     // the SAME backend, or refuse (launchResume).
     ...(provider ? { provider } : {}),
+    // A LEAN chat (LEAN_KNOWLEDGE_LAUNCH_CMD) must also RESUME lean (launchResume).
+    ...(lean ? { lean: true } : {}),
     status: 'running', startedAt: nowIso(), lc: initLifecycle(LC.SPAWNED),
   }
 
@@ -2342,11 +2368,14 @@ export async function spawnKnowledge({ question, preamble, model, effort, vault,
   // to the one chats have always had. Resolved key, not the caller's `vault` —
   // the Atlas IS the default vault, so a chat spawned without one is still an
   // Atlas chat.
-  const context = await chatEvidence({ vaultKey: vlt.key, question, id })
+  // A LEAN chat gets none: its caller's task IS the whole brief, and retrieval
+  // keyed on a brief's own words is noise (25.11.2026: ~20k characters of it in
+  // every Telegram fallback spawn).
+  const context = lean ? '' : await chatEvidence({ vaultKey: vlt.key, question, id })
   const prompt = knowledgePrompt({ id, question, preamble, context, imagePaths })
   const launch = knowledgeLaunch({
     id, sid: claudeSessionId, vaultKey: vlt.key,
-    model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, prompt, provider,
+    model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, prompt, provider, lean,
   })
   ensureRepoTrusted(vlt.path) // so the launch skips Claude Code's trust dialog
   const ns = await run([
@@ -2365,7 +2394,7 @@ export async function spawnKnowledge({ question, preamble, model, effort, vault,
 
   registry.sessions[id] = session
   persist()
-  audit({ action: 'spawn', kind: 'knowledge', id, vault: vlt.key, model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, ...(provider ? { provider } : {}), images: imagePaths.length, ok: true })
+  audit({ action: 'spawn', kind: 'knowledge', id, vault: vlt.key, model: model || DEFAULT_MODEL, effort: effort || DEFAULT_EFFORT, ...(provider ? { provider } : {}), ...(lean ? { lean: true } : {}), images: imagePaths.length, ok: true })
   return { status: 200, ok: true, id }
 }
 

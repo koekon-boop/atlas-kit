@@ -210,6 +210,27 @@ recap at close — is not spawnable with a profile and stays on the subscription
 backend, whatever backend the agent it is paired to runs on. It is the one
 launch template with no backend slot at all.
 
+### A lean chat (`lean: true`)
+
+Every turn on a metered backend re-sends the agent's whole context, and an
+Atlas chat starts big: measured on this kit (claude 2.1.332, first-turn usage),
+~67k tokens of harness — ~30k of default built-in tool schemas, ~14k of
+auto-memory, ~8k of agent-control MCP tools, ~6k of skill listing, plus the
+vault's `CLAUDE.md` — before a ~39,000-character opening prompt of preambles
+and retrieved evidence.
+
+`"lean": true` on `POST /api/agents/spawn` (knowledge chats only, boolean;
+anything else is a `400`) starts a chat that carries only what answering needs:
+the caller's `task` is the **whole** opening prompt (no standing preamble, no
+evidence), and it launches with `LEAN_KNOWLEDGE_LAUNCH_CMD` — the knowledge-only
+read MCP profile (`dev.mcp.json`, never the control tools), eight built-in
+tools (`--tools=Bash,Read,Grep,Glob,Edit,Write,WebFetch,WebSearch`),
+`--disable-slash-commands` (no skills), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+That harness measures ~12k tokens. The vault's `CLAUDE.md` still loads. The
+flag is stored on the session, so a Revive comes back lean too
+(`LEAN_RESUME_CMD`). Without the field, every spawn is byte-identical to
+before. `addons/telegram` uses it for its paid emergency fallback.
+
 ### Resuming a profiled agent
 
 The profile **name** is stored on the session, so Revive relaunches it on the

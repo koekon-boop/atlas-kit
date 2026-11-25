@@ -1035,7 +1035,7 @@ async function startRemoteAtlasClose(id, cleanup) {
  * wrapper; the scheduler calls it directly.
  * ------------------------------------------------------------------ */
 async function performSpawn(raw) {
-  const { task, repo, model, effort, kind, vault, images, parent, provider } = raw || {}
+  const { task, repo, model, effort, kind, vault, images, parent, provider, lean } = raw || {}
   if (!task || typeof task !== 'string') return { status: 400, body: { ok: false, error: 'missing "task"' } }
   // `parent` (optional): the spawning agent's session id — set by the Atlas
   // orchestrator's spawn_agent tool so GET /api/agents can draw the lineage.
@@ -1046,6 +1046,15 @@ async function performSpawn(raw) {
     return { status: 400, body: { ok: false, error: 'missing "repo"' } }
   if (vault !== undefined && typeof vault !== 'string')
     return { status: 400, body: { ok: false, error: 'invalid "vault"' } }
+  // `lean` (optional, knowledge chats only): the caller's task is the WHOLE
+  // brief — no standing preamble, no retrieved evidence — and the chat launches
+  // with LEAN_KNOWLEDGE_LAUNCH_CMD (read-only MCP, a short tool list, no skills,
+  // no auto-memory). Made for addons/telegram's paid fallback session, where
+  // every token of the start context is re-billed on every turn.
+  if (lean !== undefined && typeof lean !== 'boolean')
+    return { status: 400, body: { ok: false, error: '"lean" must be true or false' } }
+  if (lean && kind !== 'knowledge')
+    return { status: 400, body: { ok: false, error: '"lean" is for knowledge chats only' } }
   if (model !== undefined && !AGENT_MODELS[model])
     return { status: 400, body: { ok: false, error: `unknown "model" (expected ${Object.keys(AGENT_MODELS).join('/')})` } }
   if (effort !== undefined && !AGENT_EFFORTS.has(effort))
@@ -1098,13 +1107,13 @@ async function performSpawn(raw) {
         : isTypedVault(vault)
           ? ATLAS_KNOWLEDGE_PREAMBLE
           : KNOWLEDGE_PREAMBLE
-    const preamble = `${basePreamble}\n\n${DOWNLOADS_PREAMBLE}`
+    const preamble = lean ? undefined : `${basePreamble}\n\n${DOWNLOADS_PREAMBLE}`
     // `provider` (optional) swaps the BACKEND and nothing else: same preamble,
     // same vault as cwd (so the vault's own CLAUDE.md loads exactly as before),
     // same MCP config, same evidence. A knowledge chat spawns no companion
     // session, so there is no pair here to keep on one backend.
     const r = await local.spawnKnowledge({
-      question: task, preamble, model: modelId, effort: effortLevel, vault, images: imgs, provider,
+      question: task, preamble, model: modelId, effort: effortLevel, vault, images: imgs, provider, lean,
     })
     if (r.ok && r.id) {
       if (parent) setSpawnParent(r.id, parent)

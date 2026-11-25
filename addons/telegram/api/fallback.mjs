@@ -31,6 +31,18 @@
  *   · a safety refusal ("Start a new session") replaces the standing session
  *   · a transient error first tries Claude again before paying for a fallback
  *
+ * Kept cheap after the same day's bill (README "Keeping the fallback cheap"):
+ * every fallback turn re-sends the whole context to a metered backend, so
+ *   · the fallback is spawned LEAN (core's `lean: true`: no standing preamble,
+ *     no retrieved evidence, read-only MCP, eight tools, no skills/memory) with
+ *     its own short brief (fallbackBrief in agent.mjs)
+ *   · a CONTEXT CAP: once its context reaches TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS,
+ *     the next message goes to a FRESH fallback with a short handover (the last
+ *     few exchanges, cut short, plus what is unanswered) — never the whole log
+ *   · lost messages replayed on a switch arrive as ONE turn, not one each
+ *   · the handback is a 2–3-sentence summary + what the fallback parked for
+ *     Claude (`fuer_claude`) + the unanswered messages verbatim
+ *
  * State lives nested (`fallback: {...}`) in the SAME small state file as the
  * rest of the addon (telegram.json) — one more key, not a second file.
  *
@@ -42,7 +54,7 @@ import { spawn } from 'node:child_process'
 import os from 'node:os'
 import { requireClaudeBin } from '../../../api/src/claude-bin.mjs'
 import { config, stateFile } from './config.mjs'
-import { channelBrief, core, framed, forwardToAgent, readState, saveState, spawnTitle } from './agent.mjs'
+import { core, fallbackBrief, framed, forwardToAgent, readState, saveState, spawnTitle } from './agent.mjs'
 import { detectBlocked } from './fallback-detect.mjs'
 import { sendMessage } from './telegram.mjs'
 
@@ -59,6 +71,13 @@ const WINDOW_MS = 30 * 60 * 1000
 // A transient error is retried on Claude at most this often per window before
 // the paid fallback takes over after all.
 const RETRY_CAP = 2
+// Jobs the fallback left to Claude (`fuer_claude` on a send), for the handback.
+const PARKED_CAP = 20
+const PARKED_TEXT_CAP = 300
+// A capped-out fallback's successor gets this many log lines (≈ 4 exchanges),
+// each cut to this length — enough to carry the thread, not the history.
+const HANDOVER_ENTRIES = 8
+const HANDOVER_TEXT_CAP = 200
 
 const REASON_LABEL = {
   rate_limit: 'Ratenlimit erreicht',
@@ -86,7 +105,9 @@ function emptyFallback() {
     outage: null, // { since, reason, notifiedAt } — the fallback is down too
     pending: [], // { chatId, text, at } — not answered yet (full text, see PENDING_CAP)
     log: [], // { dir: 'in'|'out', text, at } — what the handoff summarizes
-    counters: { switches: 0, delivered: 0, probes: 0, buffered: 0, outages: 0, restarts: 0, retries: 0 },
+    parked: [], // { text, at } — jobs the fallback left to Claude (`fuer_claude`)
+    contextTokens: null, // the fallback session's context at the last delivery (core's contextTokens)
+    counters: { switches: 0, delivered: 0, probes: 0, buffered: 0, outages: 0, restarts: 0, retries: 0, capRestarts: 0 },
   }
 }
 
@@ -192,12 +213,53 @@ async function describeSession(id, d) {
   return { id, ...r.body.session }
 }
 
-const fallbackHeader = (fb) =>
-  `WICHTIG — DU BIST GERADE DIE ERSATZ-SITZUNG. Die Haupt-Sitzung (das reguläre Claude-Abo) ist blockiert: ${label(fb.reason)}${fb.resetText ? ` (${fb.resetText})` : ''}. Du antwortest über ein ANDERES Modell-Backend (OpenRouter) — jede Antwort kostet echtes Geld, also arbeite knapp. Gleiche Regeln wie sonst (Antwortweg, Ton, Sprache). Sag Ko EINMAL, ganz am Anfang deiner ERSTEN Antwort in diesem Notbetrieb, in einem kurzen Satz, dass gerade der Ersatz antwortet und — falls bekannt — wann Claude voraussichtlich zurück ist. Danach normal weiterarbeiten, bis eine Nachricht kommt, dass Claude wieder übernimmt.\n\n`
+/** Why the fallback is answering — and, once per episode (`announce`), the
+ *  one-sentence notice to Ko. */
+const situation = (fb, announce) =>
+  `LAGE: Die Haupt-Sitzung (Claude) ist blockiert — ${label(fb.reason)}${fb.resetText ? ` (${fb.resetText})` : ''}.${announce ? ' Sag Ko EINMAL, ganz am Anfang deiner ERSTEN Antwort, in einem kurzen Satz, dass gerade der Ersatz antwortet und — falls bekannt — wann Claude voraussichtlich zurück ist.' : ''} Antworte, bis eine Nachricht kommt, dass Claude wieder übernimmt.`
+
+const clip = (s, n) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t
+}
+
+/** The log WITHOUT the still-unanswered tail: with messages pending, the log's
+ *  entries after the last reply ARE those messages. */
+function answeredLog(fb) {
+  if (!fb.pending.length) return fb.log
+  return fb.log.slice(0, fb.log.map((e) => e.dir).lastIndexOf('out') + 1)
+}
+
+
+/** The short handover a FRESH fallback session gets when the full one is
+ *  replaced (the context cap): the last few exchanges, cut short, plus what is
+ *  still without an answer — never the whole log. (`noted` false: the full one
+ *  was left over from an EARLIER episode and this one is not announced yet —
+ *  situation() then asks for the notice instead.) */
+function handover(fb) {
+  const recent = answeredLog(fb)
+    .slice(-HANDOVER_ENTRIES)
+    .map((e) => `${e.dir === 'in' ? '← Ko' : '→ Ersatz'}: ${clip(e.text, HANDOVER_TEXT_CAP)}`)
+  return [
+    `ÜBERGABE: Die vorige Ersatz-Sitzung wurde geschlossen, weil ihr Verlauf zu groß (und damit zu teuer) wurde — du machst nahtlos weiter.${fb.noted ? ' Ko weiß schon, dass der Ersatz antwortet; kündige das nicht noch einmal an.' : ''}`,
+    ...(recent.length ? ['Zuletzt im Chat (schon beantwortet):', ...recent] : []),
+    ...(fb.pending.length ? ['Noch ohne Antwort — beantworte sie mit, falls sie eine brauchen:', ...fb.pending.map((p) => `[Telegram from ${p.chatId}] ${p.text}`)] : []),
+  ].join('\n')
+}
+
+/** One delivery's text: a single message framed as always; several (the lost
+ *  messages replayed on a switch) as ONE turn — every extra turn would re-send
+ *  the whole context once more. */
+function messageText(items) {
+  if (items.length === 1) return framed(items[0].chatId, items[0].text)
+  return `(Systemhinweis der Box, nicht von Ko: Diese ${items.length} Nachrichten sind noch unbeantwortet — beantworte sie zusammen in EINER Antwort.)\n${listOf(items)}\n\n(Reply with a POST to /api/telegram/send — the terminal is not read.)`
+}
 
 async function trySpawnFallback(providers, task, d) {
   for (const provider of providers) {
-    const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas', model: 'opus', provider }, d)
+    // `lean`: core's minimal knowledge chat (see LEAN_KNOWLEDGE_LAUNCH_CMD in
+    // api/src/agent-local.mjs) — the task below is the whole brief.
+    const r = await core('POST', '/api/agents/spawn', { task, kind: 'knowledge', vault: 'atlas', model: 'opus', provider, lean: true }, d)
     if (r.ok && r.body?.id) return { ok: true, id: r.body.id, provider }
   }
   return { ok: false, error: `no fallback provider could be spawned (tried ${providers.join(', ') || 'none'})` }
@@ -212,17 +274,38 @@ async function trySpawnFallback(providers, task, d) {
  * already decided fallback mode applies — this never touches the main
  * session. While the fallback itself is down (`outage`), the message is only
  * BUFFERED — never sent into a session that cannot answer, never dropped.
- * → `{ ok, via: 'spawn'|'prompt'|'queue'|'buffered', id?, provider? }` | `{ ok: false, error }`.
+ * → `{ ok, via: 'spawn'|'prompt'|'queue'|'buffered', id?, provider?, replaced? }` | `{ ok: false, error }`.
  */
-export async function deliverToFallback({ chatId, text }, deps = {}) {
-  const d = { env: process.env, fetch: globalThis.fetch, file: undefined, ...deps }
+export function deliverToFallback({ chatId, text }, deps = {}) {
+  return deliverBatch([{ chatId, text }], deps)
+}
+
+/**
+ * deliverToFallback for one or more messages in ONE turn. THE CONTEXT CAP lives
+ * here: a live fallback that is idle and whose context (core's `contextTokens`
+ * in GET /api/agents) has reached TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS is
+ * replaced — a fresh one is spawned with a short handover (handover()), and
+ * only once that spawn succeeded is the full one torn down with
+ * POST /api/agents/cleanup (NOT /kill: a knowledge chat's first ✕ runs a
+ * wrap-up turn — one more full-context call on the metered backend). If no
+ * fresh one can be spawned, the full one still gets the message: expensive
+ * beats unanswered. A RUNNING fallback is never replaced mid-turn; the next
+ * message checks again.
+ */
+async function deliverBatch(items, deps = {}) {
+  const d = { env: process.env, fetch: globalThis.fetch, file: undefined, log: console.error, ...deps }
   const c = config(d.env)
   const file = d.file ?? stateFile(d.env)
   const fb = readFallback(file)
+  const record = (counter) => {
+    for (const it of items) {
+      appendLog(file, 'in', it.text)
+      pushPending(file, it.chatId, it.text)
+    }
+    bumpCounters(file, { [counter]: items.length })
+  }
   if (fb.outage) {
-    pushPending(file, chatId, text)
-    bumpCounters(file, { buffered: 1 })
-    appendLog(file, 'in', text)
+    record('buffered')
     return { ok: true, via: 'buffered' }
   }
   let live = null
@@ -232,39 +315,55 @@ export async function deliverToFallback({ chatId, text }, deps = {}) {
     live = (list.body.sessions || []).find((s) => s.id === fb.fallbackSessionId) || null
     if (live && ['done', 'error', 'dormant'].includes(live.status)) live = null
   }
-  const header = fb.noted ? '' : fallbackHeader(fb)
+  let full = null
+  if (live && live.status !== 'running' && Number(live.contextTokens) >= c.fallbackMaxContextTokens) {
+    full = live
+    live = null
+  }
   if (!live) {
     const providers = fb.providerOverride ? [fb.providerOverride] : c.fallbackProviders
     if (!providers.length) return { ok: false, error: 'no fallback provider configured (TELEGRAM_FALLBACK_PROVIDERS is empty)' }
     // Its own title line FIRST — that is what core derives the session id
     // from (spawnTitle in agent.mjs), so it can never collide with the
     // standing session's id again.
-    const task = `${spawnTitle('fallback')}\n\n${header}${channelBrief(c)}\n\n---\nFirst message:\n${framed(chatId, text)}`
+    const task = [
+      spawnTitle('fallback'),
+      fallbackBrief(c),
+      situation(fb, !fb.noted),
+      ...(full ? [handover(fb)] : []),
+      `---\n${full ? 'Neue Nachricht' : 'First message'}:\n${messageText(items)}`,
+    ].join('\n\n')
     const r = await trySpawnFallback(providers, task, d)
-    if (!r.ok) return r
-    saveFallback({ fallbackSessionId: r.id, providerUsed: r.provider, noted: true, switchedAt: fb.switchedAt || new Date().toISOString() }, file)
-    bumpCounters(file, { delivered: 1 })
-    appendLog(file, 'in', text)
-    pushPending(file, chatId, text)
-    return { ok: true, via: 'spawn', id: r.id, provider: r.provider }
+    if (r.ok) {
+      saveFallback({ fallbackSessionId: r.id, providerUsed: r.provider, noted: true, switchedAt: fb.switchedAt || new Date().toISOString(), contextTokens: null }, file)
+      record('delivered')
+      if (full) {
+        bumpCounters(file, { capRestarts: 1 })
+        d.log(`[telegram] the fallback session ${full.id} reached ${full.contextTokens} context tokens (cap ${c.fallbackMaxContextTokens}) — replaced by ${r.id}`)
+        const k = await core('POST', '/api/agents/cleanup', { id: full.id }, d)
+        if (!k.ok) d.log(`[telegram] closing the full fallback session ${full.id} failed (${k.status}) — it is left idle, nothing is sent to it any more`)
+      }
+      return { ok: true, via: 'spawn', id: r.id, provider: r.provider, ...(full ? { replaced: full.id } : {}) }
+    }
+    if (!full) return r
+    d.log(`[telegram] could not replace the full fallback session ${full.id} (${r.error}) — delivering to it anyway`)
+    live = full
   }
-  const message = { id: live.id, text: `${header}${framed(chatId, text)}` }
+  saveFallback({ contextTokens: Number(live.contextTokens) || null }, file)
+  const header = fb.noted ? '' : `${situation(fb, true)}\n\n`
+  const message = { id: live.id, text: `${header}${messageText(items)}` }
   if (live.status !== 'running') {
     const p = await core('POST', '/api/agents/prompt', message, d)
     if (p.ok) {
       if (header) saveFallback({ noted: true }, file)
-      bumpCounters(file, { delivered: 1 })
-      appendLog(file, 'in', text)
-      pushPending(file, chatId, text)
+      record('delivered')
       return { ok: true, via: 'prompt', id: live.id, provider: fb.providerUsed }
     }
   }
   const q = await core('POST', '/api/agents/queue', message, d)
   if (q.ok) {
     if (header) saveFallback({ noted: true }, file)
-    bumpCounters(file, { delivered: 1 })
-    appendLog(file, 'in', text)
-    pushPending(file, chatId, text)
+    record('delivered')
     return { ok: true, via: 'queue', id: live.id, provider: fb.providerUsed }
   }
   return { ok: false, error: `queue → ${q.status} ${q.body?.error || ''}`.trim() }
@@ -273,21 +372,38 @@ export async function deliverToFallback({ chatId, text }, deps = {}) {
 /** Note an OUTBOUND reply for the eventual handoff summary — register.mjs
  *  calls this from POST /api/telegram/send, only while fallback is active.
  *  A reply also answers everything pending so far (the brief's rule: several
- *  messages → one reply). */
-export function noteOutbound(text, { file = stateFile() } = {}) {
+ *  messages → one reply). `forClaude` (the send body's `fuer_claude`) is a job
+ *  the fallback deliberately left to Claude — kept for the handback. */
+export function noteOutbound(text, { file = stateFile(), forClaude } = {}) {
   if (!fallbackActive(file)) return
   appendLog(file, 'out', text)
-  saveFallback({ pending: [] }, file)
+  const job = typeof forClaude === 'string' ? forClaude.trim() : ''
+  const parked = job ? [...readFallback(file).parked, { text: job.slice(0, PARKED_TEXT_CAP), at: new Date().toISOString() }].slice(-PARKED_CAP) : undefined
+  saveFallback({ pending: [], ...(parked ? { parked } : {}) }, file)
+}
+
+/** The handback's 2–3 sentences — in place of the whole log: who answered,
+ *  how much, what about, and the last exchange. */
+function episodeSummary(fb) {
+  const why = `${label(fb.reason)}${fb.resetText ? `, ${fb.resetText}` : ''}`
+  const answered = answeredLog(fb)
+  const ins = answered.filter((e) => e.dir === 'in')
+  if (!ins.length) return `Während du blockiert warst (${why}), kamen keine Nachrichten in der Zwischenzeit — nichts ist schon beantwortet, nichts zu übernehmen.`
+  const outs = answered.filter((e) => e.dir === 'out')
+  const n = `${ins.length}${fb.log.length >= LOG_CAP ? ' oder mehr' : ''}`
+  const last = ins.at(-1)
+  const earlier = ins.slice(-6, -1).map((e) => `„${clip(e.text, 60)}“`)
+  return [
+    `Während du blockiert warst (${why}), hat die Ersatz-Sitzung (${fb.providerUsed || 'ein Ersatz-Modell'}) ${n === '1' ? 'eine Nachricht' : `${n} Nachrichten`} von Ko beantwortet — die sind SCHON BEANTWORTET, beantworte sie NICHT noch einmal, führe nur Offenes weiter.`,
+    ...(earlier.length ? [`Themen davor: ${earlier.join(', ')}.`] : []),
+    `Zuletzt: Ko „${clip(last.text, 160)}“${outs.length ? ` → Ersatz „${clip(outs.at(-1).text, 160)}“` : ''}.`,
+  ].join(' ')
 }
 
 function buildHandoffText(fb) {
-  // With messages still pending, the log's tail after the last reply IS those
-  // messages — they belong in the "not answered" block, not under "answered".
-  const lastOut = fb.log.map((e) => e.dir).lastIndexOf('out')
-  const answered = fb.pending.length ? fb.log.slice(0, lastOut + 1) : fb.log
-  const lines = answered.length
-    ? answered.map((e) => `${e.dir === 'in' ? '← Ko' : '→ Ersatz'}: ${e.text}`)
-    : ['(keine Nachrichten in der Zwischenzeit)']
+  const parked = fb.parked.length
+    ? ['', 'FÜR DICH VORGEMERKT — diese Aufträge hat der Ersatz bewusst dir überlassen. Erledige sie jetzt (oder sag Ko kurz, wann):', ...fb.parked.map((p) => `- ${p.text}`)]
+    : []
   const open = fb.pending.length
     ? [
         '',
@@ -295,12 +411,7 @@ function buildHandoffText(fb) {
         ...fb.pending.map((p) => `[Telegram from ${p.chatId}] ${p.text}`),
       ]
     : []
-  return [
-    'SYSTEM-HANDOFF: Der Notbetrieb ist beendet — du bist wieder dran.',
-    `Während du blockiert warst (${label(fb.reason)}${fb.resetText ? `, ${fb.resetText}` : ''}) hat die Ersatz-Sitzung (${fb.providerUsed || 'ein Ersatz-Modell'}) für dich geantwortet. Diese Nachrichten sind SCHON BEANTWORTET — beantworte sie NICHT noch einmal, führe nur Offenes weiter:`,
-    ...lines,
-    ...open,
-  ].join('\n')
+  return ['SYSTEM-HANDOFF: Der Notbetrieb ist beendet — du bist wieder dran.', episodeSummary(fb), ...parked, ...open].join('\n')
 }
 
 /**
@@ -323,7 +434,7 @@ export async function switchToMain(deps = {}) {
   const r = await forwardToAgent({ chatId: c.homeChatId, text: buildHandoffText(fb) }, d)
   if (!r.ok) return r
   saveFallback(
-    { active: false, reason: null, resetText: null, resetAt: null, since: null, switchedAt: null, noted: true, lastProbeAt: null, log: [], pending: [], outage: null, providerOverride: null },
+    { active: false, reason: null, resetText: null, resetAt: null, since: null, switchedAt: null, noted: true, lastProbeAt: null, log: [], pending: [], parked: [], outage: null, providerOverride: null },
     file,
   )
   // The main session's old error line is still its LAST line until it writes
@@ -532,9 +643,8 @@ async function tick(c, d, t, file) {
     // otherwise see the SAME old entries again and double-deliver them).
     const lost = mainDeliveriesSince(file, det.cutoffAt)
     saveState({ ...readState(file), mainDeliveries: [] }, file)
-    for (const item of lost) {
-      await deliverToFallback({ chatId: item.chatId, text: item.text }, d)
-    }
+    // ONE turn for all of them (messageText) — not one full-context turn each.
+    if (lost.length) await deliverBatch(lost.map(({ chatId, text }) => ({ chatId, text })), d)
     return
   }
   if (!fb.outage && fb.fallbackSessionId) {
@@ -620,6 +730,10 @@ export function fallbackStatus({ file = stateFile(), env = process.env } = {}) {
     lastProbeAt: fb.lastProbeAt ? new Date(fb.lastProbeAt).toISOString() : null,
     outage: fb.outage ? { since: new Date(fb.outage.since).toISOString(), reason: fb.outage.reason, notified: !!fb.outage.notifiedAt } : null,
     pending: fb.pending.length,
+    parked: fb.parked.length,
+    // The context cap: the fallback session's context as of the last message
+    // delivered to it (null right after a spawn), against the cap.
+    context: { tokens: fb.contextTokens, max: c.fallbackMaxContextTokens },
     counters: fb.counters,
   }
 }
