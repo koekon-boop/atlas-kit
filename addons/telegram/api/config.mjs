@@ -160,6 +160,12 @@ export const config = (env = process.env) => ({
   fallbackProbeIntervalMs: posInt(env, 'TELEGRAM_FALLBACK_PROBE_INTERVAL_MS', 15 * 60 * 1000),
   fallbackProbeTimeoutMs: posInt(env, 'TELEGRAM_FALLBACK_PROBE_TIMEOUT_MS', 20000),
   fallbackProbeModel: str(env, 'TELEGRAM_FALLBACK_PROBE_MODEL', 'claude-haiku-4-5'),
+  // The context cap (README "Keeping the fallback cheap"): once the fallback
+  // session's context (core's contextTokens — the last turn's input side) has
+  // reached this, the NEXT message goes to a fresh fallback session with a short
+  // handover instead. Every turn re-sends the whole context over a metered
+  // backend, so this bounds what each turn costs.
+  fallbackMaxContextTokens: posInt(env, 'TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS', 60000),
 })
 
 /** Telegram's Bot API is one base URL PER METHOD, token embedded in the path —

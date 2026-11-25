@@ -50,6 +50,8 @@ const TEMPLATES = [
   ['ATLAS_CONTROL_LAUNCH_CMD', 'knowledge'],
   ['ATLAS_CONTROL_RESUME_CMD', 'knowledge'],
   ['ATLAS_WORKER_LAUNCH_CMD', 'knowledge'],
+  ['LEAN_KNOWLEDGE_LAUNCH_CMD', 'knowledge'],
+  ['LEAN_RESUME_CMD', 'knowledge'],
 ]
 
 // The single `--settings '<json>'` a composed template carries, parsed.

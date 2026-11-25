@@ -551,8 +551,9 @@ to the standing session is kept, briefly (10 entries / 30 minutes at most, in
 the state file), for exactly this. On activation, every one of them delivered
 **after** the last turn the session is known to have actually answered (or,
 if none is found in the read transcript tail, from `the error's own time minus
-2 minutes`) is replayed to the replacement session, in order — before the
-episode's handoff list is built, so the eventual handback names them too.
+2 minutes`) is replayed to the replacement session, in order and as **one**
+turn (every extra turn re-sends the whole context) — before the episode's
+handoff list is built, so the eventual handback names them too.
 
 **Switching.** Once blocked, every new message from the home chat and from any
 *unrouted* chat goes to the replacement session instead — never ALSO to the
@@ -563,9 +564,10 @@ real limit resets). The replacement is spawned (`kind: 'knowledge', vault:
 tried in order — the next one is tried only if a spawn is refused, e.g. an
 unconfigured profile); a still-live replacement from an earlier episode is
 *reused* instead of spawning again. Its very first reply in a new episode is
-told, once, to say in one short sentence that the replacement (and which
-model) is answering and when Claude is expected back — the rest of its brief
-and the reply contract are identical to the standing session's. A chat pinned
+told, once, to say in one short sentence that the replacement is answering and
+when Claude is expected back. It is spawned **lean**, with its own short brief —
+same reply contract, far fewer tokens (see [Keeping the fallback
+cheap](#keeping-the-fallback-cheap)). A chat pinned
 by `TELEGRAM_CHAT_ROUTES` is never affected by any of this — it keeps talking
 to its own existing target regardless of the standing session's health.
 
@@ -574,12 +576,14 @@ default) from the episode's start or the last probe — earlier if a known reset
 time comes first — a cheap probe — one `claude -p` turn on
 `TELEGRAM_FALLBACK_PROBE_MODEL` (haiku by default), the plain default
 Anthropic environment, a short timeout — checks whether the subscription
-answers again. On success the standing session gets ONE message listing every
-message that came in and every reply that went out while it was blocked (kept
-in the state file, 300 characters and 30 entries at most), explicitly saying
-they are **already answered** and only open points need following up — plus,
-**verbatim**, every message nobody answered yet (the fallback had not replied
-since, or could not), marked `NOCH UNBEANTWORTET` to be answered now. If that
+answers again. On success the standing session gets ONE message: a 2–3-sentence
+summary of the episode (how many messages the replacement answered, the topics
+before, the last exchange — explicitly **already answered**, only open points
+need following up), every job the replacement deliberately left to Claude
+(`FÜR DICH VORGEMERKT`, see below), and, **verbatim**, every message nobody
+answered yet (the fallback had not replied since, or could not), marked
+`NOCH UNBEANTWORTET` to be answered now. The full log stays in the state file
+(300 characters and 30 entries at most); it is not handed over. If that
 handoff cannot be delivered, the episode stays active and the next probe tries
 again — nothing pending is dropped. If the
 standing session is blocked again right away, the next tick switches back to
@@ -654,17 +658,66 @@ TELEGRAM_FALLBACK_STALE_MS=180000                                # an "other" ap
 TELEGRAM_FALLBACK_PROBE_INTERVAL_MS=900000                       # how often the recovery probe retries once the reset time is unknown, or after a failed probe
 TELEGRAM_FALLBACK_PROBE_TIMEOUT_MS=20000
 TELEGRAM_FALLBACK_PROBE_MODEL=claude-haiku-4-5
+TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS=60000                       # the context cap, below
 ```
 
 `GET /api/addons` shows `telegram.status.fallback`: `enabled`, `active`,
 `reason`, `resetAt`/`resetText`, the replacement session id + provider,
 `switchedAt`, `lastProbeAt`, `outage` (`since`, `reason`, `notified`), how many
-messages are `pending`, and the counters (`switches`, `delivered`, `probes`,
-`buffered`, `outages`, `restarts`, `retries`).
+messages are `pending`, how many jobs are `parked` for Claude, `context`
+(`tokens` — the replacement's context as of the last message delivered to it,
+`null` right after a spawn — and the cap, `max`), and the counters (`switches`,
+`delivered`, `probes`, `buffered`, `outages`, `restarts`, `retries`,
+`capRestarts`).
 
-⚠️ Every reply the replacement sends runs over a paid OpenRouter model, not
-your Anthropic subscription — its brief says so and asks it to work lean, but
-this is real, metered cost for as long as an episode lasts.
+### Keeping the fallback cheap
+
+⚠️ Every turn of the replacement runs over a paid OpenRouter model, not your
+Anthropic subscription — and every turn re-sends its **whole** context. On
+25.11.2026 one morning's replacement made 86 calls, started at ~61k tokens per
+call and grew to 306k (3.93 $; with a second session that day, 6.21 $). Four
+things keep that down:
+
+1. **Lean spawn.** The replacement is spawned with core's `lean: true`
+   (`docs/PROVIDERS.md` → "A lean chat"): no standing Atlas/orchestrator
+   preamble, no retrieved evidence (it was retrieved from the brief's own words —
+   pure noise), the read-only MCP tools instead of the agent-control ones, eight
+   built-in tools (`Bash Read Grep Glob Edit Write WebFetch WebSearch`), no
+   skills, no auto-memory. Its own brief (`fallbackBrief()` in `api/agent.mjs`)
+   keeps the reply contract and is ~2,200 characters instead of ~5,200.
+   Measured with `claude -p` in a copy of the vault's setup (Claude tokens): the
+   harness part went from ~67k to ~12k, the opening prompt from ~39,000 to
+   ~2,700 characters.
+2. **Its rules.** Answer the concrete question, in 1–3 sentences; look things
+   up only when needed, narrowly (query tools, `grep -rl`, one page or section);
+   never read big files, logs or histories up front; open a picture only when
+   the question is about it. Bigger jobs (several files, research, agents,
+   building something) are NOT done by the replacement: it tells Ko in one
+   sentence that Claude takes it over, and parks it with `"fuer_claude":"…"` in
+   the same `/api/telegram/send` body — the handback lists it. Only when Ko
+   insists does it do the job, briefly.
+3. **The context cap.** Once the replacement's context (core's `contextTokens`
+   for the session — the last turn's input side) has reached
+   `TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS` (60,000 by default) and it is idle, the
+   next message goes to a **fresh** replacement whose opening turn carries only
+   a short handover: the last four exchanges, each cut to 200 characters, plus
+   the messages still without an answer. The full one is torn down with
+   `POST /api/agents/cleanup` only after the new one exists — not `/kill`, whose
+   first ✕ on a knowledge chat runs a wrap-up turn (one more full-context call).
+   If no fresh one can be spawned, the full one still gets the message. A
+   replacement that is mid-turn is never cut off; the next message checks again.
+4. **Short handovers** — on the switch (one turn for every lost message) and on
+   the handback (the summary above, never the log).
+
+Why a cap restart and not Claude Code's own auto-compact
+(`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`): that threshold is a percentage of the
+context window Claude Code *assumes* for the model, and for a non-Anthropic
+model behind a gateway that assumption is not the real one (the 25.11.
+transcript grew to 306k tokens without a single compaction). The addon also
+cannot set it per spawn — env reaches a profiled session only through the
+profile — and a compaction is itself one more full-context call on the metered
+backend. The cap is a plain number on core's own context meter, decided between
+two messages, and covered by tests.
 
 ## Claude-login code interception (with addons/claude-login)
 

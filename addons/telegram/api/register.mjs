@@ -6,7 +6,9 @@
  * shared session rather than one per sender.
  *
  *   POST /api/telegram/send   the agent's reply path (bearer-gated): text, or with
- *                              `voice: true` a read-aloud voice note (text on any failure)
+ *                              `voice: true` a read-aloud voice note (text on any failure);
+ *                              `fuer_claude` — a job the FALLBACK leaves to Claude, kept
+ *                              for the handback (fallback.mjs, only while it is active)
  *
  * Disable it and the kit is byte-identical to one that never had it
  * (docs/ADDONS.md): no route, no poller, no state file, no outbound call.
@@ -73,17 +75,18 @@ export function buildRoutes({ Router, express }, { env = process.env, fetch: f =
     const absent = missing('outbound', env)
     if (absent.length) return res.status(503).json({ ok: false, error: `not configured — set ${absent.join(', ')}` })
     const c = config(env)
-    const { chat_id: chatId, text, voice: wantVoice } = req.body || {}
+    const { chat_id: chatId, text, voice: wantVoice, fuer_claude: forClaude } = req.body || {}
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ ok: false, error: 'missing "text"' })
     const target = chatId == null || chatId === '' ? c.homeChatId : String(chatId).trim()
     // A prompt-injected agent must not be able to message arbitrary chats.
     if (!c.allowedChatIds.includes(target)) return res.status(400).json({ ok: false, error: '"chat_id" is not in TELEGRAM_ALLOWED_CHAT_IDS' })
     if (wantVoice != null && typeof wantVoice !== 'boolean') return res.status(400).json({ ok: false, error: '"voice" must be true or false' })
+    if (forClaude != null && typeof forClaude !== 'string') return res.status(400).json({ ok: false, error: '"fuer_claude" must be a string' })
     const r = wantVoice ? await voice.send({ chatId: target, text }) : await sendMessage({ chatId: target, text }, { env, fetch: f, log })
     // Buffer the home chat's own outbound replies for the eventual handback
     // summary (README "Automatic fallback") — a no-op while fallback isn't
     // active. A routed chat's own conversation is never folded in here.
-    if (r.ok && target === c.homeChatId) noteOutbound(text, { file: file ?? stateFile(env) })
+    if (r.ok && target === c.homeChatId) noteOutbound(text, { file: file ?? stateFile(env), forClaude })
     res.status(r.ok ? 200 : 502).json(r)
   })
 

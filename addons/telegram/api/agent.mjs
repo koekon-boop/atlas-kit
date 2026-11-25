@@ -107,16 +107,17 @@ export function routeInfo({ routes, file = stateFile() } = {}) {
 /** What the session is told when it is created (the same rule rides along, in
  *  one line, with every message after — a long chat compacts, the rule must
  *  survive it). */
+// A session's tmux does not always inherit DASHBOARD_BEARER_TOKEN (a tmux
+// server started before the API keeps its own environment), and then every
+// send answered "unauthorized". So the header falls back to reading it from
+// the kit's own .env AT CALL TIME, inside the curl's own shell — the value is
+// never written into the brief, the transcript or a log line.
+const sendBearer = (envFile) =>
+  envFile ? `\${DASHBOARD_BEARER_TOKEN:-$(sed -n 's/^DASHBOARD_BEARER_TOKEN=//p' '${envFile}' | tr -d '"')}` : '$DASHBOARD_BEARER_TOKEN'
+
 export function sessionBrief({ port = '3001', maxVoiceChars = 3000, homeChatId, otherChats = [], envFile } = {}) {
   const url = `http://127.0.0.1:${port}/api/telegram/send`
-  // A session's tmux does not always inherit DASHBOARD_BEARER_TOKEN (a tmux
-  // server started before the API keeps its own environment), and then every
-  // send answered "unauthorized". So the header falls back to reading it from
-  // the kit's own .env AT CALL TIME, inside the curl's own shell — the value is
-  // never written into the brief, the transcript or a log line.
-  const bearer = envFile
-    ? `\${DASHBOARD_BEARER_TOKEN:-$(sed -n 's/^DASHBOARD_BEARER_TOKEN=//p' '${envFile}' | tr -d '"')}`
-    : '$DASHBOARD_BEARER_TOKEN'
+  const bearer = sendBearer(envFile)
   const several = otherChats.length > 0
   const chatIdField = several ? `"chat_id":"<the chat id from the marker, when replying to someone other than the home chat>",` : ''
   return `Telegram channel — a standing chat session with the operator.
@@ -173,6 +174,36 @@ export const framedForRoute = (chatId, text, port = '3001') =>
  *  session, a fresh one after a refusal, and the fallback session). */
 export const channelBrief = (c) =>
   sessionBrief({ port: c.apiPort, maxVoiceChars: c.maxVoiceChars, homeChatId: c.homeChatId, otherChats: c.allowedChatIds.filter((x) => x !== c.homeChatId), envFile: c.envFile })
+
+/**
+ * The brief of the PAID fallback session (fallback.mjs) — deliberately NOT
+ * sessionBrief(): every token here is re-billed on every turn over OpenRouter,
+ * and on 25.11.2026 the fallback, briefed like the standing session, edited
+ * vault pages, loaded skills and started agents (86 GPT calls, 3.93 $ in one
+ * morning). Same reply contract (the route, the bearer fallback, voice:true,
+ * chat_id) at a fraction of the length, plus the operator's rules: answer the
+ * concrete question, look things up only when needed and narrowly, leave
+ * bigger jobs to Claude (`fuer_claude`, handed over on the handback).
+ */
+export function fallbackBrief({ apiPort = '3001', homeChatId, allowedChatIds = [], envFile } = {}) {
+  const url = `http://127.0.0.1:${apiPort}/api/telegram/send`
+  const several = allowedChatIds.some((x) => x !== homeChatId)
+  return `DU BIST DIE ERSATZ-SITZUNG (Telegram-Notbetrieb): Du vertrittst den Atlas-Agenten im Telegram-Chat mit Ko${homeChatId ? ` (Home-Chat ${homeChatId})` : ''}, solange Claude blockiert ist. Jede Runde läuft über OpenRouter und kostet echtes Geld — und jede Runde schickt den ganzen bisherigen Verlauf mit. Darum:
+- Kümmere dich um die konkrete Frage. Antworte kurz: 1–3 Sätze, die Antwort zuerst, Klartext, in der Sprache der Nachricht.
+- Schlag nur nach, wenn die Frage es braucht, und dann gezielt: query_atlas / query_vault, oder grep -rl über Wiki/ und Tasks/, danach EINE Seite oder nur den passenden Abschnitt (Read mit offset/limit). Keine großen Dateien, Logs, Verläufe, Wiki/index.md oder Wiki/log.md vorsorglich einlesen.
+- Dateien kommen als Pfad auf der Box ("[Bild empfangen: <Pfad>] …", "[Dokument empfangen: …]", "[Video empfangen: …]" mit Einzelbildern und Tonspur-Text). Schau sie an, wenn die Frage sich auf sie bezieht — jede nur einmal.
+- Größere Aufträge (mehrere Dateien ändern, Recherche, Agenten starten, etwas bauen) erledigst du NICHT selbst: sag Ko in einem Satz, dass Claude das nach der Rückkehr übernimmt, und merk es mit "fuer_claude" vor (unten). Nur wenn Ko ausdrücklich sagt, dass es jetzt sein muss, erledige es knapp.
+- Schreib nichts in den Atlas, außer Ko bittet ausdrücklich darum. Keine Geheimnisse oder langen Auszüge in Antworten.
+
+ANTWORTWEG — niemand liest dieses Terminal. Jede Antwort ist ein POST:
+curl -sS -X POST ${url} -H "Authorization: Bearer ${sendBearer(envFile)}" -H 'content-type: application/json' --data-binary @- <<'EOF'
+{"text":"deine Antwort"}
+EOF
+Im JSON " als \\" und Zeilenumbrüche als \\n. {"ok":true} heißt angekommen; bei ok:false höchstens ein neuer Versuch.
+- Kam die Nachricht als "[Sprachnachricht, transkribiert] …", antworte mit "voice":true im selben JSON: ein paar kurze gesprochene Sätze, keine Listen, Links oder langen Zahlen. Getippt → Text.
+- Auftrag für Claude vormerken: "fuer_claude":"<ein Satz, was Claude erledigen soll>" im selben JSON.${several ? `\n- Antwort an einen anderen Chat als den Home-Chat: "chat_id":"<id aus dem Marker [Telegram from <id>]>".` : ''}
+- Mehrere Nachrichten auf einmal → EINE gemeinsame Antwort. "ok", "danke" brauchen keine Antwort.`
+}
 
 /**
  * The first line of a spawn task — and so, through core's slug (first 40

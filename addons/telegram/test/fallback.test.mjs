@@ -17,10 +17,13 @@
  *   · the three home-chat commands (/ersatz, /claude, /modell)
  *   · TELEGRAM_FALLBACK_PROVIDERS="" is the kill switch for the whole feature
  *   · a ROUTED chat is never touched by any of this
- *   · the 24./25.11.2026 hardening (bottom of the file, README "What keeps it
- *     from getting stuck"): own session ids, the probe always comes due, a
- *     fallback out of credits → Claude at once or ONE note + buffer, a refusal
- *     replaces the session, a transient error retries on Claude first
+ *   · the 24./25.11.2026 hardening (README "What keeps it from getting
+ *     stuck"): own session ids, the probe always comes due, a fallback out of
+ *     credits → Claude at once or ONE note + buffer, a refusal replaces the
+ *     session, a transient error retries on Claude first
+ *   · keeping it cheap (very bottom, README "Keeping the fallback cheap"): the
+ *     context cap, the lean spawn + short brief, short handovers, the brief's
+ *     rules, the status numbers
  *
  * Hermetic: Telegram + core's agent routes are one stubbed `fetch` (the same
  * convention as routing.test.mjs/poller.test.mjs), extended with
@@ -99,7 +102,7 @@ function makeWorld({ sessions = [], describeById = {}, spawnFails = [], telegram
       w.sessions.push({ id, status: 'idle' })
       return json(200, { ok: true, id })
     }
-    if (route === '/api/agents/kill') {
+    if (route === '/api/agents/kill' || route === '/api/agents/cleanup') {
       w.sessions = w.sessions.filter((s) => s.id !== body.id)
       return json(200, { ok: true })
     }
@@ -724,4 +727,183 @@ test('3: /ersatz during an outage ends the outage and really delivers to the fal
   assert.match(r.reply, /übernimmt jetzt/)
   assert.equal(readState(file).fallback.outage, null)
   assert.ok(w.core.some((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-fb'))
+})
+
+/* --- keeping it cheap (README "Keeping the fallback cheap") ---------------
+ * Measured 25.11.2026: 86 GPT calls in one morning, the fallback's context
+ * from 61k up to 306k tokens per call, 3.93 $ for that session alone. */
+
+const ACTIVE = (extra = {}) => ({ active: true, reason: 'rate_limit', resetText: 'resets 8pm (UTC)', switchedAt: at(3600000), fallbackSessionId: 'kb-fb', providerUsed: 'gpt-openrouter', noted: true, log: [], ...extra })
+const exchanges = (n, long = '') =>
+  Array.from({ length: n }, (_, i) => [
+    { dir: 'in', text: `Frage ${i + 1}${long}`, at: at((n - i) * 60000) },
+    { dir: 'out', text: `Antwort ${i + 1}${long}`, at: at((n - i) * 60000 - 30000) },
+  ]).flat()
+
+test('1 (context cap): an IDLE fallback at the cap is replaced — fresh lean spawn with a SHORT handover, the old one torn down with cleanup (not kill)', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 61000 }] })
+  const long = ' — mit sehr viel Text dahinter'.repeat(20)
+  const { file, log } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE({ log: [...exchanges(10, long), { dir: 'in', text: 'offene Frage', at: at(1000) }], pending: [{ chatId: HOME, text: 'offene Frage', at: at(1000) }] }) } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'neue Frage' }, { env: ENV, fetch: w.fetch, file, log: (m) => log.push(m) })
+  assert.equal(r.ok, true)
+  assert.equal(r.via, 'spawn')
+  assert.equal(r.replaced, 'kb-fb')
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.equal(spawn.body.lean, true)
+  assert.equal(spawn.body.provider, 'gpt-openrouter')
+  const task = spawn.body.task
+  assert.match(task, /ÜBERGABE/)
+  assert.match(task, /nicht noch einmal an/, 'Ko already knows — no second announcement')
+  assert.doesNotMatch(task, /Sag Ko EINMAL/)
+  // the last 4 exchanges only, each cut short — never the whole log
+  assert.ok(task.includes('← Ko: Frage 7') && task.includes('→ Ersatz: Antwort 10'))
+  assert.ok(!task.includes('Frage 6 '), 'older exchanges stay out')
+  assert.ok(!task.includes(long.repeat(1)), 'each line is cut short')
+  assert.match(task, /Noch ohne Antwort[^\n]*\n\[Telegram from 111\] offene Frage/)
+  assert.match(task, /Neue Nachricht:\n\[Telegram from 111\] neue Frage/)
+  // torn down only AFTER the new one exists, and hard: cleanup, never the wrap-up turn of /kill
+  const routes = w.core.map((c) => c.route)
+  assert.ok(routes.indexOf('/api/agents/cleanup') > routes.indexOf('/api/agents/spawn'))
+  assert.equal(w.core.find((c) => c.route === '/api/agents/cleanup').body.id, 'kb-fb')
+  assert.ok(!routes.includes('/api/agents/kill'))
+  assert.ok(!w.core.some((c) => (c.route === '/api/agents/prompt' || c.route === '/api/agents/queue') && c.body?.id === 'kb-fb'), 'nothing more goes into the full session')
+  const fb = readState(file).fallback
+  assert.equal(fb.fallbackSessionId, r.id)
+  assert.equal(fb.counters.capRestarts, 1)
+  assert.equal(fb.contextTokens, null, 'unknown until the new session has run a turn')
+  assert.deepEqual(fb.pending.map((p) => p.text), ['offene Frage', 'neue Frage'], 'still owed an answer — kept for the handback')
+  assert.ok(log.some((l) => /reached 61000 context tokens/.test(l)))
+})
+
+test('1: a full fallback left over from an EARLIER episode is replaced too — and the new episode is still announced', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 70000 }] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE({ noted: false }) } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'hallo?' }, { env: ENV, fetch: w.fetch, file, log: () => {} })
+  assert.equal(r.replaced, 'kb-fb')
+  const task = w.core.find((c) => c.route === '/api/agents/spawn').body.task
+  assert.match(task, /Sag Ko EINMAL/)
+  assert.doesNotMatch(task, /Ko weiß schon/)
+  assert.equal(readState(file).fallback.noted, true)
+})
+
+test('1: below the cap the live fallback is simply reused, and its context size is recorded', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 59999 }] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE() } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'kurz?' }, { env: ENV, fetch: w.fetch, file })
+  assert.equal(r.via, 'prompt')
+  assert.equal(w.core.filter((c) => c.route === '/api/agents/spawn').length, 0)
+  assert.equal(readState(file).fallback.contextTokens, 59999)
+})
+
+test('1: a RUNNING fallback over the cap is never replaced mid-turn — the message is queued, the next one checks again', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'running', contextTokens: 250000 }] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE() } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'noch was' }, { env: ENV, fetch: w.fetch, file })
+  assert.equal(r.via, 'queue')
+  assert.ok(!w.core.some((c) => c.route === '/api/agents/spawn' || c.route === '/api/agents/cleanup'))
+})
+
+test('1: if no fresh fallback can be spawned, the full one still answers — expensive beats unanswered', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 90000 }], spawnFails: ['gpt-openrouter', 'deepseek-openrouter'] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE() } })
+  const r = await deliverToFallback({ chatId: HOME, text: 'hallo?' }, { env: ENV, fetch: w.fetch, file, log: () => {} })
+  assert.equal(r.ok, true)
+  assert.equal(r.via, 'prompt')
+  assert.equal(r.id, 'kb-fb')
+  assert.ok(!w.core.some((c) => c.route === '/api/agents/cleanup'), 'the only working session is not torn down')
+  assert.equal(readState(file).fallback.counters.capRestarts, 0)
+})
+
+test('1: TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS sets the cap', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 61000 }] })
+  const env = { ...ENV, TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS: '100000' }
+  const { file } = build({ world: w, env, state: { sessionId: 'kb-main', fallback: ACTIVE() } })
+  assert.equal((await deliverToFallback({ chatId: HOME, text: 'a' }, { env, fetch: w.fetch, file })).via, 'prompt')
+  const low = { ...ENV, TELEGRAM_FALLBACK_MAX_CONTEXT_TOKENS: '20000' }
+  assert.equal((await deliverToFallback({ chatId: HOME, text: 'b' }, { env: low, fetch: w.fetch, file, log: () => {} })).via, 'spawn')
+  assert.equal(fallbackStatus({ file, env: low }).context.max, 20000)
+})
+
+test('2+4 (lean start, brief rules): the fallback is spawned lean, with its own SHORT brief — not the standing session\'s', async () => {
+  const w = makeWorld()
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE({ noted: false, fallbackSessionId: null }) } })
+  await deliverToFallback({ chatId: HOME, text: 'Was steht heute an?' }, { env: ENV, fetch: w.fetch, file })
+  const spawn = w.core.find((c) => c.route === '/api/agents/spawn')
+  assert.equal(spawn.body.lean, true, 'core: no standing preamble, no evidence, read-only MCP, short tool list')
+  const task = spawn.body.task
+  assert.ok(task.length < 3500, `the whole opening turn is ${task.length} characters (the standing brief alone is ~5,200; the 25.11. opening prompt was ~39,000)`)
+  assert.doesNotMatch(task, /PICTURES, VIDEOS AND DOCUMENTS|WHAT YOU CAN DO/, 'not the standing session\'s brief')
+  // the reply contract survives
+  assert.ok(task.includes('http://127.0.0.1:3001/api/telegram/send'))
+  assert.match(task, /"voice":true/)
+  // the operator's rules (point 4)
+  assert.match(task, /Kümmere dich um die konkrete Frage/)
+  assert.match(task, /Antworte kurz: 1–3 Sätze/)
+  assert.match(task, /Schlag nur nach, wenn die Frage es braucht, und dann gezielt/)
+  assert.match(task, /Keine großen Dateien, Logs, Verläufe[^\n]*vorsorglich/)
+  assert.match(task, /Größere Aufträge[^\n]*NICHT selbst[^\n]*"fuer_claude"/)
+  assert.match(task, /Sag Ko EINMAL/, 'the first fallback turn of an episode still announces itself')
+  assert.match(task, /Ratenlimit erreicht \(resets 8pm \(UTC\)\)/)
+})
+
+test('3 (switch-over): lost messages are replayed as ONE turn, not one full-context turn each', async () => {
+  const w = makeWorld({ describeById: { 'kb-main': MAIN_UUID } })
+  const lost = [
+    { at: at(50000), chatId: HOME, text: 'Erste' },
+    { at: at(40000), chatId: HOME, text: 'Zweite' },
+  ]
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', mainDeliveries: lost } })
+  await onFallbackTick({ env: ENV, fetch: w.fetch, file, ...tails({ 'uuid-main': [goodTurn(120000), apiErr({ error: 'rate_limit', message: { content: 'x · resets 8pm (UTC)' } }, 1000)] }) })
+  const deliveries = w.core.filter((c) => ['/api/agents/spawn', '/api/agents/prompt', '/api/agents/queue'].includes(c.route))
+  assert.equal(deliveries.length, 1, 'one spawn carries both')
+  assert.match(deliveries[0].body.task, /Diese 2 Nachrichten sind noch unbeantwortet[^\n]*\n\[Telegram from 111\] Erste\n\[Telegram from 111\] Zweite/)
+  const fb = readState(file).fallback
+  assert.deepEqual(fb.pending.map((p) => p.text), ['Erste', 'Zweite'])
+  assert.equal(fb.counters.delivered, 2)
+})
+
+test('3 (handback): a 2–3-sentence summary + what was parked for Claude + the unanswered — never the whole log', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-main', status: 'idle' }, { id: 'kb-fb', status: 'idle' }] })
+  const b = await (async () => {
+    const built = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE({ log: exchanges(10) }) } })
+    const app = express()
+    app.use(built.routes)
+    const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)) })
+    after(() => server.close())
+    return { ...built, base: `http://127.0.0.1:${server.address().port}` }
+  })()
+  const send = (body) => fetch(`${b.base}/api/telegram/send`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${BEARER}` }, body: JSON.stringify(body) })
+  assert.equal((await send({ text: 'x', fuer_claude: 42 })).status, 400, '"fuer_claude" must be a string')
+  await b.inbound.handleOne(update(1, text(1, 'Bau mir bitte das Dashboard um', HOME)))
+  assert.equal((await send({ text: 'Das macht Claude, sobald es zurück ist.', fuer_claude: 'Dashboard umbauen (Ko, 25.11.)' })).status, 200)
+  await b.inbound.handleOne(update(2, text(2, 'Und wie spät ist es?', HOME)))
+  const r = await switchToMain({ env: ENV, fetch: w.fetch, file: b.file })
+  assert.equal(r.ok, true)
+  const handoff = w.core.find((c) => c.route === '/api/agents/prompt' && c.body?.id === 'kb-main').body.text
+  const [head, open] = handoff.split('NOCH UNBEANTWORTET')
+  assert.match(head, /11 Nachrichten von Ko beantwortet — die sind SCHON BEANTWORTET/)
+  assert.match(head, /Zuletzt: Ko „Bau mir bitte das Dashboard um“ → Ersatz „Das macht Claude, sobald es zurück ist\.“/)
+  assert.match(head, /FÜR DICH VORGEMERKT[^\n]*\n- Dashboard umbauen \(Ko, 25\.11\.\)/)
+  assert.ok(!head.includes('Frage 1,') && !head.includes('Antwort 9'), 'the log itself is not handed over')
+  assert.ok(head.split(/(?<=[.!?“])\s+/).filter((x) => x.includes('SCHON BEANTWORTET') || x.startsWith('Themen') || x.startsWith('Zuletzt')).length <= 3)
+  assert.ok(open.includes('[Telegram from 111] Und wie spät ist es?'))
+  assert.deepEqual(readState(b.file).fallback.parked, [], 'handed over — cleared with the episode')
+})
+
+test('3: a parked job outside fallback mode is ignored (the standing session has no use for it)', () => {
+  const file = newFile('parked-inactive')
+  fs.writeFileSync(file, JSON.stringify({ fallback: { active: false } }))
+  noteOutbound('hi', { file, forClaude: 'egal' })
+  assert.deepEqual(readState(file).fallback.parked ?? [], [])
+})
+
+test('5 (status): the fallback\'s context size against the cap, the cap restarts, the parked jobs', async () => {
+  const w = makeWorld({ sessions: [{ id: 'kb-fb', status: 'idle', contextTokens: 42000 }] })
+  const { file } = build({ world: w, state: { sessionId: 'kb-main', fallback: ACTIVE({ parked: [{ text: 'x', at: at(0) }], counters: { capRestarts: 3 } }) } })
+  await deliverToFallback({ chatId: HOME, text: 'hi' }, { env: ENV, fetch: w.fetch, file })
+  const st = fallbackStatus({ file, env: ENV })
+  assert.deepEqual(st.context, { tokens: 42000, max: 60000 })
+  assert.equal(st.counters.capRestarts, 3)
+  assert.equal(st.parked, 1)
+  assert.equal(fallbackStatus({ file: newFile('fresh'), env: ENV }).counters.capRestarts, 0)
 })
